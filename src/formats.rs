@@ -165,7 +165,7 @@ pub mod cesium3dtiles {
             // This is more compatible with viewers and matches the 3D Tiles spec better
             let crs_to = "EPSG:4979";
             let transformer = Proj::new_known_crs(&crs_from, crs_to, None).unwrap();
-            
+
             // Transform to ECEF for root transform - pg2b3dm still uses ECEF for root transform
             // GLB content is in input CRS, but root transform is in ECEF
             let transformer_to_ecef = Proj::new_known_crs(&crs_from, "EPSG:4978", None).unwrap();
@@ -181,7 +181,7 @@ pub mod cesium3dtiles {
                 content_bv_from_tile,
                 content_add_bv,
             );
-            
+
             // Add root transform to translate to ECEF center - matches pg2b3dm 2.0.0+ approach
             // GLB content is in ECEF (relative to root center in ECEF) to match root transform coordinate system
             // Root transform translates to ECEF center to position the content correctly
@@ -196,11 +196,11 @@ pub mod cesium3dtiles {
             let root_center_ecef = transformer_to_ecef
                 .convert((root_center_original[0], root_center_original[1], root_center_original[2]))
                 .unwrap();
-            
+
             log::info!("Root center for tileset transform - input CRS: [{:.2}, {:.2}, {:.2}], ECEF: [{:.2}, {:.2}, {:.2}]",
                 root_center_original[0], root_center_original[1], root_center_original[2],
                 root_center_ecef.0, root_center_ecef.1, root_center_ecef.2);
-            
+
             // Create identity transform with translation to ECEF center
             let root_transform = Transform([
                 1.0, 0.0, 0.0, 0.0,
@@ -223,7 +223,7 @@ pub mod cesium3dtiles {
             // Apply root transform to root tile
             let mut root_with_transform = root;
             root_with_transform.transform = Some(root_transform);
-            
+
             Self {
                 asset: Default::default(),
                 geometric_error: geometric_error_above_leaf + root_with_transform.geometric_error * 1.5,
@@ -319,7 +319,7 @@ pub mod cesium3dtiles {
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
-                    BoundingVolume::region_from_bbox(&tile_bbox, transformer).unwrap();
+                    BoundingVolume::box_from_bbox(&tile_bbox, transformer).unwrap();
                 let mut content: Option<Content> = None;
 
                 if quadtree.nr_items > 0 {
@@ -392,145 +392,6 @@ pub mod cesium3dtiles {
                     children: None,
                     implicit_tiling: None,
                 }
-            }
-        }
-
-        #[allow(dead_code)]
-        pub fn from_grid(
-            grid: &SquareGrid,
-            citymodel: &crate::parser::CityJSONMetadata,
-            feature_set: &crate::parser::FeatureSet,
-        ) -> Self {
-            let crs_from = format!(
-                "EPSG:{}",
-                citymodel.metadata.reference_system.to_epsg().unwrap()
-            );
-            // Because we have a boundingVolume.box. For a boundingVolume.region we need 4979.
-            let crs_to = "EPSG:4978";
-            let transformer = Proj::new_known_crs(&crs_from, crs_to, None).unwrap();
-
-            let mut root_children: Vec<Tile> = Vec::with_capacity(grid.length * grid.length);
-            for (cellid, cell) in grid {
-                if cell.feature_ids.is_empty() {
-                    // Empty cell, don't create tiles for it
-                    continue;
-                }
-
-                let mut content_bbox_qc = feature_set[cell.feature_ids[0]].bbox_qc.clone();
-                for fi in cell.feature_ids.iter() {
-                    content_bbox_qc.update_with(&feature_set[*fi].bbox_qc);
-                }
-                let content_bbox_rw = content_bbox_qc.to_bbox(&citymodel.transform, None, None);
-                let content_bounding_voume =
-                    BoundingVolume::box_from_bbox(&content_bbox_rw, &transformer).unwrap();
-
-                let mut cell_bbox = grid.cell_bbox(&cellid);
-                // Set the bounding volume height from the content height
-                cell_bbox[2] = content_bbox_rw[2];
-                cell_bbox[5] = content_bbox_rw[5];
-                let bounding_volume =
-                    BoundingVolume::box_from_bbox(&cell_bbox, &transformer).unwrap();
-
-                // We are adding a child for each LoD.
-                // TODO: but we are cheating here now, because we know that the input data has 3 LoDs...
-
-                // The geometric error of a tile is its 'size'.
-                // Since we have square tiles, we compute its size as the length of
-                // its side on the x-axis.
-                let dz = cell_bbox[5] - cell_bbox[2];
-
-                // LoD2.2 - leaf node with minimum geometric error
-                // Calculate geometric error for leaf tile based on tile size
-                let dx = cell_bbox[3] - cell_bbox[0];
-                let dy = cell_bbox[4] - cell_bbox[1];
-                let diagonal = (dx * dx + dy * dy + dz * dz).sqrt();
-                let leaf_geometric_error = diagonal * 0.001; // 0.1% of diagonal as minimum
-                let geometric_error_lod22 = leaf_geometric_error.max(0.1); // Ensure minimum value
-                
-                // For 3D Tiles with geographic 3D bounding volumes, GLB content uses input CRS (local coordinate system)
-                // This matches pg2b3dm 2.0.0+ approach - coordinates are in input CRS, not geographic 3D
-                let tile_lod22 = Tile {
-                    id: TileId::new(cellid.column, cellid.row, 3),
-                    bounding_volume,
-                    geometric_error: geometric_error_lod22,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}-0-0.glb", cellid),
-                    }),
-                    children: None,
-                    implicit_tiling: None,
-                };
-
-                // LoD 1.3
-                let tile_lod13 = Tile {
-                    id: TileId::new(cellid.column, cellid.row, 2),
-                    bounding_volume,
-                    geometric_error: dz * 0.1,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}-0.glb", cellid),
-                    }),
-                    children: Some(vec![tile_lod22]),
-                    implicit_tiling: None,
-                };
-
-                // LoD 1.2
-                root_children.push(Tile {
-                    id: TileId::new(cellid.column, cellid.row, 1),
-                    bounding_volume,
-                    geometric_error: dz * 0.3,
-                    // geometric_error: 10.0,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}.glb", cellid),
-                    }),
-                    children: Some(vec![tile_lod13]),
-                    implicit_tiling: None,
-                });
-            }
-
-            let root_volume = BoundingVolume::region_from_bbox(&grid.bbox, &transformer).unwrap();
-            debug!("root bbox: {:?}", &grid.bbox);
-            debug!("root boundingVolume: {:?}", &root_volume);
-            let root_geometric_error = grid.bbox[3] - grid.bbox[0];
-
-            let root = Tile {
-                id: TileId::new(0, 0, 0),
-                bounding_volume: root_volume,
-                geometric_error: root_geometric_error,
-                viewer_request_volume: None,
-                refine: Some(Refinement::Replace),
-                transform: None,
-                content: None,
-                children: Some(root_children),
-                implicit_tiling: None,
-            };
-
-            // Using gltf tile content
-            let mut extensions: Extensions = HashMap::new();
-            let e1 = Extension::ContentGtlf {
-                extensions_used: None,
-                extensions_required: None,
-            };
-            extensions.insert(ExtensionName::ContentGltf, e1);
-
-            Self {
-                asset: Default::default(),
-                geometric_error: root_geometric_error * 1.5,
-                root,
-                properties: None,
-                extensions_used: Some(vec![ExtensionName::ContentGltf]),
-                extensions_required: Some(vec![ExtensionName::ContentGltf]),
-                extensions: Some(extensions),
             }
         }
 
