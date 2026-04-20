@@ -29,6 +29,7 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
+use cityjson_export as _;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::env;

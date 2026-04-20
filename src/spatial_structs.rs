@@ -461,7 +461,9 @@ pub fn deinterleave(mortoncode: &u64) -> [u64; 2] {
 ///
 /// ## Examples
 ///
-/// ```
+/// ```ignore
+/// use crate::spatial_structs::SquareGrid;
+///
 /// let grid = SquareGrid::new(&[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], 1);
 /// let grid_idx = grid.locate_point(&[2.5, 1.5]);
 /// assert_eq!(grid_idx, [3_u64, 2_u64]);

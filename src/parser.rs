@@ -1100,6 +1100,16 @@ fn merge_bbox(target: &mut Bbox, other: &Bbox) {
 mod tests {
     use super::*;
 
+    fn resource_path(name: &str) -> PathBuf {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let direct = manifest.join("resources").join("data").join(name);
+        if direct.exists() {
+            direct
+        } else {
+            manifest.join("..").join("resources").join("data").join(name)
+        }
+    }
+
     #[test]
     fn test_crs_to_epsg() {
         let crs = Crs("https://www.opengis.net/def/crs/EPSG/0/7415".to_string());
@@ -1109,20 +1119,11 @@ mod tests {
 
     #[test]
     fn test_feature_file_loads_through_cjlib() {
-        let pb = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("data")
-            .join("3dbag_feature_x71.city.jsonl");
-        let base = std::fs::read(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join("data")
-                .join("3dbag_x00.city.json"),
-        )
-        .unwrap();
+        let pb = resource_path("3dbag_feature_x71.city.jsonl");
+        let base = std::fs::read(resource_path("3dbag_x00.city.json")).unwrap();
         let model = from_feature_file_with_base(pb, &base).unwrap();
         let stats =
-            selected_geometry_stats(model, Some(&vec![CityObjectType::Building]));
+            selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
         assert!(stats.bbox.is_some());
         assert!(!stats.selected_vertices.is_empty());
         let bbox = stats.bbox.unwrap();
@@ -1135,6 +1136,8 @@ mod tests {
         let base = serde_json::to_vec(&serde_json::json!({
             "type": "CityJSON",
             "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
             "transform": {
                 "scale": [1.0, 1.0, 1.0],
                 "translate": [0.0, 0.0, 0.0]
@@ -1143,7 +1146,7 @@ mod tests {
         .unwrap();
         let feature = serde_json::json!({
             "type": "CityJSONFeature",
-            "id": "mixed-feature",
+            "id": "building-1",
             "CityObjects": {
                 "building-1": {
                     "type": "Building",
@@ -1182,14 +1185,14 @@ mod tests {
 
         let model = from_feature_file_with_base(&feature_path, &base).unwrap();
         let stats =
-            selected_geometry_stats(model, Some(&vec![CityObjectType::Building]));
+            selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
         let grid = crate::spatial_structs::SquareGrid::new(
             &[0.0, 0.0, 0.0, 200.0, 200.0, 10.0],
             100,
             7415,
         );
         let counts = count_vertices_in_grid(
-            model,
+            &model,
             &stats.selected_vertices,
             &grid,
             &stats.bbox.unwrap(),

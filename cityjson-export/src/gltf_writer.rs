@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cityjson_index::{CityIndex, IndexedFeatureRef};
+use cityjson_lib::cityjson::v2_0::{GeometryType, VertexIndex};
+use cityjson_lib::json::staged::from_feature_file_with_base;
+use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json as json;
 use log::info;
 
-use crate::parser::{CityJSONFeatureVertices, Geometry, Transform, World};
-use crate::proj::Proj;
+use crate::parser::{FeatureReference, InputSource, World};
 use crate::spatial_structs::{QuadTree, QuadTreeNodeId};
 
 const GLTF_VERSION: &str = "2.0";
@@ -75,127 +78,168 @@ pub fn write_tile_glb<P: AsRef<Path>>(
     let qtree_node = quadtree
         .node(&qtree_node_id)
         .context("Tile not present in quadtree")?;
+    let feature_reader = FeatureReader::new(world)?;
+    let mut builder = MeshBuilder::new();
+    let mut feature_count = 0usize;
 
-    let epsg_code = world
-        .crs
-        .to_epsg()
-        .map_err(|e| anyhow::anyhow!("Failed to read EPSG code from metadata: {}", e))?;
-    let crs_from = format!("EPSG:{}", epsg_code);
+    for feature_id in collect_tile_feature_ids(world, qtree_node) {
+        let feature = &world.features[feature_id];
+        let model = feature_reader.load(&feature.reference)?;
+        builder.add_model(&model)?;
+        feature_count += 1;
+    }
 
-    // Transform coordinates to ECEF (EPSG:4978) to match root transform coordinate system
-    // Root transform is in ECEF, so GLB content must also be in ECEF for correct positioning
-    let transformer_to_ecef =
-        Proj::new_known_crs(&crs_from, "EPSG:4978", None).context("Create CRS to ECEF transformer")?;
-    
-    // Also need transformer for vertical geoid correction (local to tile)
-    let transformer_crs_to_ell =
-        Proj::new_known_crs(&crs_from, "EPSG:4979", None).context("Create CRS to ellipsoidal transformer")?;
-
-    // Calculate root center in input CRS, then transform to ECEF
-    // GLB coordinates will be relative to root center in ECEF to match root transform
-    let root_bbox = quadtree.bbox(&world.grid);
-    let root_center_input_crs = [
-        (root_bbox[0] + root_bbox[3]) * 0.5,
-        (root_bbox[1] + root_bbox[4]) * 0.5,
-        (root_bbox[2] + root_bbox[5]) * 0.5,
-    ];
-    info!("Root center in input CRS: [{:.2}, {:.2}, {:.2}]", root_center_input_crs[0], root_center_input_crs[1], root_center_input_crs[2]);
-    info!("Root bbox: [{:.2}, {:.2}, {:.2}, {:.2}, {:.2}, {:.2}]", 
-        root_bbox[0], root_bbox[1], root_bbox[2], root_bbox[3], root_bbox[4], root_bbox[5]);
-    
-    // Transform root center to ECEF for GLB content coordinates
-    let root_center_ecef = transformer_to_ecef
-        .convert((root_center_input_crs[0], root_center_input_crs[1], root_center_input_crs[2]))
-        .context("Transform root center to ECEF")?;
-    info!("Root center in ECEF: [{:.2}, {:.2}, {:.2}]", root_center_ecef.0, root_center_ecef.1, root_center_ecef.2);
-
-    // Use tile center for vertical geoid correction (local to tile)
-    let tile_bbox = qtree_node.bbox(&world.grid);
-    let tile_center_original = [
-        (tile_bbox[0] + tile_bbox[3]) * 0.5,
-        (tile_bbox[1] + tile_bbox[4]) * 0.5,
-        tile_bbox[2],
-    ];
-
-    let vertical_geoid_n = transformer_crs_to_ell
-        .convert((
-            tile_center_original[0],
-            tile_center_original[1],
-            tile_center_original[2],
-        ))
-        .map(|(_, _, h_ell)| h_ell - tile_center_original[2])
-        .unwrap_or(0.0);
-
-    // For 3D Tiles with root transform, GLB coordinates must be in ECEF and relative to ROOT center in ECEF
-    // This ensures coordinate system consistency: root transform (ECEF) + GLB content (ECEF) = correct positioning
-    let mut builder = MeshBuilder::new(
-        transformer_to_ecef,
-        root_center_ecef,
-        vertical_geoid_n
+    info!(
+        "Processed {} features for the output GLB, writing {} vertices and {} indices",
+        feature_count,
+        builder.positions.len(),
+        builder.indices.len()
     );
 
-    let mut feature_count = 0;
-    for cellid in qtree_node.cells() {
-        let cell = world.grid.cell(cellid);
-        for fid in cell.feature_ids.iter() {
-            let feature = &world.features[*fid];
-            let cf = CityJSONFeatureVertices::from_file(&feature.path_jsonl)
-                .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", feature.path_jsonl, e))?;
-            builder.add_feature(&cf, &world.transform)?;
-            feature_count += 1;
+    builder.write_glb(output_path, default_color)
+}
+
+enum FeatureReader {
+    Legacy {
+        features_root: PathBuf,
+        feature_base_document: Vec<u8>,
+    },
+    CjIndex {
+        city_index: CityIndex,
+        refs_by_id: HashMap<String, IndexedFeatureRef>,
+    },
+}
+
+impl FeatureReader {
+    fn new(world: &World) -> Result<Self> {
+        match &world.input_source {
+            InputSource::LegacyFeatureFiles { features_root } => Ok(Self::Legacy {
+                features_root: features_root.clone(),
+                feature_base_document: world.feature_base_document.clone(),
+            }),
+            InputSource::CjIndexDataset { .. } => {
+                let city_index = world
+                    .input_source
+                    .open_index()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let mut refs_by_id = HashMap::new();
+                for page_result in city_index.iter_all_feature_ref_pages(4096)? {
+                    for feature_ref in page_result? {
+                        refs_by_id.insert(feature_ref.feature_id.clone(), feature_ref);
+                    }
+                }
+                Ok(Self::CjIndex {
+                    city_index,
+                    refs_by_id,
+                })
+            }
         }
     }
-    info!("Processed {} features for tile, writing GLB with {} vertices, {} indices", 
-          feature_count, builder.positions.len(), builder.indices.len());
 
-    builder.write_glb(output_path, default_color)
+    fn load(&self, reference: &FeatureReference) -> Result<CityModel> {
+        match (self, reference) {
+            (
+                Self::Legacy {
+                    features_root,
+                    feature_base_document,
+                },
+                FeatureReference::LegacyPath(relative_path),
+            ) => {
+                let feature_path = features_root.join(relative_path);
+                from_feature_file_with_base(&feature_path, feature_base_document)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            }
+            (Self::CjIndex { city_index, refs_by_id }, FeatureReference::CjIndexId(feature_id)) => {
+                let indexed = refs_by_id
+                    .get(feature_id)
+                    .ok_or_else(|| anyhow::anyhow!("missing cjindex feature reference {feature_id}"))?;
+                city_index
+                    .read_feature(indexed)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            }
+            (Self::Legacy { .. }, FeatureReference::CjIndexId(_)) => {
+                Err(anyhow::anyhow!("legacy input unexpectedly referenced a cjindex feature"))
+            }
+            (Self::CjIndex { .. }, FeatureReference::LegacyPath(_)) => {
+                Err(anyhow::anyhow!("cjindex input unexpectedly referenced a legacy feature path"))
+            }
+        }
+    }
+}
+
+fn collect_tile_feature_ids(
+    world: &World,
+    qtree_node: &QuadTree,
+) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut feature_ids = Vec::new();
+    for cellid in qtree_node.cells() {
+        let cell = world.grid.cell(cellid);
+        for fid in &cell.feature_ids {
+            if seen.insert(*fid) {
+                feature_ids.push(*fid);
+            }
+        }
+    }
+    feature_ids
 }
 
 struct MeshBuilder {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     indices: Vec<u32>,
-    transformer_to_ecef: Proj,
-    root_center_ecef: (f64, f64, f64),
-    vertical_bias: f64,
 }
 
 impl MeshBuilder {
-    fn new(
-        transformer_to_ecef: Proj,
-        root_center_ecef: (f64, f64, f64),
-        vertical_bias: f64,
-    ) -> Self {
+    fn new() -> Self {
         Self {
             positions: Vec::new(),
             normals: Vec::new(),
             indices: Vec::new(),
-            transformer_to_ecef,
-            root_center_ecef,
-            vertical_bias,
         }
     }
 
-    fn add_feature(&mut self, feature: &CityJSONFeatureVertices, transform: &Transform) -> Result<()> {
-        let mut vertex_cache: HashMap<usize, u32> = HashMap::new();
+    fn add_model(&mut self, model: &CityModel) -> Result<()> {
+        let mut vertex_cache: HashMap<u32, u32> = HashMap::new();
 
-        for (_id, co) in feature.cityobjects.iter() {
-            if let Some(geoms) = &co.geometry {
-                for geometry in geoms {
-                    match geometry {
-                        Geometry::MultiSurface { boundaries } => {
-                            for surface in boundaries {
-                                self.add_surface(surface, &feature.vertices, transform, &mut vertex_cache)?;
+        for (_id, cityobject) in model.cityobjects().iter() {
+            let Some(geometry_handles) = cityobject.geometry() else {
+                continue;
+            };
+            for geometry_handle in geometry_handles {
+                let geometry = model.resolve_geometry(*geometry_handle)?;
+                match geometry.geometry().type_geometry() {
+                    GeometryType::MultiSurface | GeometryType::CompositeSurface => {
+                        let Some(boundary) = geometry.geometry().boundaries() else {
+                            continue;
+                        };
+                        for surface in boundary.to_nested_multi_or_composite_surface()? {
+                            self.add_surface(&surface, model, &mut vertex_cache)?;
+                        }
+                    }
+                    GeometryType::Solid => {
+                        let Some(boundary) = geometry.geometry().boundaries() else {
+                            continue;
+                        };
+                        for shell in boundary.to_nested_solid()? {
+                            for surface in shell {
+                                self.add_surface(&surface, model, &mut vertex_cache)?;
                             }
                         }
-                        Geometry::Solid { boundaries } => {
-                            for shell in boundaries {
+                    }
+                    GeometryType::MultiSolid | GeometryType::CompositeSolid => {
+                        let Some(boundary) = geometry.geometry().boundaries() else {
+                            continue;
+                        };
+                        for solid in boundary.to_nested_multi_or_composite_solid()? {
+                            for shell in solid {
                                 for surface in shell {
-                                    self.add_surface(surface, &feature.vertices, transform, &mut vertex_cache)?;
+                                    self.add_surface(&surface, model, &mut vertex_cache)?;
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -203,12 +247,27 @@ impl MeshBuilder {
         Ok(())
     }
 
+    fn vertex_index(
+        &mut self,
+        idx: u32,
+        position: [f32; 3],
+        cache: &mut HashMap<u32, u32>,
+    ) -> u32 {
+        if let Some(&existing) = cache.get(&idx) {
+            return existing;
+        }
+        self.positions.push(position);
+        self.normals.push([0.0, 0.0, 0.0]);
+        let index = (self.positions.len() - 1) as u32;
+        cache.insert(idx, index);
+        index
+    }
+
     fn add_surface(
         &mut self,
-        surface: &Vec<Vec<usize>>,
-        vertices_qc: &[[i64; 3]],
-        transform: &Transform,
-        cache: &mut HashMap<usize, u32>,
+        surface: &[Vec<u32>],
+        model: &CityModel,
+        cache: &mut HashMap<u32, u32>,
     ) -> Result<()> {
         if surface.is_empty() {
             return Ok(());
@@ -233,7 +292,7 @@ impl MeshBuilder {
             }
 
             for &vertex_id in ring {
-                let position = self.compute_local_position(vertex_id, vertices_qc, transform)?;
+                let position = self.compute_local_position(vertex_id, model)?;
                 let glb_index = self.vertex_index(vertex_id, position, cache);
                 local_positions.push(position);
                 glb_indices.push(glb_index);
@@ -300,22 +359,6 @@ impl MeshBuilder {
         Ok(())
     }
 
-    fn vertex_index(
-        &mut self,
-        idx: usize,
-        position: [f32; 3],
-        cache: &mut HashMap<usize, u32>,
-    ) -> u32 {
-        if let Some(&existing) = cache.get(&idx) {
-            return existing;
-        }
-        self.positions.push(position);
-        self.normals.push([0.0, 0.0, 0.0]);
-        let index = (self.positions.len() - 1) as u32;
-        cache.insert(idx, index);
-        index
-    }
-
     fn emit_triangles(&mut self, face_indices: Vec<u32>) {
         for tri in face_indices.chunks_exact(3) {
             let i0 = tri[0] as usize;
@@ -347,71 +390,56 @@ impl MeshBuilder {
 
     fn compute_local_position(
         &self,
-        idx: usize,
-        vertices_qc: &[[i64; 3]],
-        transform: &Transform,
+        idx: u32,
+        model: &CityModel,
     ) -> Result<[f32; 3], anyhow::Error> {
-        let [x_qc, y_qc, z_qc] = vertices_qc[idx];
-        // 1. Dequantize coordinates to input CRS
-        let x_input = (x_qc as f64 * transform.scale[0]) + transform.translate[0];
-        let y_input = (y_qc as f64 * transform.scale[1]) + transform.translate[1];
-        let z_input = (z_qc as f64 * transform.scale[2]) + transform.translate[2] + self.vertical_bias;
-
-        // 2. Transform coordinates from input CRS to ECEF (EPSG:4978)
-        // This ensures coordinate system consistency with root transform (which is in ECEF)
-        let (x_ecef, y_ecef, z_ecef) = self.transformer_to_ecef
-            .convert((x_input, y_input, z_input))
-            .context("Transform vertex coordinates to ECEF")?;
-
-        // 3. Make coordinates relative to root center in ECEF
-        // Root transform will translate these relative coordinates to the correct ECEF position
-        let x_local = (x_ecef - self.root_center_ecef.0) as f32;
-        let y_local = (y_ecef - self.root_center_ecef.1) as f32;
-        let z_local = (z_ecef - self.root_center_ecef.2) as f32;
-        
-        // Debug: log first few coordinates to verify transformation is working
-        if idx == 0 {
-            log::info!("First vertex: input_CRS=({:.2}, {:.2}, {:.2}), ECEF=({:.2}, {:.2}, {:.2}), root_center_ECEF=({:.2}, {:.2}, {:.2}), relative_ECEF=({:.2}, {:.2}, {:.2})",
-                x_input, y_input, z_input,
-                x_ecef, y_ecef, z_ecef,
-                self.root_center_ecef.0, self.root_center_ecef.1, self.root_center_ecef.2,
-                x_local, y_local, z_local);
-        }
-
-        // Return ECEF coordinates relative to root center
-        // Y-up transformation in glTF node will convert from ECEF Z-up to glTF Y-up standard
-        Ok([x_local, y_local, z_local])
+        let vertex = model
+            .get_vertex(VertexIndex::new(idx))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex {idx}"))?;
+        let [x, y, z] = vertex.to_array();
+        Ok([x as f32, y as f32, z as f32])
     }
 
     fn write_glb<P: AsRef<Path>>(&mut self, output_path: P, default_color: &str) -> Result<()> {
         self.normalize_normals();
 
         if self.positions.is_empty() {
-            info!("No geometry to write, creating empty GLB file at {:?}", output_path.as_ref());
-            // Create parent directories if they don't exist
+            info!(
+                "No geometry to write, creating empty GLB file at {:?}",
+                output_path.as_ref()
+            );
             if let Some(parent) = output_path.as_ref().parent() {
                 std::fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create parent directory for {:?}", output_path.as_ref()))?;
+                    .with_context(|| {
+                        format!(
+                            "Failed to create parent directory for {:?}",
+                            output_path.as_ref()
+                        )
+                    })?;
             }
             File::create(output_path.as_ref()).context("Create empty GLB file")?;
             return Ok(());
         }
-        info!("Writing GLB file with {} vertices, {} indices to {:?}", 
-              self.positions.len(), self.indices.len(), output_path.as_ref());
-        // Log root center being used (in ECEF)
-        info!("Root center in MeshBuilder (ECEF): [{:.2}, {:.2}, {:.2}]", 
-              self.root_center_ecef.0, self.root_center_ecef.1, self.root_center_ecef.2);
+        info!(
+            "Writing GLB file with {} vertices and {} indices to {:?}",
+            self.positions.len(),
+            self.indices.len(),
+            output_path.as_ref()
+        );
 
         let mut bin_buffer: Vec<u8> = Vec::new();
 
         let positions_offset = 0;
-        // Log first few positions to verify they're relative
         if !self.positions.is_empty() {
-            info!("First position in self.positions: [{:.2}, {:.2}, {:.2}]", 
-                self.positions[0][0], self.positions[0][1], self.positions[0][2]);
+            info!(
+                "First position in self.positions: [{:.2}, {:.2}, {:.2}]",
+                self.positions[0][0], self.positions[0][1], self.positions[0][2]
+            );
             if self.positions.len() > 1 {
-                info!("Second position in self.positions: [{:.2}, {:.2}, {:.2}]", 
-                    self.positions[1][0], self.positions[1][1], self.positions[1][2]);
+                info!(
+                    "Second position in self.positions: [{:.2}, {:.2}, {:.2}]",
+                    self.positions[1][0], self.positions[1][1], self.positions[1][2]
+                );
             }
         }
         for p in &self.positions {
@@ -540,9 +568,8 @@ impl MeshBuilder {
             json::Index::new(1),
         );
 
-        // Create default PBR material matching pg2b3dm's structure
         let material = create_default_material(default_color)?;
-        
+
         let primitive = json::mesh::Primitive {
             attributes,
             indices: Some(json::Index::new(2)),
@@ -561,24 +588,17 @@ impl MeshBuilder {
             name: None,
         };
 
-        // Apply Y-up transformation matrix to convert from ECEF (Z-up) to glTF standard (Y-up)
-        // GLB content coordinates are in ECEF (Z-up), and this matrix converts them to glTF Y-up format
-        // This matches pg2b3dm's approach - the Y-up matrix is needed in GLB node
-        // Matrix format: [1,0,0,0, 0,0,-1,0, 0,1,0,0, 0,0,0,1] (column-major in glTF JSON)
-        // Transformation: X'=X, Y'=-Z (ECEF Z becomes glTF -Y), Z'=Y (ECEF Y becomes glTF Z)
-        let y_up_matrix = [
-            1.0, 0.0, 0.0, 0.0,   // Column 0: [1, 0, 0, 0] - X axis
-            0.0, 0.0, -1.0, 0.0,  // Column 1: [0, 0, -1, 0] - Y axis becomes -Z
-            0.0, 1.0, 0.0, 0.0,   // Column 2: [0, 1, 0, 0] - Z axis becomes Y
-            0.0, 0.0, 0.0, 1.0,   // Column 3: [0, 0, 0, 1] - Translation/scale
-        ];
-
         let node = json::Node {
             mesh: Some(json::Index::new(0)),
             camera: None,
             children: None,
             skin: None,
-            matrix: Some(y_up_matrix),
+            matrix: Some([
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ]),
             rotation: None,
             scale: None,
             translation: None,
@@ -612,7 +632,7 @@ impl MeshBuilder {
             scene: Some(json::Index::new(0)),
             asset: json::Asset {
                 version: GLTF_VERSION.into(),
-                generator: Some("tyler".into()),
+                generator: Some("cityjson-export".into()),
                 copyright: None,
                 ..Default::default()
             },
@@ -646,13 +666,11 @@ impl MeshBuilder {
                 .with_context(|| format!("Failed to create parent directory for {:?}", output_path.as_ref()))?;
         }
         
-        // Store path for logging before moving
         let output_path_str = output_path.as_ref().to_string_lossy().to_string();
-        
+
         let mut file = File::create(output_path)?;
         file.write_all(&glb_bytes)?;
-        
-        // Log summary for this GLB file
+
         if !self.positions.is_empty() {
             let min_x = self.positions.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
             let max_x = self.positions.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
@@ -660,40 +678,20 @@ impl MeshBuilder {
             let max_y = self.positions.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
             let min_z = self.positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
             let max_z = self.positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
-            
+
             let center_x = (min_x + max_x) / 2.0;
             let center_y = (min_y + max_y) / 2.0;
             let center_z = (min_z + max_z) / 2.0;
-            
-            // Check if coordinates are relative (centered around zero) or absolute (large positive values)
-            // Relative coordinates should be within a few kilometers of zero
-            // Absolute coordinates in BC Albers (EPSG:6654) are typically 100k-500k range
-            let is_relative = min_x < 0.0 || max_x < 100000.0 || (min_x.abs() < 10000.0 && max_x.abs() < 10000.0);
-            
-            info!("═══════════════════════════════════════════════════════════════");
+
             info!("GLB Summary: {}", output_path_str);
-            info!("  Root center (ECEF): [{:.2}, {:.2}, {:.2}]", self.root_center_ecef.0, self.root_center_ecef.1, self.root_center_ecef.2);
             info!("  Vertices: {}", self.positions.len());
-            info!("  Coordinate range (ECEF, relative to root center):");
+            info!("  Coordinate range:");
             info!("    X: [{:.2}, {:.2}] (span: {:.2})", min_x, max_x, max_x - min_x);
             info!("    Y: [{:.2}, {:.2}] (span: {:.2})", min_y, max_y, max_y - min_y);
             info!("    Z: [{:.2}, {:.2}] (span: {:.2})", min_z, max_z, max_z - min_z);
             info!("  Coordinate center: [{:.2}, {:.2}, {:.2}]", center_x, center_y, center_z);
-            if !self.positions.is_empty() {
-                info!("  First position: [{:.2}, {:.2}, {:.2}]", 
-                    self.positions[0][0], self.positions[0][1], self.positions[0][2]);
-            }
-            // ECEF coordinates relative to root center should be small (within a few kilometers)
-            // Absolute ECEF coordinates would be very large (millions of meters from Earth center)
-            if is_relative {
-                info!("  ✓ Status: RELATIVE to root center in ECEF (coordinates are local)");
-            } else {
-                info!("  ⚠️  Status: Coordinates may be absolute (check if values are very large)");
-                info!("     Expected: coordinates should be relative (small values, within a few km)");
-            }
-            info!("═══════════════════════════════════════════════════════════════");
         }
-        
+
         Ok(())
     }
 
@@ -714,4 +712,3 @@ impl MeshBuilder {
         }
     }
 }
-
