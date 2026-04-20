@@ -1,26 +1,23 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use cityjson_index::{CityIndex, IndexedFeatureRef};
 use cityjson_lib::cityjson::v2_0::{GeometryType, VertexIndex};
-use cityjson_lib::json::staged::from_feature_file_with_base;
 use cityjson_lib::CityModel;
 use earcutr::earcut;
-use gltf::json as json;
+use gltf::json;
 use log::info;
-
-use crate::parser::{FeatureReference, InputSource, World};
-use crate::spatial_structs::{QuadTree, QuadTreeNodeId};
 
 const GLTF_VERSION: &str = "2.0";
 
 /// Parse hex color string (#RRGGBB) to RGBA f32 array [R, G, B, A]
 fn hex_to_rgba(hex: &str) -> Result<[f32; 4], anyhow::Error> {
     if hex.len() != 7 || !hex.starts_with('#') {
-        return Err(anyhow::anyhow!("Invalid hex color format: expected #RRGGBB"));
+        return Err(anyhow::anyhow!(
+            "Invalid hex color format: expected #RRGGBB"
+        ));
     }
     let hex_digits = &hex[1..];
     let r = u8::from_str_radix(&hex_digits[0..2], 16)?;
@@ -37,13 +34,13 @@ fn hex_to_rgba(hex: &str) -> Result<[f32; 4], anyhow::Error> {
 /// Create default PBR material matching pg2b3dm's structure
 fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::Error> {
     let base_color_rgba = hex_to_rgba(base_color)?;
-    
+
     // Metallic roughness factor from pg2b3dm default: #008000
     // Green channel = 128/255 = 0.501960... (roughness)
     // Red channel = 0/255 = 0.0 (metallic)
     let roughness_factor = 128.0 / 255.0;
     let metallic_factor = 0.0;
-    
+
     Ok(json::Material {
         name: None,
         extensions: Default::default(),
@@ -67,121 +64,19 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
     })
 }
 
-pub fn write_tile_glb<P: AsRef<Path>>(
-    world: &World,
-    quadtree: &QuadTree,
-    qtree_node_id: QuadTreeNodeId,
+pub fn write_city_model_glb<P: AsRef<Path>>(
+    model: &CityModel,
     output_path: P,
     default_color: &str,
 ) -> Result<()> {
-    info!("write_tile_glb called for node {:?}, output: {:?}", qtree_node_id, output_path.as_ref());
-    let qtree_node = quadtree
-        .node(&qtree_node_id)
-        .context("Tile not present in quadtree")?;
-    let feature_reader = FeatureReader::new(world)?;
     let mut builder = MeshBuilder::new();
-    let mut feature_count = 0usize;
-
-    for feature_id in collect_tile_feature_ids(world, qtree_node) {
-        let feature = &world.features[feature_id];
-        let model = feature_reader.load(&feature.reference)?;
-        builder.add_model(&model)?;
-        feature_count += 1;
-    }
-
+    builder.add_model(model)?;
     info!(
-        "Processed {} features for the output GLB, writing {} vertices and {} indices",
-        feature_count,
+        "Processed {} vertices and {} indices for the output GLB",
         builder.positions.len(),
         builder.indices.len()
     );
-
     builder.write_glb(output_path, default_color)
-}
-
-enum FeatureReader {
-    Legacy {
-        features_root: PathBuf,
-        feature_base_document: Vec<u8>,
-    },
-    CjIndex {
-        city_index: CityIndex,
-        refs_by_id: HashMap<String, IndexedFeatureRef>,
-    },
-}
-
-impl FeatureReader {
-    fn new(world: &World) -> Result<Self> {
-        match &world.input_source {
-            InputSource::LegacyFeatureFiles { features_root } => Ok(Self::Legacy {
-                features_root: features_root.clone(),
-                feature_base_document: world.feature_base_document.clone(),
-            }),
-            InputSource::CjIndexDataset { .. } => {
-                let city_index = world
-                    .input_source
-                    .open_index()
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                let mut refs_by_id = HashMap::new();
-                for page_result in city_index.iter_all_feature_ref_pages(4096)? {
-                    for feature_ref in page_result? {
-                        refs_by_id.insert(feature_ref.feature_id.clone(), feature_ref);
-                    }
-                }
-                Ok(Self::CjIndex {
-                    city_index,
-                    refs_by_id,
-                })
-            }
-        }
-    }
-
-    fn load(&self, reference: &FeatureReference) -> Result<CityModel> {
-        match (self, reference) {
-            (
-                Self::Legacy {
-                    features_root,
-                    feature_base_document,
-                },
-                FeatureReference::LegacyPath(relative_path),
-            ) => {
-                let feature_path = features_root.join(relative_path);
-                from_feature_file_with_base(&feature_path, feature_base_document)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-            }
-            (Self::CjIndex { city_index, refs_by_id }, FeatureReference::CjIndexId(feature_id)) => {
-                let indexed = refs_by_id
-                    .get(feature_id)
-                    .ok_or_else(|| anyhow::anyhow!("missing cjindex feature reference {feature_id}"))?;
-                city_index
-                    .read_feature(indexed)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))
-            }
-            (Self::Legacy { .. }, FeatureReference::CjIndexId(_)) => {
-                Err(anyhow::anyhow!("legacy input unexpectedly referenced a cjindex feature"))
-            }
-            (Self::CjIndex { .. }, FeatureReference::LegacyPath(_)) => {
-                Err(anyhow::anyhow!("cjindex input unexpectedly referenced a legacy feature path"))
-            }
-        }
-    }
-}
-
-fn collect_tile_feature_ids(
-    world: &World,
-    qtree_node: &QuadTree,
-) -> Vec<usize> {
-    let mut seen = std::collections::HashSet::new();
-    let mut feature_ids = Vec::new();
-    for cellid in qtree_node.cells() {
-        let cell = world.grid.cell(cellid);
-        for fid in &cell.feature_ids {
-            if seen.insert(*fid) {
-                feature_ids.push(*fid);
-            }
-        }
-    }
-    feature_ids
 }
 
 struct MeshBuilder {
@@ -247,12 +142,7 @@ impl MeshBuilder {
         Ok(())
     }
 
-    fn vertex_index(
-        &mut self,
-        idx: u32,
-        position: [f32; 3],
-        cache: &mut HashMap<u32, u32>,
-    ) -> u32 {
+    fn vertex_index(&mut self, idx: u32, position: [f32; 3], cache: &mut HashMap<u32, u32>) -> u32 {
         if let Some(&existing) = cache.get(&idx) {
             return existing;
         }
@@ -409,13 +299,12 @@ impl MeshBuilder {
                 output_path.as_ref()
             );
             if let Some(parent) = output_path.as_ref().parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| {
-                        format!(
-                            "Failed to create parent directory for {:?}",
-                            output_path.as_ref()
-                        )
-                    })?;
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "Failed to create parent directory for {:?}",
+                        output_path.as_ref()
+                    )
+                })?;
             }
             File::create(output_path.as_ref()).context("Create empty GLB file")?;
             return Ok(());
@@ -430,18 +319,6 @@ impl MeshBuilder {
         let mut bin_buffer: Vec<u8> = Vec::new();
 
         let positions_offset = 0;
-        if !self.positions.is_empty() {
-            info!(
-                "First position in self.positions: [{:.2}, {:.2}, {:.2}]",
-                self.positions[0][0], self.positions[0][1], self.positions[0][2]
-            );
-            if self.positions.len() > 1 {
-                info!(
-                    "Second position in self.positions: [{:.2}, {:.2}, {:.2}]",
-                    self.positions[1][0], self.positions[1][1], self.positions[1][2]
-                );
-            }
-        }
         for p in &self.positions {
             for component in p {
                 bin_buffer.extend_from_slice(&component.to_le_bytes());
@@ -471,7 +348,11 @@ impl MeshBuilder {
             min: Some(json::Value::Array(
                 (0..3)
                     .map(|axis| {
-                        let min = self.positions.iter().map(|v| v[axis]).fold(f32::INFINITY, f32::min);
+                        let min = self
+                            .positions
+                            .iter()
+                            .map(|v| v[axis])
+                            .fold(f32::INFINITY, f32::min);
                         json::Value::from(min)
                     })
                     .collect(),
@@ -479,7 +360,11 @@ impl MeshBuilder {
             max: Some(json::Value::Array(
                 (0..3)
                     .map(|axis| {
-                        let max = self.positions.iter().map(|v| v[axis]).fold(f32::NEG_INFINITY, f32::max);
+                        let max = self
+                            .positions
+                            .iter()
+                            .map(|v| v[axis])
+                            .fold(f32::NEG_INFINITY, f32::max);
                         json::Value::from(max)
                     })
                     .collect(),
@@ -517,7 +402,12 @@ impl MeshBuilder {
             )),
             normalized: false,
             min: Some(json::Value::from(vec![0])),
-            max: Some(json::Value::from(vec![self.indices.iter().copied().max().unwrap_or(0)])),
+            max: Some(json::Value::from(vec![self
+                .indices
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)])),
             type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
             extensions: Default::default(),
             extras: Default::default(),
@@ -531,7 +421,9 @@ impl MeshBuilder {
                 byte_length: json::validation::USize64((self.positions.len() * 12) as u64),
                 byte_offset: Some(json::validation::USize64(positions_offset as u64)),
                 byte_stride: Some(json::buffer::Stride(12)),
-                target: Some(json::validation::Checked::Valid(json::buffer::Target::ArrayBuffer)),
+                target: Some(json::validation::Checked::Valid(
+                    json::buffer::Target::ArrayBuffer,
+                )),
                 extensions: Default::default(),
                 extras: Default::default(),
                 name: None,
@@ -541,7 +433,9 @@ impl MeshBuilder {
                 byte_length: json::validation::USize64((self.normals.len() * 12) as u64),
                 byte_offset: Some(json::validation::USize64(normals_offset as u64)),
                 byte_stride: Some(json::buffer::Stride(12)),
-                target: Some(json::validation::Checked::Valid(json::buffer::Target::ArrayBuffer)),
+                target: Some(json::validation::Checked::Valid(
+                    json::buffer::Target::ArrayBuffer,
+                )),
                 extensions: Default::default(),
                 extras: Default::default(),
                 name: None,
@@ -551,7 +445,9 @@ impl MeshBuilder {
                 byte_length: json::validation::USize64((self.indices.len() * 4) as u64),
                 byte_offset: Some(json::validation::USize64(indices_offset as u64)),
                 byte_stride: None,
-                target: Some(json::validation::Checked::Valid(json::buffer::Target::ElementArrayBuffer)),
+                target: Some(json::validation::Checked::Valid(
+                    json::buffer::Target::ElementArrayBuffer,
+                )),
                 extensions: Default::default(),
                 extras: Default::default(),
                 name: None,
@@ -641,10 +537,10 @@ impl MeshBuilder {
 
         let mut json_bytes = json::serialize::to_string(&root)?.into_bytes();
         let json_padding = (4 - (json_bytes.len() % 4)) % 4;
-        json_bytes.extend(std::iter::repeat(b' ').take(json_padding));
+        json_bytes.extend(std::iter::repeat_n(b' ', json_padding));
 
         let bin_padding = (4 - (bin_buffer.len() % 4)) % 4;
-        bin_buffer.extend(std::iter::repeat(0).take(bin_padding));
+        bin_buffer.extend(std::iter::repeat_n(0u8, bin_padding));
 
         let total_length = 12 + 8 + json_bytes.len() + 8 + bin_buffer.len();
         let mut glb_bytes = Vec::with_capacity(total_length);
@@ -660,36 +556,79 @@ impl MeshBuilder {
         glb_bytes.extend_from_slice(b"BIN\0");
         glb_bytes.extend_from_slice(&bin_buffer);
 
-        // Create parent directories if they don't exist
         if let Some(parent) = output_path.as_ref().parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create parent directory for {:?}", output_path.as_ref()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create parent directory for {:?}",
+                    output_path.as_ref()
+                )
+            })?;
         }
-        
-        let output_path_str = output_path.as_ref().to_string_lossy().to_string();
 
-        let mut file = File::create(output_path)?;
+        let mut file = File::create(output_path.as_ref())?;
         file.write_all(&glb_bytes)?;
 
         if !self.positions.is_empty() {
-            let min_x = self.positions.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
-            let max_x = self.positions.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
-            let min_y = self.positions.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
-            let max_y = self.positions.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
-            let min_z = self.positions.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
-            let max_z = self.positions.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+            let min_x = self
+                .positions
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::INFINITY, f32::min);
+            let max_x = self
+                .positions
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_y = self
+                .positions
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::INFINITY, f32::min);
+            let max_y = self
+                .positions
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let min_z = self
+                .positions
+                .iter()
+                .map(|p| p[2])
+                .fold(f32::INFINITY, f32::min);
+            let max_z = self
+                .positions
+                .iter()
+                .map(|p| p[2])
+                .fold(f32::NEG_INFINITY, f32::max);
 
             let center_x = (min_x + max_x) / 2.0;
             let center_y = (min_y + max_y) / 2.0;
             let center_z = (min_z + max_z) / 2.0;
 
-            info!("GLB Summary: {}", output_path_str);
+            info!("GLB Summary: {:?}", output_path.as_ref());
             info!("  Vertices: {}", self.positions.len());
             info!("  Coordinate range:");
-            info!("    X: [{:.2}, {:.2}] (span: {:.2})", min_x, max_x, max_x - min_x);
-            info!("    Y: [{:.2}, {:.2}] (span: {:.2})", min_y, max_y, max_y - min_y);
-            info!("    Z: [{:.2}, {:.2}] (span: {:.2})", min_z, max_z, max_z - min_z);
-            info!("  Coordinate center: [{:.2}, {:.2}, {:.2}]", center_x, center_y, center_z);
+            info!(
+                "    X: [{:.2}, {:.2}] (span: {:.2})",
+                min_x,
+                max_x,
+                max_x - min_x
+            );
+            info!(
+                "    Y: [{:.2}, {:.2}] (span: {:.2})",
+                min_y,
+                max_y,
+                max_y - min_y
+            );
+            info!(
+                "    Z: [{:.2}, {:.2}] (span: {:.2})",
+                min_z,
+                max_z,
+                max_z - min_z
+            );
+            info!(
+                "  Coordinate center: [{:.2}, {:.2}, {:.2}]",
+                center_x, center_y, center_z
+            );
         }
 
         Ok(())
@@ -697,7 +636,8 @@ impl MeshBuilder {
 
     fn normalize_normals(&mut self) {
         for normal in self.normals.iter_mut() {
-            let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
             if length > f32::EPSILON {
                 normal[0] /= length;
                 normal[1] /= length;

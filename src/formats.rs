@@ -194,7 +194,11 @@ pub mod cesium3dtiles {
                 (root_bbox[2] + root_bbox[5]) * 0.5,
             ];
             let root_center_ecef = transformer_to_ecef
-                .convert((root_center_original[0], root_center_original[1], root_center_original[2]))
+                .convert((
+                    root_center_original[0],
+                    root_center_original[1],
+                    root_center_original[2],
+                ))
                 .unwrap();
 
             log::info!("Root center for tileset transform - input CRS: [{:.2}, {:.2}, {:.2}], ECEF: [{:.2}, {:.2}, {:.2}]",
@@ -203,9 +207,18 @@ pub mod cesium3dtiles {
 
             // Create identity transform with translation to ECEF center
             let root_transform = Transform([
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
                 root_center_ecef.0,
                 root_center_ecef.1,
                 root_center_ecef.2,
@@ -226,7 +239,8 @@ pub mod cesium3dtiles {
 
             Self {
                 asset: Default::default(),
-                geometric_error: geometric_error_above_leaf + root_with_transform.geometric_error * 1.5,
+                geometric_error: geometric_error_above_leaf
+                    + root_with_transform.geometric_error * 1.5,
                 root: root_with_transform,
                 properties: None,
                 extensions_used: Some(vec![ExtensionName::ContentGltf]),
@@ -375,7 +389,7 @@ pub mod cesium3dtiles {
                 let dz = tile_bbox[5] - tile_bbox[2];
                 let diagonal = (dx * dx + dy * dy + dz * dz).sqrt();
                 let leaf_geometric_error = diagonal * 0.001; // 0.1% of diagonal as minimum
-                // Ensure minimum value of 0.1 to avoid issues with very small tiles
+                                                             // Ensure minimum value of 0.1 to avoid issues with very small tiles
                 let geometric_error = leaf_geometric_error.max(0.1);
 
                 // For 3D Tiles with geographic 3D bounding volumes, GLB content uses input CRS (local coordinate system)

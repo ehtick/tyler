@@ -317,25 +317,12 @@ name = "cityjson-export"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
- "bitvec",
- "cityjson-index",
  "cityjson-lib",
  "clap 4.6.1",
  "earcutr",
  "env_logger 0.10.2",
  "gltf",
- "libc",
  "log",
- "morton-encoding",
- "num-traits",
- "proj-sys",
- "rayon",
- "serde",
- "serde_json",
- "serde_repr",
- "thiserror 1.0.69",
- "walkdir",
 ]
 
 [[package]]

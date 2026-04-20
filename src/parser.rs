@@ -435,9 +435,9 @@ impl World {
             };
 
             if needs_open {
-                let city_index = input_source
-                    .open_index()
-                    .map_err(|error| cityjson_lib::Error::Io(std::io::Error::other(error.to_string())))?;
+                let city_index = input_source.open_index().map_err(|error| {
+                    cityjson_lib::Error::Io(std::io::Error::other(error.to_string()))
+                })?;
                 *cell.borrow_mut() = Some((index_path.clone(), city_index));
             }
 
@@ -675,12 +675,8 @@ impl World {
         let stats = selected_geometry_stats(model, self.cityobject_types.as_ref());
         let bbox = stats.bbox?;
         let centroid = stats.centroid?;
-        let cell_vtx_cnt = count_vertices_in_grid(
-            model,
-            &stats.selected_vertices,
-            &self.grid,
-            &bbox,
-        );
+        let cell_vtx_cnt =
+            count_vertices_in_grid(model, &stats.selected_vertices, &self.grid, &bbox);
         if cell_vtx_cnt.is_empty() {
             return None;
         }
@@ -1106,7 +1102,11 @@ mod tests {
         if direct.exists() {
             direct
         } else {
-            manifest.join("..").join("resources").join("data").join(name)
+            manifest
+                .join("..")
+                .join("resources")
+                .join("data")
+                .join(name)
         }
     }
 
@@ -1122,8 +1122,7 @@ mod tests {
         let pb = resource_path("3dbag_feature_x71.city.jsonl");
         let base = std::fs::read(resource_path("3dbag_x00.city.json")).unwrap();
         let model = from_feature_file_with_base(pb, &base).unwrap();
-        let stats =
-            selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
         assert!(stats.bbox.is_some());
         assert!(!stats.selected_vertices.is_empty());
         let bbox = stats.bbox.unwrap();
@@ -1184,8 +1183,7 @@ mod tests {
         std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
 
         let model = from_feature_file_with_base(&feature_path, &base).unwrap();
-        let stats =
-            selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
         let grid = crate::spatial_structs::SquareGrid::new(
             &[0.0, 0.0, 0.0, 200.0, 200.0, 10.0],
             100,
