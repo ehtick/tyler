@@ -19,17 +19,30 @@ lint:
 fmt:
     cargo fmt --package tyler --package cityjson-convert
 
+# Check workspace formatting without rewriting files.
+fmt-check:
+    cargo fmt --package tyler --package cityjson-convert --check
+
 # Run the workspace tests with all features enabled.
 test:
     cargo test --workspace --all-targets --all-features --exclude proj-sys
 
-# Clean the workspace by removing all build artifacts.
+# Clean the workspace by removing all build artifacts and test artifacts.
 clean:
     cargo clean
+    rm -rf tests/output
 
 # Run the full local validation sequence.
 ci:
     just fmt
+    just lint
+    just check
+    just build
+    just test
+
+# Run the full validation sequence without modifying files.
+ci-check:
+    just fmt-check
     just lint
     just check
     just build
