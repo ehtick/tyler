@@ -1,21 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cityjson_convert::{convert_to_glb, ExportOptions};
 use cityjson_lib::json;
 use serde_json::Value;
-
-fn test_output_path(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "cityjson-convert-{name}-{}-{unique}.glb",
-        std::process::id()
-    ))
-}
 
 fn stable_output_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -38,11 +26,17 @@ fn read_glb_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(&bytes[20..20 + json_length]).expect("GLB JSON chunk should parse")
 }
 
+fn has_extension(root: &Value, name: &str) -> bool {
+    root["extensionsUsed"]
+        .as_array()
+        .is_some_and(|extensions| extensions.iter().any(|value| value.as_str() == Some(name)))
+}
+
 #[test]
 fn convert_to_glb_writes_expected_geometry_layout() {
-    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_building_part.city.jsonl"))
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
         .expect("fixture feature stream should parse");
-    let output_path = test_output_path("ams-up-geometry");
+    let output_path = stable_output_path("ams-up-geometry");
 
     convert_to_glb(&model, &output_path, &ExportOptions::default())
         .expect("GLB conversion should succeed");
@@ -123,34 +117,102 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     assert_eq!(mesh["attributes"]["POSITION"].as_u64().unwrap(), 0);
     assert_eq!(mesh["attributes"]["NORMAL"].as_u64().unwrap(), 1);
     assert_eq!(mesh["indices"].as_u64().unwrap(), 2);
-
-    let _ = fs::remove_file(output_path);
 }
 
 #[test]
-fn convert_to_glb_triangulates_surfaces_with_holes() {
+fn convert_to_glb_can_disable_quantization_and_compression() {
     let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
-        .expect("hole fixture feature stream should parse");
-    let output_path = stable_output_path("ams_up_holes");
+        .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("ams-up-raw");
+    let options = ExportOptions {
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
 
-    convert_to_glb(&model, &output_path, &ExportOptions::default())
-        .expect("GLB conversion should succeed for hole-bearing geometry");
+    convert_to_glb(&model, &output_path, &options).expect("raw GLB conversion should succeed");
 
     let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
     let root = read_glb_json(&glb_bytes);
+
     let accessors = root["accessors"]
         .as_array()
         .expect("glTF should contain accessors");
+    assert_eq!(accessors[0]["componentType"].as_u64().unwrap(), 5126);
+    assert_eq!(accessors[1]["componentType"].as_u64().unwrap(), 5126);
+    assert_eq!(accessors[2]["componentType"].as_u64().unwrap(), 5123);
+    assert!(!has_extension(&root, "KHR_mesh_quantization"));
+    assert!(!has_extension(&root, "EXT_meshopt_compression"));
 
-    assert!(
-        accessors[0]["count"].as_u64().unwrap() > 0,
-        "hole-bearing feature should still produce position data"
-    );
+    let buffers = root["buffers"].as_array().expect("glTF should contain buffers");
+    assert_eq!(buffers.len(), 1, "uncompressed output should contain a single GLB buffer");
+
+    let buffer_views = root["bufferViews"]
+        .as_array()
+        .expect("glTF should contain bufferViews");
+    for (index, buffer_view) in buffer_views.iter().enumerate() {
+        assert_eq!(
+            buffer_view["buffer"].as_u64().unwrap(),
+            0,
+            "bufferView {index} should point at the GLB BIN buffer"
+        );
+        assert!(
+            buffer_view.get("extensions").is_none(),
+            "bufferView {index} should not carry meshopt extension metadata"
+        );
+    }
+
+    let node_matrix = root["nodes"][0]["matrix"]
+        .as_array()
+        .expect("root node should carry the local-to-world transform");
+    assert_eq!(node_matrix[0].as_f64().unwrap(), 1.0);
+    assert_eq!(node_matrix[6].as_f64().unwrap(), -1.0);
+    assert_eq!(node_matrix[9].as_f64().unwrap(), 1.0);
+}
+
+#[test]
+fn convert_to_glb_can_disable_only_meshopt_compression() {
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("ams-up-quantized-uncompressed");
+    let options = ExportOptions {
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options)
+        .expect("quantized uncompressed GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+
+    let accessors = root["accessors"]
+        .as_array()
+        .expect("glTF should contain accessors");
+    assert_eq!(accessors[0]["componentType"].as_u64().unwrap(), 5122);
+    assert_eq!(accessors[1]["componentType"].as_u64().unwrap(), 5120);
+    assert!(has_extension(&root, "KHR_mesh_quantization"));
+    assert!(!has_extension(&root, "EXT_meshopt_compression"));
     assert_eq!(
-        root["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap(),
-        2,
-        "primitive should still reference the shared index accessor"
+        root["buffers"].as_array().expect("glTF should contain buffers").len(),
+        1,
+        "disabling meshopt compression should remove the fallback buffer"
     );
+
+    let buffer_views = root["bufferViews"]
+        .as_array()
+        .expect("glTF should contain bufferViews");
+    for (index, buffer_view) in buffer_views.iter().enumerate() {
+        assert_eq!(
+            buffer_view["buffer"].as_u64().unwrap(),
+            0,
+            "bufferView {index} should point at the GLB BIN buffer"
+        );
+        assert!(
+            buffer_view.get("extensions").is_none(),
+            "bufferView {index} should not carry meshopt extension metadata"
+        );
+    }
 }
 
 #[test]
@@ -160,16 +222,10 @@ fn convert_to_glb_merges_multiple_features_into_one_centered_mesh() {
 }
 
 #[test]
-#[ignore = "TODO: enable once quantization lands in the geometry pipeline"]
-fn convert_to_glb_quantizes_geometry_when_enabled() {
-    todo!("assert accessor component types, dequantization transform, and acceptable coordinate error");
-}
-
-#[test]
 fn convert_to_glb_writes_meshopt_compression_extension() {
-    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_building_part.city.jsonl"))
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
         .expect("fixture feature stream should parse");
-    let output_path = test_output_path("ams-up-meshopt");
+    let output_path = stable_output_path("ams-up-meshopt");
 
     convert_to_glb(&model, &output_path, &ExportOptions::default())
         .expect("GLB conversion should succeed");
@@ -227,6 +283,4 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
             .unwrap(),
         "TRIANGLES"
     );
-
-    let _ = fs::remove_file(output_path);
 }

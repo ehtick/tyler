@@ -83,6 +83,8 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     model: &CityModel,
     output_path: P,
     default_color: &str,
+    quantize_geometry: bool,
+    meshopt_compression: bool,
 ) -> Result<()> {
     let mut collector = MeshCollector::new();
     collector.add_model(model)?;
@@ -92,7 +94,12 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
         processed.vertex_count(),
         processed.index_count()
     );
-    processed.write_glb(output_path, default_color)
+    processed.write_glb(
+        output_path,
+        default_color,
+        quantize_geometry,
+        meshopt_compression,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -261,6 +268,18 @@ struct QuantizedPosition {
 #[repr(C)]
 struct QuantizedNormal {
     normal: [i8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct FloatPosition {
+    position: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct FloatNormal {
+    normal: [f32; 3],
 }
 
 struct QuantizedMesh {
@@ -606,7 +625,13 @@ impl ProcessedMesh {
         }
     }
 
-    fn write_glb<P: AsRef<Path>>(&self, output_path: P, default_color: &str) -> Result<()> {
+    fn write_glb<P: AsRef<Path>>(
+        &self,
+        output_path: P,
+        default_color: &str,
+        quantize_geometry: bool,
+        meshopt_compression: bool,
+    ) -> Result<()> {
         if self.vertices.is_empty() {
             info!(
                 "No geometry to write, creating empty GLB file at {}",
@@ -631,8 +656,7 @@ impl ProcessedMesh {
             output_path.as_ref().display()
         );
 
-        let quantized = self.quantize()?;
-        let encoded = quantized.encode_glb(default_color)?;
+        let encoded = self.encode_glb(default_color, quantize_geometry, meshopt_compression)?;
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
@@ -652,6 +676,19 @@ impl ProcessedMesh {
         );
 
         Ok(())
+    }
+
+    fn encode_glb(
+        &self,
+        default_color: &str,
+        quantize_geometry: bool,
+        meshopt_compression: bool,
+    ) -> Result<EncodedGlb> {
+        if quantize_geometry {
+            self.quantize()?.encode_glb(default_color, meshopt_compression)
+        } else {
+            self.encode_raw_glb(default_color, meshopt_compression)
+        }
     }
 
     fn quantize(&self) -> Result<QuantizedMesh> {
@@ -720,121 +757,156 @@ impl ProcessedMesh {
             center: self.center,
         })
     }
+
+    fn encode_raw_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
+        let bounds = self
+            .bounds
+            .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
+        let index_buffer = self.select_index_buffer()?;
+
+        let mut buffer_builder = BufferBuilder::default();
+        let vertex_accessors =
+            buffer_builder.push_float_vertices(&self.vertices, &bounds, meshopt_compression)?;
+        let index_accessor =
+            buffer_builder.push_indices(&index_buffer, self.vertices.len(), meshopt_compression)?;
+
+        build_encoded_glb(
+            buffer_builder,
+            default_color,
+            vertex_accessors,
+            index_accessor,
+            build_node_matrix(1.0, self.center),
+            false,
+            meshopt_compression,
+        )
+    }
 }
 
 impl QuantizedMesh {
-    fn encode_glb(&self, default_color: &str) -> Result<EncodedGlb> {
+    fn encode_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
         let mut buffer_builder = BufferBuilder::default();
         let vertex_accessors = buffer_builder.push_quantized_vertices(
             &self.positions,
             &self.normals,
             &self.normalized_bounds,
+            meshopt_compression,
         )?;
-        let index_accessor = buffer_builder.push_indices(&self.indices, self.positions.len())?;
+        let index_accessor =
+            buffer_builder.push_indices(&self.indices, self.positions.len(), meshopt_compression)?;
 
-        let mut attributes = std::collections::BTreeMap::new();
-        attributes.insert(
-            json::validation::Checked::Valid(json::mesh::Semantic::Positions),
-            vertex_accessors.positions,
-        );
-        attributes.insert(
-            json::validation::Checked::Valid(json::mesh::Semantic::Normals),
-            vertex_accessors.normals,
-        );
+        build_encoded_glb(
+            buffer_builder,
+            default_color,
+            vertex_accessors,
+            index_accessor,
+            build_node_matrix(self.position_scale, self.center),
+            true,
+            meshopt_compression,
+        )
+    }
+}
 
-        let material = create_default_material(default_color)?;
+fn build_encoded_glb(
+    buffer_builder: BufferBuilder,
+    default_color: &str,
+    vertex_accessors: VertexAccessors,
+    index_accessor: json::Index<json::Accessor>,
+    node_matrix: [f32; 16],
+    quantization_enabled: bool,
+    meshopt_compression: bool,
+) -> Result<EncodedGlb> {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert(
+        json::validation::Checked::Valid(json::mesh::Semantic::Positions),
+        vertex_accessors.positions,
+    );
+    attributes.insert(
+        json::validation::Checked::Valid(json::mesh::Semantic::Normals),
+        vertex_accessors.normals,
+    );
 
-        let primitive = json::mesh::Primitive {
-            attributes,
-            indices: Some(index_accessor),
-            material: Some(json::Index::new(0)),
-            mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
-            targets: None,
+    let material = create_default_material(default_color)?;
+
+    let primitive = json::mesh::Primitive {
+        attributes,
+        indices: Some(index_accessor),
+        material: Some(json::Index::new(0)),
+        mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
+        targets: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+    };
+
+    let mesh = json::Mesh {
+        primitives: vec![primitive],
+        weights: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+        name: None,
+    };
+
+    let node = json::Node {
+        mesh: Some(json::Index::new(0)),
+        camera: None,
+        children: None,
+        skin: None,
+        matrix: Some(node_matrix),
+        rotation: None,
+        scale: None,
+        translation: None,
+        weights: None,
+        extensions: Default::default(),
+        extras: Default::default(),
+        name: None,
+    };
+
+    let scene = json::Scene {
+        nodes: vec![json::Index::new(0)],
+        extensions: Default::default(),
+        extras: Default::default(),
+        name: None,
+    };
+
+    let mut extensions_used = Vec::new();
+    let mut extensions_required = Vec::new();
+    if quantization_enabled {
+        extensions_used.push(QUANTIZATION_EXTENSION.to_string());
+        extensions_required.push(QUANTIZATION_EXTENSION.to_string());
+    }
+    if meshopt_compression {
+        extensions_used.push(MESHOPT_EXTENSION.to_string());
+        extensions_required.push(MESHOPT_EXTENSION.to_string());
+    }
+
+    let mut buffers = vec![json::Buffer {
+        byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
+        uri: None,
+        name: Some("buffer0".into()),
+        extensions: Default::default(),
+        extras: Default::default(),
+    }];
+    if meshopt_compression {
+        buffers.push(json::Buffer {
+            byte_length: json::validation::USize64(buffer_builder.fallback_buffer_length as u64),
+            uri: None,
+            name: Some("fallback".into()),
             extensions: Default::default(),
             extras: Default::default(),
-        };
+        });
+    }
 
-        let mesh = json::Mesh {
-            primitives: vec![primitive],
-            weights: None,
-            extensions: Default::default(),
-            extras: Default::default(),
-            name: None,
-        };
-
-        let node = json::Node {
-            mesh: Some(json::Index::new(0)),
-            camera: None,
-            children: None,
-            skin: None,
-            matrix: Some([
-                self.position_scale,
-                0.0,
-                0.0,
-                0.0, //
-                0.0,
-                0.0,
-                -self.position_scale,
-                0.0, //
-                0.0,
-                self.position_scale,
-                0.0,
-                0.0, //
-                self.center[0],
-                self.center[2],
-                -self.center[1],
-                1.0,
-            ]),
-            rotation: None,
-            scale: None,
-            translation: None,
-            weights: None,
-            extensions: Default::default(),
-            extras: Default::default(),
-            name: None,
-        };
-
-        let scene = json::Scene {
-            nodes: vec![json::Index::new(0)],
-            extensions: Default::default(),
-            extras: Default::default(),
-            name: None,
-        };
-
-        let root = json::Root {
+    Ok(EncodedGlb {
+        root: json::Root {
             accessors: buffer_builder.accessors,
-            buffers: vec![
-                json::Buffer {
-                    byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
-                    uri: None,
-                    name: Some("buffer0".into()),
-                    extensions: Default::default(),
-                    extras: Default::default(),
-                },
-                json::Buffer {
-                    byte_length: json::validation::USize64(
-                        buffer_builder.fallback_buffer_length as u64,
-                    ),
-                    uri: None,
-                    name: Some("fallback".into()),
-                    extensions: Default::default(),
-                    extras: Default::default(),
-                },
-            ],
+            buffers,
             buffer_views: buffer_builder.buffer_views,
             materials: vec![material],
             meshes: vec![mesh],
             nodes: vec![node],
             scenes: vec![scene],
             scene: Some(json::Index::new(0)),
-            extensions_used: vec![
-                QUANTIZATION_EXTENSION.to_string(),
-                MESHOPT_EXTENSION.to_string(),
-            ],
-            extensions_required: vec![
-                QUANTIZATION_EXTENSION.to_string(),
-                MESHOPT_EXTENSION.to_string(),
-            ],
+            extensions_used,
+            extensions_required,
             asset: json::Asset {
                 version: GLTF_VERSION.into(),
                 generator: Some("cityjson-convert".into()),
@@ -842,14 +914,19 @@ impl QuantizedMesh {
                 ..Default::default()
             },
             ..Default::default()
-        };
+        },
+        bin_buffer: buffer_builder.bytes,
+        meshopt_views: buffer_builder.meshopt_views,
+    })
+}
 
-        Ok(EncodedGlb {
-            root,
-            bin_buffer: buffer_builder.bytes,
-            meshopt_views: buffer_builder.meshopt_views,
-        })
-    }
+fn build_node_matrix(scale: f32, center: [f32; 3]) -> [f32; 16] {
+    [
+        scale, 0.0, 0.0, 0.0, //
+        0.0, 0.0, -scale, 0.0, //
+        0.0, scale, 0.0, 0.0, //
+        center[0], center[2], -center[1], 1.0,
+    ]
 }
 
 impl BufferBuilder {
@@ -858,19 +935,28 @@ impl BufferBuilder {
         positions: &[QuantizedPosition],
         normals: &[QuantizedNormal],
         bounds: &Bounds,
+        meshopt_compression: bool,
     ) -> Result<VertexAccessors> {
-        let position_bytes = encode_vertex_buffer(positions)
-            .context("failed to meshopt-encode quantized position stream")?;
-        let position_view = self.push_meshopt_buffer_view(
-            position_bytes,
-            positions.len() * QUANTIZED_POSITION_STRIDE,
-            Some(QUANTIZED_POSITION_STRIDE),
-            positions.len(),
-            json::buffer::Target::ArrayBuffer,
-            "ATTRIBUTES",
-            None,
-            std::mem::align_of::<i16>(),
-        );
+        let position_view = if meshopt_compression {
+            let position_bytes = encode_vertex_buffer(positions)
+                .context("failed to meshopt-encode quantized position stream")?;
+            self.push_meshopt_buffer_view(
+                position_bytes,
+                positions.len() * QUANTIZED_POSITION_STRIDE,
+                Some(QUANTIZED_POSITION_STRIDE),
+                positions.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<i16>(),
+            )
+        } else {
+            self.push_buffer_view(
+                positions,
+                Some(QUANTIZED_POSITION_STRIDE),
+                json::buffer::Target::ArrayBuffer,
+            )
+        };
         let positions = self.push_accessor(json::Accessor {
             buffer_view: Some(position_view),
             byte_offset: Some(json::validation::USize64(0)),
@@ -892,18 +978,26 @@ impl BufferBuilder {
             sparse: None,
         });
 
-        let normal_bytes = encode_vertex_buffer(normals)
-            .context("failed to meshopt-encode quantized normal stream")?;
-        let normal_view = self.push_meshopt_buffer_view(
-            normal_bytes,
-            normals.len() * QUANTIZED_NORMAL_STRIDE,
-            Some(QUANTIZED_NORMAL_STRIDE),
-            normals.len(),
-            json::buffer::Target::ArrayBuffer,
-            "ATTRIBUTES",
-            None,
-            std::mem::align_of::<i8>(),
-        );
+        let normal_view = if meshopt_compression {
+            let normal_bytes = encode_vertex_buffer(normals)
+                .context("failed to meshopt-encode quantized normal stream")?;
+            self.push_meshopt_buffer_view(
+                normal_bytes,
+                normals.len() * QUANTIZED_NORMAL_STRIDE,
+                Some(QUANTIZED_NORMAL_STRIDE),
+                normals.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<i8>(),
+            )
+        } else {
+            self.push_buffer_view(
+                normals,
+                Some(QUANTIZED_NORMAL_STRIDE),
+                json::buffer::Target::ArrayBuffer,
+            )
+        };
         let normals = self.push_accessor(json::Accessor {
             buffer_view: Some(normal_view),
             byte_offset: Some(json::validation::USize64(0)),
@@ -924,23 +1018,134 @@ impl BufferBuilder {
         Ok(VertexAccessors { positions, normals })
     }
 
+    fn push_float_vertices(
+        &mut self,
+        vertices: &[Vertex],
+        bounds: &Bounds,
+        meshopt_compression: bool,
+    ) -> Result<VertexAccessors> {
+        let positions: Vec<FloatPosition> = vertices
+            .iter()
+            .map(|vertex| FloatPosition {
+                position: vertex.position,
+            })
+            .collect();
+        let normals: Vec<FloatNormal> = vertices
+            .iter()
+            .map(|vertex| FloatNormal {
+                normal: vertex.normal,
+            })
+            .collect();
+
+        let position_stride = std::mem::size_of::<FloatPosition>();
+        let normal_stride = std::mem::size_of::<FloatNormal>();
+
+        let position_view = if meshopt_compression {
+            let position_bytes = encode_vertex_buffer(&positions)
+                .context("failed to meshopt-encode float position stream")?;
+            self.push_meshopt_buffer_view(
+                position_bytes,
+                positions.len() * position_stride,
+                Some(position_stride),
+                positions.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<f32>(),
+            )
+        } else {
+            self.push_buffer_view(&positions, Some(position_stride), json::buffer::Target::ArrayBuffer)
+        };
+        let positions = self.push_accessor(json::Accessor {
+            buffer_view: Some(position_view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(positions.len() as u64),
+            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::F32,
+            )),
+            normalized: false,
+            min: Some(json::Value::Array(
+                bounds.min.iter().copied().map(json::Value::from).collect(),
+            )),
+            max: Some(json::Value::Array(
+                bounds.max.iter().copied().map(json::Value::from).collect(),
+            )),
+            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: None,
+            sparse: None,
+        });
+
+        let normal_view = if meshopt_compression {
+            let normal_bytes = encode_vertex_buffer(&normals)
+                .context("failed to meshopt-encode float normal stream")?;
+            self.push_meshopt_buffer_view(
+                normal_bytes,
+                normals.len() * normal_stride,
+                Some(normal_stride),
+                normals.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<f32>(),
+            )
+        } else {
+            self.push_buffer_view(&normals, Some(normal_stride), json::buffer::Target::ArrayBuffer)
+        };
+        let normals = self.push_accessor(json::Accessor {
+            buffer_view: Some(normal_view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(normals.len() as u64),
+            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::F32,
+            )),
+            normalized: false,
+            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
+            extensions: Default::default(),
+            extras: Default::default(),
+            min: None,
+            max: None,
+            name: None,
+            sparse: None,
+        });
+
+        Ok(VertexAccessors { positions, normals })
+    }
+
     fn push_indices(
         &mut self,
         index_buffer: &IndexBuffer,
         vertex_count: usize,
+        meshopt_compression: bool,
     ) -> Result<json::Index<json::Accessor>> {
-        let encoded_indices = encode_index_buffer(&index_buffer.as_u32_vec(), vertex_count)
-            .context("failed to meshopt-encode index stream")?;
-        let view = self.push_meshopt_buffer_view(
-            encoded_indices,
-            index_buffer.byte_length(),
-            None,
-            index_buffer.count(),
-            json::buffer::Target::ElementArrayBuffer,
-            "TRIANGLES",
-            None,
-            index_buffer.byte_stride(),
-        );
+        let view = if meshopt_compression {
+            let encoded_indices = encode_index_buffer(&index_buffer.as_u32_vec(), vertex_count)
+                .context("failed to meshopt-encode index stream")?;
+            self.push_meshopt_buffer_view(
+                encoded_indices,
+                index_buffer.byte_length(),
+                None,
+                index_buffer.count(),
+                json::buffer::Target::ElementArrayBuffer,
+                "TRIANGLES",
+                None,
+                index_buffer.byte_stride(),
+            )
+        } else {
+            match index_buffer {
+                IndexBuffer::U16(indices) => self.push_buffer_view(
+                    indices,
+                    None,
+                    json::buffer::Target::ElementArrayBuffer,
+                ),
+                IndexBuffer::U32(indices) => self.push_buffer_view(
+                    indices,
+                    None,
+                    json::buffer::Target::ElementArrayBuffer,
+                ),
+            }
+        };
         Ok(self.push_accessor(json::Accessor {
             buffer_view: Some(view),
             byte_offset: Some(json::validation::USize64(0)),
@@ -955,6 +1160,34 @@ impl BufferBuilder {
             name: None,
             sparse: None,
         }))
+    }
+
+    fn push_buffer_view<T>(
+        &mut self,
+        data: &[T],
+        byte_stride: Option<usize>,
+        target: json::buffer::Target,
+    ) -> json::Index<json::buffer::View> {
+        let byte_offset = self.bytes.len();
+        let byte_length = std::mem::size_of_val(data);
+        let data_bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_length)
+        };
+        self.bytes.extend_from_slice(data_bytes);
+
+        let index = self.buffer_views.len();
+        self.buffer_views.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: json::validation::USize64(byte_length as u64),
+            byte_offset: Some(json::validation::USize64(byte_offset as u64)),
+            byte_stride: byte_stride.map(json::buffer::Stride),
+            target: Some(json::validation::Checked::Valid(target)),
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: None,
+        });
+
+        json::Index::new(index as u32)
     }
 
     fn push_meshopt_buffer_view(
@@ -1010,7 +1243,9 @@ impl EncodedGlb {
     fn write<P: AsRef<Path>>(self, output_path: P) -> Result<()> {
         let mut root_json =
             serde_json::to_value(&self.root).context("failed to serialize glTF root to JSON")?;
-        inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
+        if !self.meshopt_views.is_empty() {
+            inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
+        }
 
         let mut json_bytes =
             serde_json::to_vec(&root_json).context("failed to encode glTF JSON chunk")?;
