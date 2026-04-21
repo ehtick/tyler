@@ -80,9 +80,20 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         .as_array()
         .expect("quantized glTF should declare extensionsRequired");
     assert!(extensions_used.iter().any(|value| value.as_str() == Some("KHR_mesh_quantization")));
+    assert!(extensions_used
+        .iter()
+        .any(|value| value.as_str() == Some("EXT_meshopt_compression")));
     assert!(extensions_required
         .iter()
         .any(|value| value.as_str() == Some("KHR_mesh_quantization")));
+    assert!(extensions_required
+        .iter()
+        .any(|value| value.as_str() == Some("EXT_meshopt_compression")));
+
+    let buffers = root["buffers"]
+        .as_array()
+        .expect("compressed glTF should contain explicit source and fallback buffers");
+    assert_eq!(buffers.len(), 2);
 
     let min = positions["min"].as_array().expect("positions accessor should have min");
     let max = positions["max"].as_array().expect("positions accessor should have max");
@@ -155,7 +166,67 @@ fn convert_to_glb_quantizes_geometry_when_enabled() {
 }
 
 #[test]
-#[ignore = "TODO: enable once EXT_meshopt_compression is written by the exporter"]
 fn convert_to_glb_writes_meshopt_compression_extension() {
-    todo!("assert EXT_meshopt_compression declarations and compressed bufferView metadata");
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_building_part.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let output_path = test_output_path("ams-up-meshopt");
+
+    convert_to_glb(&model, &output_path, &ExportOptions::default())
+        .expect("GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+
+    let buffers = root["buffers"]
+        .as_array()
+        .expect("compressed glTF should declare buffers");
+    assert_eq!(buffers.len(), 2, "compressed output should carry a source buffer and a fallback placeholder");
+    assert!(
+        buffers[1]["extensions"]["EXT_meshopt_compression"]["fallback"]
+            .as_bool()
+            .unwrap(),
+        "fallback buffer should be explicitly tagged"
+    );
+
+    let buffer_views = root["bufferViews"]
+        .as_array()
+        .expect("compressed glTF should declare bufferViews");
+    assert_eq!(buffer_views.len(), 3, "writer currently emits position, normal, and index views");
+
+    for (index, buffer_view) in buffer_views.iter().enumerate() {
+        assert_eq!(
+            buffer_view["buffer"].as_u64().unwrap(),
+            1,
+            "bufferView {index} should reference the fallback buffer layout"
+        );
+        let extension = &buffer_view["extensions"]["EXT_meshopt_compression"];
+        assert_eq!(
+            extension["buffer"].as_u64().unwrap(),
+            0,
+            "bufferView {index} should source compressed bytes from buffer 0"
+        );
+        assert!(extension["byteLength"].as_u64().unwrap() > 0);
+        assert!(extension["count"].as_u64().unwrap() > 0);
+    }
+
+    assert_eq!(
+        buffer_views[0]["extensions"]["EXT_meshopt_compression"]["mode"]
+            .as_str()
+            .unwrap(),
+        "ATTRIBUTES"
+    );
+    assert_eq!(
+        buffer_views[1]["extensions"]["EXT_meshopt_compression"]["mode"]
+            .as_str()
+            .unwrap(),
+        "ATTRIBUTES"
+    );
+    assert_eq!(
+        buffer_views[2]["extensions"]["EXT_meshopt_compression"]["mode"]
+            .as_str()
+            .unwrap(),
+        "TRIANGLES"
+    );
+
+    let _ = fs::remove_file(output_path);
 }

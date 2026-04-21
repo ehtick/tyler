@@ -11,14 +11,16 @@ use earcutr::earcut;
 use gltf::json;
 use log::info;
 use meshopt::{
-    generate_vertex_remap, optimize_overdraw_in_place_decoder, optimize_vertex_cache,
-    optimize_vertex_fetch, quantize_snorm, remap_index_buffer, remap_vertex_buffer,
-    DecodePosition,
+    encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
+    optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
+    quantize_snorm, remap_index_buffer, remap_vertex_buffer, DecodePosition,
 };
+use serde_json::{json as json_value, Map as JsonMap, Value as JsonValue};
 
 const GLTF_VERSION: &str = "2.0";
 const OVERDRAW_THRESHOLD: f32 = 1.05;
 const QUANTIZATION_EXTENSION: &str = "KHR_mesh_quantization";
+const MESHOPT_EXTENSION: &str = "EXT_meshopt_compression";
 const QUANTIZED_POSITION_STRIDE: usize = std::mem::size_of::<QuantizedPosition>();
 const QUANTIZED_NORMAL_STRIDE: usize = std::mem::size_of::<QuantizedNormal>();
 
@@ -152,6 +154,13 @@ enum IndexBuffer {
 }
 
 impl IndexBuffer {
+    fn byte_stride(&self) -> usize {
+        match self {
+            Self::U16(_) => std::mem::size_of::<u16>(),
+            Self::U32(_) => std::mem::size_of::<u32>(),
+        }
+    }
+
     fn component_type(
         &self,
     ) -> json::validation::Checked<json::accessor::GenericComponentType> {
@@ -186,18 +195,10 @@ impl IndexBuffer {
         }
     }
 
-    fn write_bytes(&self, buffer: &mut Vec<u8>) {
+    fn as_u32_vec(&self) -> Vec<u32> {
         match self {
-            Self::U16(indices) => {
-                for index in indices {
-                    buffer.extend_from_slice(&index.to_le_bytes());
-                }
-            }
-            Self::U32(indices) => {
-                for index in indices {
-                    buffer.extend_from_slice(&index.to_le_bytes());
-                }
-            }
+            Self::U16(indices) => indices.iter().copied().map(u32::from).collect(),
+            Self::U32(indices) => indices.clone(),
         }
     }
 }
@@ -224,16 +225,30 @@ struct VertexAccessors {
     normals: json::Index<json::Accessor>,
 }
 
+#[derive(Clone, Debug)]
+struct MeshoptBufferView {
+    buffer: u32,
+    byte_offset: u64,
+    byte_length: u64,
+    byte_stride: u64,
+    count: u64,
+    mode: &'static str,
+    filter: Option<&'static str>,
+}
+
 #[derive(Default)]
 struct BufferBuilder {
     bytes: Vec<u8>,
     buffer_views: Vec<json::buffer::View>,
     accessors: Vec<json::Accessor>,
+    meshopt_views: Vec<Option<MeshoptBufferView>>,
+    fallback_buffer_length: usize,
 }
 
 struct EncodedGlb {
     root: json::Root,
     bin_buffer: Vec<u8>,
+    meshopt_views: Vec<Option<MeshoptBufferView>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -709,11 +724,13 @@ impl ProcessedMesh {
 
 impl QuantizedMesh {
     fn encode_glb(&self, default_color: &str) -> Result<EncodedGlb> {
-
         let mut buffer_builder = BufferBuilder::default();
-        let vertex_accessors =
-            buffer_builder.push_quantized_vertices(&self.positions, &self.normals, &self.normalized_bounds);
-        let index_accessor = buffer_builder.push_indices(&self.indices);
+        let vertex_accessors = buffer_builder.push_quantized_vertices(
+            &self.positions,
+            &self.normals,
+            &self.normalized_bounds,
+        )?;
+        let index_accessor = buffer_builder.push_indices(&self.indices, self.positions.len())?;
 
         let mut attributes = std::collections::BTreeMap::new();
         attributes.insert(
@@ -786,21 +803,38 @@ impl QuantizedMesh {
 
         let root = json::Root {
             accessors: buffer_builder.accessors,
-            buffers: vec![json::Buffer {
-                byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
-                uri: None,
-                name: Some("buffer0".into()),
-                extensions: Default::default(),
-                extras: Default::default(),
-            }],
+            buffers: vec![
+                json::Buffer {
+                    byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
+                    uri: None,
+                    name: Some("buffer0".into()),
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                },
+                json::Buffer {
+                    byte_length: json::validation::USize64(
+                        buffer_builder.fallback_buffer_length as u64,
+                    ),
+                    uri: None,
+                    name: Some("fallback".into()),
+                    extensions: Default::default(),
+                    extras: Default::default(),
+                },
+            ],
             buffer_views: buffer_builder.buffer_views,
             materials: vec![material],
             meshes: vec![mesh],
             nodes: vec![node],
             scenes: vec![scene],
             scene: Some(json::Index::new(0)),
-            extensions_used: vec![QUANTIZATION_EXTENSION.to_string()],
-            extensions_required: vec![QUANTIZATION_EXTENSION.to_string()],
+            extensions_used: vec![
+                QUANTIZATION_EXTENSION.to_string(),
+                MESHOPT_EXTENSION.to_string(),
+            ],
+            extensions_required: vec![
+                QUANTIZATION_EXTENSION.to_string(),
+                MESHOPT_EXTENSION.to_string(),
+            ],
             asset: json::Asset {
                 version: GLTF_VERSION.into(),
                 generator: Some("cityjson-convert".into()),
@@ -813,6 +847,7 @@ impl QuantizedMesh {
         Ok(EncodedGlb {
             root,
             bin_buffer: buffer_builder.bytes,
+            meshopt_views: buffer_builder.meshopt_views,
         })
     }
 }
@@ -823,18 +858,18 @@ impl BufferBuilder {
         positions: &[QuantizedPosition],
         normals: &[QuantizedNormal],
         bounds: &Bounds,
-    ) -> VertexAccessors {
-        let mut position_bytes = Vec::with_capacity(positions.len() * QUANTIZED_POSITION_STRIDE);
-        for position in positions {
-            for component in position.position {
-                position_bytes.extend_from_slice(&component.to_le_bytes());
-            }
-        }
-
-        let position_view = self.push_buffer_view(
+    ) -> Result<VertexAccessors> {
+        let position_bytes = encode_vertex_buffer(positions)
+            .context("failed to meshopt-encode quantized position stream")?;
+        let position_view = self.push_meshopt_buffer_view(
             position_bytes,
+            positions.len() * QUANTIZED_POSITION_STRIDE,
             Some(QUANTIZED_POSITION_STRIDE),
+            positions.len(),
             json::buffer::Target::ArrayBuffer,
+            "ATTRIBUTES",
+            None,
+            std::mem::align_of::<i16>(),
         );
         let positions = self.push_accessor(json::Accessor {
             buffer_view: Some(position_view),
@@ -857,16 +892,17 @@ impl BufferBuilder {
             sparse: None,
         });
 
-        let mut normal_bytes = Vec::with_capacity(normals.len() * QUANTIZED_NORMAL_STRIDE);
-        for normal in normals {
-            for component in normal.normal {
-                normal_bytes.extend_from_slice(&component.to_le_bytes());
-            }
-        }
-        let normal_view = self.push_buffer_view(
+        let normal_bytes = encode_vertex_buffer(normals)
+            .context("failed to meshopt-encode quantized normal stream")?;
+        let normal_view = self.push_meshopt_buffer_view(
             normal_bytes,
+            normals.len() * QUANTIZED_NORMAL_STRIDE,
             Some(QUANTIZED_NORMAL_STRIDE),
+            normals.len(),
             json::buffer::Target::ArrayBuffer,
+            "ATTRIBUTES",
+            None,
+            std::mem::align_of::<i8>(),
         );
         let normals = self.push_accessor(json::Accessor {
             buffer_view: Some(normal_view),
@@ -885,15 +921,27 @@ impl BufferBuilder {
             sparse: None,
         });
 
-        VertexAccessors { positions, normals }
+        Ok(VertexAccessors { positions, normals })
     }
 
-    fn push_indices(&mut self, index_buffer: &IndexBuffer) -> json::Index<json::Accessor> {
-        let mut index_bytes = Vec::with_capacity(index_buffer.byte_length());
-        index_buffer.write_bytes(&mut index_bytes);
-        let view =
-            self.push_buffer_view(index_bytes, None, json::buffer::Target::ElementArrayBuffer);
-        self.push_accessor(json::Accessor {
+    fn push_indices(
+        &mut self,
+        index_buffer: &IndexBuffer,
+        vertex_count: usize,
+    ) -> Result<json::Index<json::Accessor>> {
+        let encoded_indices = encode_index_buffer(&index_buffer.as_u32_vec(), vertex_count)
+            .context("failed to meshopt-encode index stream")?;
+        let view = self.push_meshopt_buffer_view(
+            encoded_indices,
+            index_buffer.byte_length(),
+            None,
+            index_buffer.count(),
+            json::buffer::Target::ElementArrayBuffer,
+            "TRIANGLES",
+            None,
+            index_buffer.byte_stride(),
+        );
+        Ok(self.push_accessor(json::Accessor {
             buffer_view: Some(view),
             byte_offset: Some(json::validation::USize64(0)),
             count: json::validation::USize64(index_buffer.count() as u64),
@@ -906,30 +954,47 @@ impl BufferBuilder {
             extras: Default::default(),
             name: None,
             sparse: None,
-        })
+        }))
     }
 
-    fn push_buffer_view(
+    fn push_meshopt_buffer_view(
         &mut self,
-        data: Vec<u8>,
+        compressed_data: Vec<u8>,
+        fallback_byte_length: usize,
         byte_stride: Option<usize>,
+        count: usize,
         target: json::buffer::Target,
+        mode: &'static str,
+        filter: Option<&'static str>,
+        fallback_alignment: usize,
     ) -> json::Index<json::buffer::View> {
-        let byte_offset = self.bytes.len();
-        let byte_length = data.len();
-        self.bytes.extend_from_slice(&data);
+        let compressed_byte_offset = self.bytes.len();
+        let compressed_byte_length = compressed_data.len();
+        self.bytes.extend_from_slice(&compressed_data);
+
+        let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback_alignment);
+        self.fallback_buffer_length = fallback_byte_offset + fallback_byte_length;
 
         let index = self.buffer_views.len();
         self.buffer_views.push(json::buffer::View {
-            buffer: json::Index::new(0),
-            byte_length: json::validation::USize64(byte_length as u64),
-            byte_offset: Some(json::validation::USize64(byte_offset as u64)),
+            buffer: json::Index::new(1),
+            byte_length: json::validation::USize64(fallback_byte_length as u64),
+            byte_offset: Some(json::validation::USize64(fallback_byte_offset as u64)),
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
             extensions: Default::default(),
             extras: Default::default(),
             name: None,
         });
+        self.meshopt_views.push(Some(MeshoptBufferView {
+            buffer: 0,
+            byte_offset: compressed_byte_offset as u64,
+            byte_length: compressed_byte_length as u64,
+            byte_stride: byte_stride.unwrap_or(fallback_alignment) as u64,
+            count: count as u64,
+            mode,
+            filter,
+        }));
 
         json::Index::new(index as u32)
     }
@@ -943,7 +1008,12 @@ impl BufferBuilder {
 
 impl EncodedGlb {
     fn write<P: AsRef<Path>>(self, output_path: P) -> Result<()> {
-        let mut json_bytes = json::serialize::to_string(&self.root)?.into_bytes();
+        let mut root_json =
+            serde_json::to_value(&self.root).context("failed to serialize glTF root to JSON")?;
+        inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
+
+        let mut json_bytes =
+            serde_json::to_vec(&root_json).context("failed to encode glTF JSON chunk")?;
         let json_padding = (4 - (json_bytes.len() % 4)) % 4;
         json_bytes.extend(std::iter::repeat_n(b' ', json_padding));
 
@@ -985,5 +1055,85 @@ impl EncodedGlb {
         file.write_all(&glb_bytes)?;
 
         Ok(())
+    }
+}
+
+fn inject_meshopt_extensions(
+    root: &mut JsonValue,
+    meshopt_views: &[Option<MeshoptBufferView>],
+) -> Result<()> {
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must be an object"))?;
+    let buffers = root_object
+        .get_mut("buffers")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain a buffers array"))?;
+    let fallback_buffer = buffers
+        .get_mut(1)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain a fallback buffer"))?;
+    insert_extension(
+        fallback_buffer,
+        MESHOPT_EXTENSION,
+        json_value!({ "fallback": true }),
+    )?;
+
+    let buffer_views = root_object
+        .get_mut("bufferViews")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain a bufferViews array"))?;
+    if buffer_views.len() != meshopt_views.len() {
+        anyhow::bail!(
+            "buffer view count {} does not match meshopt metadata {}",
+            buffer_views.len(),
+            meshopt_views.len()
+        );
+    }
+
+    for (buffer_view, meshopt_view) in buffer_views.iter_mut().zip(meshopt_views.iter()) {
+        let Some(meshopt_view) = meshopt_view else {
+            continue;
+        };
+
+        let mut extension = JsonMap::new();
+        extension.insert("buffer".into(), JsonValue::from(meshopt_view.buffer));
+        extension.insert("byteOffset".into(), JsonValue::from(meshopt_view.byte_offset));
+        extension.insert("byteLength".into(), JsonValue::from(meshopt_view.byte_length));
+        extension.insert("byteStride".into(), JsonValue::from(meshopt_view.byte_stride));
+        extension.insert("count".into(), JsonValue::from(meshopt_view.count));
+        extension.insert("mode".into(), JsonValue::from(meshopt_view.mode));
+        if let Some(filter) = meshopt_view.filter {
+            extension.insert("filter".into(), JsonValue::from(filter));
+        }
+
+        insert_extension(buffer_view, MESHOPT_EXTENSION, JsonValue::Object(extension))?;
+    }
+
+    Ok(())
+}
+
+fn insert_extension(target: &mut JsonValue, name: &str, value: JsonValue) -> Result<()> {
+    let object = target
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("extension target must be a JSON object"))?;
+    let extensions = object
+        .entry("extensions")
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let extensions_object = extensions
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("glTF extensions field must be a JSON object"))?;
+    extensions_object.insert(name.to_string(), value);
+    Ok(())
+}
+
+fn align_length(length: usize, alignment: usize) -> usize {
+    if alignment <= 1 {
+        return length;
+    }
+    let remainder = length % alignment;
+    if remainder == 0 {
+        length
+    } else {
+        length + (alignment - remainder)
     }
 }
