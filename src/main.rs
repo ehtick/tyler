@@ -63,7 +63,7 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -102,6 +102,57 @@ struct PreparedInput {
     source: parser::InputSource,
     metadata_path: PathBuf,
     feature_base_document: Option<Vec<u8>>,
+}
+
+fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOptions {
+    let mut feature_type_colors = BTreeMap::new();
+
+    for (feature_type, color) in [
+        ("Building", cli.color_building.as_ref()),
+        ("BuildingPart", cli.color_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.color_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.color_tin_relief.as_ref()),
+        ("Road", cli.color_road.as_ref()),
+        ("Railway", cli.color_railway.as_ref()),
+        ("TransportSquare", cli.color_transport_square.as_ref()),
+        ("WaterBody", cli.color_water_body.as_ref()),
+        ("PlantCover", cli.color_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.color_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.color_land_use.as_ref()),
+        ("CityFurniture", cli.color_city_furniture.as_ref()),
+        ("Bridge", cli.color_bridge.as_ref()),
+        ("BridgePart", cli.color_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.color_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.color_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.color_tunnel.as_ref()),
+        ("TunnelPart", cli.color_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.color_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.color_generic_city_object.as_ref()),
+    ] {
+        if let Some(color) = color {
+            feature_type_colors.insert(feature_type.to_string(), color.clone());
+        }
+    }
+
+    cityjson_convert::ExportOptions {
+        native_glb_color: "#FFC0CB".to_string(),
+        metadata_class_name: cli
+            .cesium3dtiles_metadata_class
+            .clone()
+            .unwrap_or_else(|| "cityobject".to_string()),
+        feature_type_colors,
+        quantize_geometry: true,
+        meshopt_compression: true,
+    }
 }
 
 fn prepare_input(
@@ -511,6 +562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Created output directory {:#?}", &path_features_input_dir);
         }
 
+        let export_options = build_glb_export_options(&cli);
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
             let tileid_grid = &tile.id;
@@ -563,7 +615,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = cityjson_convert::convert_to_glb(
                 &model,
                 &output_file,
-                &cityjson_convert::ExportOptions::default(),
+                &export_options,
             ) {
                 warn!("Tile {} conversion failed: {}", tileid_grid, error);
                 return Some(tile);

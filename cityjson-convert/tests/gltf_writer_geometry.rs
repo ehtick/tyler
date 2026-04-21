@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,6 +43,25 @@ fn accessor_component_types(root: &Value) -> Vec<u64> {
         .iter()
         .map(|accessor| accessor["componentType"].as_u64().unwrap())
         .collect()
+}
+
+fn assert_rgba_eq(actual: &Value, expected: [f64; 4]) {
+    let actual = actual
+        .as_array()
+        .expect("material baseColorFactor should be an array");
+    assert_eq!(actual.len(), 4);
+    for (component, expected) in actual.iter().zip(expected) {
+        let actual = component.as_f64().unwrap();
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "expected rgba component {expected}, got {actual}"
+        );
+    }
+}
+
+fn buffer_view_is_meshopt_compressed(root: &Value, buffer_view_index: u64) -> bool {
+    root["bufferViews"][buffer_view_index as usize]["extensions"]["EXT_meshopt_compression"]
+        .is_object()
 }
 
 #[test]
@@ -94,7 +114,10 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         feature_ids["componentType"].as_u64().unwrap(),
         5121 | 5123
     ));
-    assert!(matches!(indices["componentType"].as_u64().unwrap(), 5123 | 5125));
+    assert!(matches!(
+        indices["componentType"].as_u64().unwrap(),
+        5123 | 5125
+    ));
 
     let extensions_used = root["extensionsUsed"]
         .as_array()
@@ -165,9 +188,11 @@ fn convert_to_glb_writes_expected_geometry_layout() {
             .unwrap(),
         0
     );
-    assert!(root["extensions"]["EXT_structural_metadata"]["propertyTables"]
-        .as_array()
-        .is_some_and(|tables| !tables.is_empty()));
+    assert!(
+        root["extensions"]["EXT_structural_metadata"]["propertyTables"]
+            .as_array()
+            .is_some_and(|tables| !tables.is_empty())
+    );
 }
 
 #[test]
@@ -284,8 +309,9 @@ fn convert_to_glb_can_disable_only_meshopt_compression() {
 
 #[test]
 fn convert_to_glb_merges_multiple_features_into_one_centered_mesh() {
-    let model = json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
-        .expect("fixture feature stream should parse");
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture feature stream should parse");
     let output_path = stable_output_path("multi-feature-types");
 
     convert_to_glb(&model, &output_path, &ExportOptions::default())
@@ -297,12 +323,20 @@ fn convert_to_glb_merges_multiple_features_into_one_centered_mesh() {
     let primitives = root["meshes"][0]["primitives"]
         .as_array()
         .expect("glTF should contain primitives");
-    assert_eq!(primitives.len(), 2, "writer should group geometry into one primitive per feature type");
+    assert_eq!(
+        primitives.len(),
+        2,
+        "writer should group geometry into one primitive per feature type"
+    );
 
     let materials = root["materials"]
         .as_array()
         .expect("glTF should contain materials");
-    assert_eq!(materials.len(), 2, "writer should create one material per primitive type group");
+    assert_eq!(
+        materials.len(),
+        2,
+        "writer should create one material per primitive type group"
+    );
     assert_ne!(
         materials[0]["pbrMetallicRoughness"]["baseColorFactor"],
         materials[1]["pbrMetallicRoughness"]["baseColorFactor"],
@@ -361,7 +395,10 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
         .iter()
         .filter(|buffer_view| buffer_view.get("extensions").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(meshopt_views.len(), 4);
+    assert!(
+        meshopt_views.len() >= 4,
+        "compressed output should include at least the geometry streams"
+    );
 
     for (index, buffer_view) in meshopt_views.iter().enumerate() {
         assert_eq!(
@@ -379,28 +416,118 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
         assert!(extension["count"].as_u64().unwrap() > 0);
     }
 
+    let accessors = root["accessors"]
+        .as_array()
+        .expect("compressed glTF should declare accessors");
+    let geometry_buffer_views = [
+        accessors[0]["bufferView"].as_u64().unwrap(),
+        accessors[1]["bufferView"].as_u64().unwrap(),
+        accessors[2]["bufferView"].as_u64().unwrap(),
+        accessors[3]["bufferView"].as_u64().unwrap(),
+    ];
     assert_eq!(
-        meshopt_views[0]["extensions"]["EXT_meshopt_compression"]["mode"]
+        buffer_views[geometry_buffer_views[0] as usize]["extensions"]["EXT_meshopt_compression"]
+            ["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        meshopt_views[1]["extensions"]["EXT_meshopt_compression"]["mode"]
+        buffer_views[geometry_buffer_views[1] as usize]["extensions"]["EXT_meshopt_compression"]
+            ["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        meshopt_views[2]["extensions"]["EXT_meshopt_compression"]["mode"]
+        buffer_views[geometry_buffer_views[2] as usize]["extensions"]["EXT_meshopt_compression"]
+            ["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        meshopt_views[3]["extensions"]["EXT_meshopt_compression"]["mode"]
+        buffer_views[geometry_buffer_views[3] as usize]["extensions"]["EXT_meshopt_compression"]
+            ["mode"]
             .as_str()
             .unwrap(),
         "TRIANGLES"
+    );
+}
+
+#[test]
+fn convert_to_glb_uses_custom_metadata_class_and_feature_colors() {
+    let model = json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("multi-feature-types-custom");
+    let options = ExportOptions {
+        metadata_class_name: "test".to_string(),
+        feature_type_colors: BTreeMap::from([
+            ("Building".to_string(), "#010203".to_string()),
+            ("WaterBody".to_string(), "#ABCDEF".to_string()),
+        ]),
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options).expect("GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+
+    assert!(root["extensions"]["EXT_structural_metadata"]["schema"]["classes"]
+        .get("test")
+        .is_some());
+    assert_eq!(
+        root["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["class"]
+            .as_str()
+            .unwrap(),
+        "test"
+    );
+
+    let materials = root["materials"]
+        .as_array()
+        .expect("glTF should contain materials");
+    assert_rgba_eq(
+        &materials[0]["pbrMetallicRoughness"]["baseColorFactor"],
+        [1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0],
+    );
+    assert_rgba_eq(
+        &materials[1]["pbrMetallicRoughness"]["baseColorFactor"],
+        [171.0 / 255.0, 205.0 / 255.0, 239.0 / 255.0, 1.0],
+    );
+}
+
+#[test]
+fn convert_to_glb_compresses_metadata_numeric_columns() {
+    let model = json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("multi-feature-types-metadata-compressed");
+
+    convert_to_glb(&model, &output_path, &ExportOptions::default())
+        .expect("GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+    let properties = root["extensions"]["EXT_structural_metadata"]["propertyTables"][0]
+        ["properties"]
+        .as_object()
+        .expect("structural metadata property table should contain properties");
+
+    let levels_values = properties["levels"]["values"].as_u64().unwrap();
+    let depth_values = properties["depth"]["values"].as_u64().unwrap();
+    let name_offsets = properties["name"]["stringOffsets"].as_u64().unwrap();
+    let name_values = properties["name"]["values"].as_u64().unwrap();
+    let occupied_values = properties["occupied"]["values"].as_u64().unwrap();
+
+    assert!(buffer_view_is_meshopt_compressed(&root, levels_values));
+    assert!(buffer_view_is_meshopt_compressed(&root, depth_values));
+    assert!(buffer_view_is_meshopt_compressed(&root, name_offsets));
+    assert!(
+        !buffer_view_is_meshopt_compressed(&root, name_values),
+        "string byte blobs still use raw buffer views"
+    );
+    assert!(
+        !buffer_view_is_meshopt_compressed(&root, occupied_values),
+        "INT8 bool columns remain raw because meshopt attribute encoding requires 4-byte elements"
     );
 }

@@ -1,12 +1,13 @@
 #![allow(clippy::too_many_lines)]
 
-use std::convert::TryFrom;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+use crate::ExportOptions;
 use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
@@ -86,9 +87,7 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
 pub fn write_city_model_glb<P: AsRef<Path>>(
     model: &CityModel,
     output_path: P,
-    default_color: &str,
-    quantize_geometry: bool,
-    meshopt_compression: bool,
+    options: &ExportOptions,
 ) -> Result<()> {
     let mut collector = MeshCollector::new();
     collector.add_model(model)?;
@@ -98,12 +97,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
         processed.vertex_count(),
         processed.index_count()
     );
-    processed.write_glb(
-        output_path,
-        default_color,
-        quantize_geometry,
-        meshopt_compression,
-    )
+    processed.write_glb(output_path, options)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -263,11 +257,9 @@ impl FeatureIdBuffer {
             Self::U8(_) => json::validation::Checked::Valid(json::accessor::GenericComponentType(
                 json::accessor::ComponentType::U8,
             )),
-            Self::U16(_) => {
-                json::validation::Checked::Valid(json::accessor::GenericComponentType(
-                    json::accessor::ComponentType::U16,
-                ))
-            }
+            Self::U16(_) => json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::U16,
+            )),
         }
     }
 
@@ -484,7 +476,12 @@ impl MeshCollector {
                         };
                         for shell in boundary.to_nested_solid()? {
                             for surface in shell {
-                                self.add_surface(&feature_type, feature_index as u32, &surface, model)?;
+                                self.add_surface(
+                                    &feature_type,
+                                    feature_index as u32,
+                                    &surface,
+                                    model,
+                                )?;
                             }
                         }
                     }
@@ -495,7 +492,12 @@ impl MeshCollector {
                         for solid in boundary.to_nested_multi_or_composite_solid()? {
                             for shell in solid {
                                 for surface in shell {
-                                    self.add_surface(&feature_type, feature_index as u32, &surface, model)?;
+                                    self.add_surface(
+                                        &feature_type,
+                                        feature_index as u32,
+                                        &surface,
+                                        model,
+                                    )?;
                                 }
                             }
                         }
@@ -595,7 +597,11 @@ impl MeshCollector {
             return attributes;
         }
 
-        let Some(parent_handle) = cityobject.parents().and_then(|parents| parents.first()).copied() else {
+        let Some(parent_handle) = cityobject
+            .parents()
+            .and_then(|parents| parents.first())
+            .copied()
+        else {
             return attributes;
         };
         let Some(parent) = model.cityobjects().get(parent_handle) else {
@@ -820,7 +826,11 @@ impl ProcessedScene {
             }
         }
 
-        let center = if has_vertices { bounds.center() } else { [0.0; 3] };
+        let center = if has_vertices {
+            bounds.center()
+        } else {
+            [0.0; 3]
+        };
         for primitive in primitives.values_mut() {
             for vertex in &mut primitive.vertices {
                 vertex.position[0] -= center[0];
@@ -856,21 +866,29 @@ impl ProcessedScene {
     }
 
     fn vertex_count(&self) -> usize {
-        self.primitives.iter().map(|primitive| primitive.vertices.len()).sum()
+        self.primitives
+            .iter()
+            .map(|primitive| primitive.vertices.len())
+            .sum()
     }
 
     fn index_count(&self) -> usize {
-        self.primitives.iter().map(|primitive| primitive.indices.len()).sum()
+        self.primitives
+            .iter()
+            .map(|primitive| primitive.indices.len())
+            .sum()
     }
 
     fn write_glb<P: AsRef<Path>>(
         &self,
         output_path: P,
-        default_color: &str,
-        quantize_geometry: bool,
-        meshopt_compression: bool,
+        options: &ExportOptions,
     ) -> Result<()> {
-        if self.primitives.iter().all(|primitive| primitive.vertices.is_empty()) {
+        if self
+            .primitives
+            .iter()
+            .all(|primitive| primitive.vertices.is_empty())
+        {
             info!(
                 "No geometry to write, creating empty GLB file at {}",
                 output_path.as_ref().display()
@@ -894,7 +912,7 @@ impl ProcessedScene {
             output_path.as_ref().display()
         );
 
-        let encoded = self.encode_glb(default_color, quantize_geometry, meshopt_compression)?;
+        let encoded = self.encode_glb(options)?;
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
@@ -920,26 +938,25 @@ impl ProcessedScene {
         Ok(())
     }
 
-    fn encode_glb(
-        &self,
-        default_color: &str,
-        quantize_geometry: bool,
-        meshopt_compression: bool,
-    ) -> Result<EncodedGlb> {
-        if quantize_geometry {
-            QuantizedScene::from_processed(self)?.encode_glb(default_color, meshopt_compression)
+    fn encode_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
+        if options.quantize_geometry {
+            QuantizedScene::from_processed(self)?.encode_glb(options)
         } else {
-            self.encode_raw_glb(default_color, meshopt_compression)
+            self.encode_raw_glb(options)
         }
     }
 
-    fn encode_raw_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
+    fn encode_raw_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
         let mut buffer_builder = BufferBuilder::default();
         let primitive_encodings =
-            self.encode_primitives_raw(&mut buffer_builder, meshopt_compression)?;
-        let materials = build_materials(&primitive_encodings, default_color)?;
-        let structural_metadata =
-            StructuralMetadataExtension::from_features(&self.features, &mut buffer_builder)?;
+            self.encode_primitives_raw(&mut buffer_builder, options.meshopt_compression)?;
+        let materials = build_materials(&primitive_encodings, options)?;
+        let structural_metadata = StructuralMetadataExtension::from_features(
+            &self.features,
+            &mut buffer_builder,
+            &options.metadata_class_name,
+            options.meshopt_compression,
+        )?;
 
         build_encoded_glb(
             buffer_builder,
@@ -947,7 +964,7 @@ impl ProcessedScene {
             materials,
             build_node_matrix(1.0, self.center),
             false,
-            meshopt_compression,
+            options.meshopt_compression,
             structural_metadata,
         )
     }
@@ -1001,13 +1018,17 @@ impl QuantizedScene {
         })
     }
 
-    fn encode_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
+    fn encode_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
         let mut buffer_builder = BufferBuilder::default();
         let primitive_encodings =
-            self.encode_primitives(&mut buffer_builder, meshopt_compression)?;
-        let materials = build_materials(&primitive_encodings, default_color)?;
-        let structural_metadata =
-            StructuralMetadataExtension::from_features(&self.features, &mut buffer_builder)?;
+            self.encode_primitives(&mut buffer_builder, options.meshopt_compression)?;
+        let materials = build_materials(&primitive_encodings, options)?;
+        let structural_metadata = StructuralMetadataExtension::from_features(
+            &self.features,
+            &mut buffer_builder,
+            &options.metadata_class_name,
+            options.meshopt_compression,
+        )?;
 
         build_encoded_glb(
             buffer_builder,
@@ -1015,7 +1036,7 @@ impl QuantizedScene {
             materials,
             build_node_matrix(self.position_scale, self.center),
             true,
-            meshopt_compression,
+            options.meshopt_compression,
             structural_metadata,
         )
     }
@@ -1064,7 +1085,11 @@ impl ProcessedPrimitiveMesh {
                     ],
                 })
                 .collect(),
-            feature_ids: self.vertices.iter().map(|vertex| vertex.feature_id).collect(),
+            feature_ids: self
+                .vertices
+                .iter()
+                .map(|vertex| vertex.feature_id)
+                .collect(),
             indices: self.select_index_buffer()?,
             normalized_bounds,
         })
@@ -1085,7 +1110,10 @@ fn build_encoded_glb(
         .map(|encoding| encoding.feature_count)
         .collect::<Vec<_>>();
     let mesh = json::Mesh {
-        primitives: primitive_encodings.into_iter().map(|encoding| encoding.primitive).collect(),
+        primitives: primitive_encodings
+            .into_iter()
+            .map(|encoding| encoding.primitive)
+            .collect(),
         weights: None,
         extensions: None,
         extras: Default::default(),
@@ -1239,11 +1267,7 @@ impl ProcessedScene {
             )?;
             primitive_encodings.push(PrimitiveEncoding {
                 feature_type: primitive.feature_type.clone(),
-                primitive: build_primitive(
-                    vertex_accessors,
-                    index_accessor,
-                    material_index as u32,
-                ),
+                primitive: build_primitive(vertex_accessors, index_accessor, material_index as u32),
                 feature_count: primitive
                     .vertices
                     .iter()
@@ -1278,12 +1302,13 @@ impl QuantizedScene {
             )?;
             primitive_encodings.push(PrimitiveEncoding {
                 feature_type: primitive.feature_type.clone(),
-                primitive: build_primitive(
-                    vertex_accessors,
-                    index_accessor,
-                    material_index as u32,
-                ),
-                feature_count: primitive.feature_ids.iter().copied().collect::<BTreeSet<_>>().len(),
+                primitive: build_primitive(vertex_accessors, index_accessor, material_index as u32),
+                feature_count: primitive
+                    .feature_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
             });
         }
         Ok(primitive_encodings)
@@ -1326,49 +1351,56 @@ fn build_primitive(
 
 fn build_materials(
     primitive_encodings: &[PrimitiveEncoding],
-    default_color: &str,
+    options: &ExportOptions,
 ) -> Result<Vec<json::Material>> {
     primitive_encodings
         .iter()
-        .map(|encoding| {
-            create_default_material(default_color_for_feature_type(
-                &encoding.feature_type,
-                default_color,
-            ))
-        })
+        .map(|encoding| create_default_material(resolve_feature_type_color(
+            &encoding.feature_type,
+            options,
+        )))
         .collect()
 }
 
-fn default_color_for_feature_type<'a>(feature_type: &str, fallback: &'a str) -> &'a str {
+fn resolve_feature_type_color<'a>(feature_type: &str, options: &'a ExportOptions) -> &'a str {
+    if let Some(color) = options.feature_type_colors.get(feature_type) {
+        return color.as_str();
+    }
+
+    default_color_for_feature_type(feature_type).unwrap_or(&options.native_glb_color)
+}
+
+fn default_color_for_feature_type(feature_type: &str) -> Option<&'static str> {
     match feature_type {
-        "Building" => "#d8c3a5",
-        "BuildingPart" => "#e6d5b8",
-        "BuildingInstallation" => "#b89b7a",
-        "TINRelief" => "#9fb37c",
-        "Road" => "#8b8b8b",
-        "Railway" => "#666666",
-        "TransportSquare" => "#a8a8a8",
-        "WaterBody" => "#7db8da",
-        "PlantCover" => "#8dbb6b",
-        "SolitaryVegetationObject" => "#689d45",
-        "LandUse" => "#c0cf8c",
-        "CityFurniture" => "#c78d5b",
-        "Bridge" => "#b39a86",
-        "BridgePart" => "#c2aa96",
-        "BridgeInstallation" => "#927562",
-        "BridgeConstructiveElement" => "#8e705d",
-        "Tunnel" => "#968d84",
-        "TunnelPart" => "#a39a90",
-        "TunnelInstallation" => "#7b726a",
-        "GenericCityObject" => "#b48ead",
-        "OtherConstruction" => "#b5947d",
-        _ => fallback,
+        "Building" => Some("#d8c3a5"),
+        "BuildingPart" => Some("#e6d5b8"),
+        "BuildingInstallation" => Some("#b89b7a"),
+        "TINRelief" => Some("#9fb37c"),
+        "Road" => Some("#8b8b8b"),
+        "Railway" => Some("#666666"),
+        "TransportSquare" => Some("#a8a8a8"),
+        "WaterBody" => Some("#7db8da"),
+        "PlantCover" => Some("#8dbb6b"),
+        "SolitaryVegetationObject" => Some("#689d45"),
+        "LandUse" => Some("#c0cf8c"),
+        "CityFurniture" => Some("#c78d5b"),
+        "Bridge" => Some("#b39a86"),
+        "BridgePart" => Some("#c2aa96"),
+        "BridgeInstallation" => Some("#927562"),
+        "BridgeConstructiveElement" => Some("#8e705d"),
+        "Tunnel" => Some("#968d84"),
+        "TunnelPart" => Some("#a39a90"),
+        "TunnelInstallation" => Some("#7b726a"),
+        "GenericCityObject" => Some("#b48ead"),
+        "OtherConstruction" => Some("#b5947d"),
+        _ => None,
     }
 }
 
 fn build_structural_metadata_columns(
     features: &[FeatureRecord],
     buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
 ) -> Result<BTreeMap<String, StructuralMetadataColumn>> {
     let mut column_types = BTreeMap::<String, &'static str>::new();
     for feature in features {
@@ -1400,9 +1432,18 @@ fn build_structural_metadata_columns(
     for (name, kind) in column_types {
         let column = match kind {
             "bool" => build_bool_metadata_column(&name, features, buffer_builder)?,
-            "int" => build_int_metadata_column(&name, features, buffer_builder)?,
-            "float" => build_float_metadata_column(&name, features, buffer_builder)?,
-            "string" => build_string_metadata_column(&name, features, buffer_builder)?,
+            "int" => {
+                build_int_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
+            "float" => {
+                build_float_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
+            "string" => build_string_metadata_column(
+                &name,
+                features,
+                buffer_builder,
+                meshopt_compression,
+            )?,
             _ => continue,
         };
         columns.insert(name, column);
@@ -1419,7 +1460,13 @@ fn build_bool_metadata_column(
     let values = features
         .iter()
         .map(|feature| match feature.attributes.get(name) {
-            Some(MetadataValue::Bool(value)) => if *value { 1_i8 } else { 0_i8 },
+            Some(MetadataValue::Bool(value)) => {
+                if *value {
+                    1_i8
+                } else {
+                    0_i8
+                }
+            }
             _ => i8::MAX,
         })
         .collect::<Vec<_>>();
@@ -1440,6 +1487,7 @@ fn build_int_metadata_column(
     name: &str,
     features: &[FeatureRecord],
     buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
 ) -> Result<StructuralMetadataColumn> {
     let values = features
         .iter()
@@ -1450,7 +1498,8 @@ fn build_int_metadata_column(
             _ => i32::MAX,
         })
         .collect::<Vec<_>>();
-    let view = buffer_builder.push_scalar_buffer_view(&values, json::buffer::Target::ArrayBuffer);
+    let view = buffer_builder
+        .push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "SCALAR",
@@ -1467,6 +1516,7 @@ fn build_float_metadata_column(
     name: &str,
     features: &[FeatureRecord],
     buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
 ) -> Result<StructuralMetadataColumn> {
     let values = features
         .iter()
@@ -1477,7 +1527,8 @@ fn build_float_metadata_column(
             _ => f32::MAX,
         })
         .collect::<Vec<_>>();
-    let view = buffer_builder.push_scalar_buffer_view(&values, json::buffer::Target::ArrayBuffer);
+    let view = buffer_builder
+        .push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "SCALAR",
@@ -1494,6 +1545,7 @@ fn build_string_metadata_column(
     name: &str,
     features: &[FeatureRecord],
     buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
 ) -> Result<StructuralMetadataColumn> {
     let mut values = Vec::<u8>::new();
     let mut offsets = Vec::<u32>::with_capacity(features.len() + 1);
@@ -1505,8 +1557,10 @@ fn build_string_metadata_column(
         offsets.push(values.len() as u32);
     }
 
-    let values_view = buffer_builder.push_byte_buffer_view(&values, json::buffer::Target::ArrayBuffer);
-    let offsets_view = buffer_builder.push_scalar_buffer_view(&offsets, json::buffer::Target::ArrayBuffer);
+    let values_view =
+        buffer_builder.push_byte_buffer_view(&values, json::buffer::Target::ArrayBuffer);
+    let offsets_view = buffer_builder
+        .push_metadata_scalar_buffer_view(&offsets, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "STRING",
@@ -1523,18 +1577,21 @@ impl StructuralMetadataExtension {
     fn from_features(
         features: &[FeatureRecord],
         buffer_builder: &mut BufferBuilder,
+        class_name: &str,
+        meshopt_compression: bool,
     ) -> Result<Option<Self>> {
         if features.is_empty() {
             return Ok(None);
         }
 
-        let columns = build_structural_metadata_columns(features, buffer_builder)?;
+        let columns =
+            build_structural_metadata_columns(features, buffer_builder, meshopt_compression)?;
         if columns.is_empty() {
             return Ok(None);
         }
 
         Ok(Some(Self {
-            class_name: "cityobject".to_string(),
+            class_name: class_name.to_string(),
             columns,
             feature_count: features.len(),
         }))
@@ -1739,7 +1796,10 @@ impl BufferBuilder {
         });
 
         let feature_ids = if include_feature_ids {
-            let feature_ids = vertices.iter().map(|vertex| vertex.feature_id).collect::<Vec<_>>();
+            let feature_ids = vertices
+                .iter()
+                .map(|vertex| vertex.feature_id)
+                .collect::<Vec<_>>();
             Some(self.push_feature_ids(&feature_ids, meshopt_compression)?)
         } else {
             None
@@ -1918,6 +1978,29 @@ impl BufferBuilder {
         self.push_buffer_view(data, None, target)
     }
 
+    fn push_metadata_scalar_buffer_view<T>(
+        &mut self,
+        data: &[T],
+        meshopt_compression: bool,
+    ) -> Result<json::Index<json::buffer::View>> {
+        if meshopt_compression && std::mem::size_of::<T>() % 4 == 0 {
+            let encoded = encode_vertex_buffer(data)
+                .context("failed to meshopt-encode structural metadata column")?;
+            Ok(self.push_meshopt_buffer_view(
+                &encoded,
+                std::mem::size_of_val(data),
+                Some(std::mem::size_of::<T>()),
+                data.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<T>(),
+            ))
+        } else {
+            Ok(self.push_scalar_buffer_view(data, json::buffer::Target::ArrayBuffer))
+        }
+    }
+
     fn push_byte_buffer_view(
         &mut self,
         data: &[u8],
@@ -2035,7 +2118,10 @@ impl EncodedGlb {
     }
 }
 
-fn inject_mesh_feature_extensions(root: &mut JsonValue, primitive_feature_counts: &[usize]) -> Result<()> {
+fn inject_mesh_feature_extensions(
+    root: &mut JsonValue,
+    primitive_feature_counts: &[usize],
+) -> Result<()> {
     let root_object = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("glTF root JSON must be an object"))?;

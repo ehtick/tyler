@@ -22,6 +22,9 @@ struct Cli {
     /// Disable `EXT_meshopt_compression` in the generated GLB.
     #[arg(long = "no-meshopt-compression", default_value_t = false)]
     no_meshopt_compression: bool,
+    /// Metadata class name for `EXT_structural_metadata`.
+    #[arg(long = "3dtiles-metadata-class", default_value = "cityobject")]
+    metadata_class_name: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = json::from_file(&cli.input)?;
     let options = ExportOptions {
         native_glb_color: cli.native_glb_color,
+        metadata_class_name: cli.metadata_class_name,
+        feature_type_colors: Default::default(),
         quantize_geometry: !cli.no_quantization,
         meshopt_compression: !cli.no_meshopt_compression,
     };
