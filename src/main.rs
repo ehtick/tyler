@@ -63,28 +63,16 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use core::time::Duration;
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
-use subprocess::{Exec, Redirection};
-
-#[derive(Debug, Default, Clone)]
-struct SubprocessConfig {
-    output_extension: String,
-    exe: PathBuf,
-    script: PathBuf,
-    timeout: Option<Duration>,
-    verbose: bool,
-}
 
 #[derive(Debug, Clone, clap::ValueEnum, Eq, PartialEq)]
 #[clap(rename_all = "lower")]
@@ -199,30 +187,11 @@ fn collect_tile_feature_ids(
     feature_ids
 }
 
-/// Write the list of feature paths for a tile into a text file, instead of passing
-/// super long paths-string to the subprocess, because with very long arguments we can
-/// get an 'Argument list too long' error.
-fn write_inputs(
+fn build_tile_cityjsonseq(
     world: &parser::World,
-    path_features_input_dir: &Path,
     qtree_node: &spatial_structs::QuadTree,
-    file_name: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let path_features_input_file = path_features_input_dir
-        .join(file_name)
-        .with_extension("input");
-    let path_tile_ndjson = path_features_input_dir
-        .join(file_name)
-        .with_extension("city.jsonl");
-    fs::create_dir_all(path_features_input_file.parent().unwrap()).unwrap_or_else(|_| {
-        panic!(
-            "should be able to create the directory {:?}",
-            path_features_input_file.parent().unwrap()
-        )
-    });
-    let ndjson_file = File::create(&path_tile_ndjson)
-        .unwrap_or_else(|_| panic!("should be able to create a file {:?}", &path_tile_ndjson));
-    let mut feature_output = BufWriter::new(ndjson_file);
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut feature_output = Vec::new();
     let feature_ids = collect_tile_feature_ids(world, qtree_node);
 
     match &world.input_source {
@@ -260,76 +229,23 @@ fn write_inputs(
         }
     }
 
-    let _fi_file = File::create(&path_features_input_file).unwrap_or_else(|_| {
-        panic!(
-            "should be able to create a file {:?}",
-            &path_features_input_file
-        )
-    });
-    let mut feature_input = BufWriter::new(_fi_file);
-    writeln!(feature_input, "{}", path_tile_ndjson.display())?;
-    Ok(path_features_input_file)
+    Ok(feature_output)
 }
 
-fn run_subprocess(
-    subprocess_config: &SubprocessConfig,
-    tile: Tile,
-    output_file: PathBuf,
-    cmd: Exec,
-) -> Option<Tile> {
-    let cmd_string = cmd.to_cmdline_lossy();
-    debug!("{cmd_string}");
-    let redirection_stdout = Redirection::Pipe; // Redirection::Pipe | subprocess::NullFile
-    let redirection_stderr = Redirection::Pipe; // Redirection::Merge
-    let exec = cmd.stdout(redirection_stdout).stderr(redirection_stderr);
-    let popen_res = exec.popen();
-    match popen_res {
-        Ok(mut popen) => {
-            let (mut stdout_opt, mut stderr_opt): (Option<String>, Option<String>) = (None, None);
-            let mut _exit_status = subprocess::ExitStatus::Undetermined;
-            if let Some(timeout) = subprocess_config.timeout {
-                let mut communicator = popen.communicate_start(None);
-                if let Some(status) = popen.wait_timeout(timeout).unwrap() {
-                    if let Ok(s) = communicator.read_string() {
-                        (stdout_opt, stderr_opt) = s;
-                    };
-                    _exit_status = status;
-                } else {
-                    warn!(
-                        "Tile {} timed out, conversion subprocess command:\n{}",
-                        &tile.id, cmd_string
-                    );
-                    popen.kill().unwrap();
-                    popen.wait().unwrap();
-                    _exit_status = popen.exit_status().unwrap();
-                }
-            } else {
-                (stdout_opt, stderr_opt) = popen.communicate(None).unwrap();
-                _exit_status = popen.wait().unwrap();
-            }
-
-            // The stderr is Redirection::Merge-d into the stdout
-            if !output_file.exists() {
-                if subprocess_config.verbose {
-                    warn!(
-                        "Tile {} conversion failed, conversion subprocess command:\n{}\nsubprocess stdout:\n{}\nsubprocess stderr:\n{}",
-                        tile.id, cmd_string, stdout_opt.unwrap_or_default(), stderr_opt.unwrap_or_default(),
-                    );
-                } else {
-                    warn!(
-                        "Tile {} conversion failed, conversion subprocess command:\n{}",
-                        tile.id, cmd_string
-                    );
-                }
-                return Some(tile);
-            }
-        }
-        Err(popen_error) => {
-            warn!("{}", popen_error);
-            return Some(tile);
-        }
+fn write_debug_tile_input(
+    path_features_input_dir: &Path,
+    file_name: &str,
+    cityjsonseq_bytes: &[u8],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fs::create_dir_all(path_features_input_dir)?;
+    let path_tile_ndjson = path_features_input_dir
+        .join(file_name)
+        .with_extension("city.jsonl");
+    if let Some(parent) = path_tile_ndjson.parent() {
+        fs::create_dir_all(parent)?;
     }
-    None
+    fs::write(&path_tile_ndjson, cityjsonseq_bytes)?;
+    Ok(path_tile_ndjson)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -347,79 +263,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grid_cellsize = cli.grid_cellsize.unwrap();
     let geometric_error_above_leaf = cli.geometric_error_above_leaf.unwrap();
     let format = Formats::_3DTiles; // override --format
-    let subprocess_config = match format {
-        Formats::_3DTiles => {
-            #[allow(unused)]
-            let mut exe = PathBuf::new();
-            if let Some(ref exe_g) = cli.exe_geof {
-                assert!(exe_g.exists() && exe_g.is_file(), "geoflow executable must be an existing file for generating 3D Tiles, exe_geof: {:?}", &exe_g);
-                exe = exe_g.clone();
-            } else {
-                debug!(
-                    "exe_geof is not set for generating 3D Tiles, defaulting to 'geof' in the filesystem PATH"
-                );
-                exe = PathBuf::from("geof");
-            }
-            if !cli.cesium3dtiles_tileset_only {
-                let res = Exec::cmd(&exe)
-                    .arg("--version")
-                    .arg("--verbose")
-                    .stdout(Redirection::Pipe)
-                    .stderr(Redirection::Merge)
-                    .capture();
-                let res_plugins = Exec::cmd(&exe)
-                    .arg("--list-plugins")
-                    .arg("--verbose")
-                    .stdout(Redirection::Pipe)
-                    .stderr(Redirection::Merge)
-                    .capture();
-                if let Ok(capture_data) = res {
-                    let plugins_stdout_str = res_plugins.unwrap().stdout_str();
-                    info!(
-                        "geof version:\n{}{}",
-                        capture_data.stdout_str(),
-                        plugins_stdout_str
-                    );
-                } else if let Err(popen_error) = res {
-                    panic!("Could not execute geof ({:?}):\n{}", &exe, popen_error)
-                }
-            }
-            let geof_flowchart_path = match env::var("TYLER_RESOURCES_DIR") {
-                Ok(val) => PathBuf::from(val).join("geof").join("createGLB.json"),
-                Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources")
-                    .join("geof")
-                    .join("createGLB.json"),
-            };
-            let timeout = cli.timeout.map(|t| Duration::new(t, 0));
-            SubprocessConfig {
-                output_extension: "glb".to_string(),
-                exe,
-                script: geof_flowchart_path,
-                timeout,
-                verbose: cli.verbose_geof,
-            }
-        }
-        Formats::CityJSON => {
-            // TODO: refactor parallel loop
-            panic!("cityjson output is not supported");
-            // if let Some(exe) = cli.exe_python {
-            //     SubprocessConfig {
-            //         output_extension: "city.json".to_string(),
-            //         exe,
-            //         script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            //             .join("resources")
-            //             .join("python")
-            //             .join("convert_cityjsonfeatures.py"),
-            //     }
-            // } else {
-            //     panic!("exe_python must be set for generating CityJSON tiles")
-            // }
-        }
-    };
-    debug!("{:?}", &subprocess_config);
-    // Since we have a default value, it is safe to unwrap
-    // let qtree_capacity = 0; // override cli.qtree_capacity
+                                    // Since we have a default value, it is safe to unwrap
+                                    // let qtree_capacity = 0; // override cli.qtree_capacity
     let qtree_criteria = spatial_structs::QuadTreeCriteria::Vertices; // override --qtree-criteria
     let quadtree_capacity = match qtree_criteria {
         spatial_structs::QuadTreeCriteria::Objects => {
@@ -429,6 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             spatial_structs::QuadTreeCapacity::Vertices(cli.qtree_capacity.unwrap())
         }
     };
+    #[allow(unused)]
     let metadata_class: String = match format {
         Formats::_3DTiles => {
             if cli.cesium3dtiles_tileset_only {
@@ -444,16 +290,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.cesium3dtiles_content_bv_from_tile && !cli.cesium3dtiles_content_add_bv {
         warn!("cesium3dtiles_content_bv_from_tile is true, but cesium3dtiles_content_add_bv is false. The tile content bounding volumes are not going to be added, unless you set --3dtiles-content-add-bv");
     }
-    let proj_data = match env::var("PROJ_DATA") {
-        Ok(val) => {
-            debug!("PROJ_DATA: {}", &val);
-            Some(val)
-        }
-        Err(_val) => {
-            warn!("PROJ_DATA environment variable is not set");
-            None
-        }
-    };
     let debug_data = match cli.debug_load_data {
         None => DebugData::default(),
         Some(ref dir_path) => {
@@ -662,19 +498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Export by calling a subprocess to merge the .jsonl files and convert them to the
-    // target format
-    let cotypes_str: Vec<String> = match &world.cityobject_types {
-        None => Vec::new(),
-        Some(cotypes) => cotypes.iter().map(|co| co.to_string()).collect(),
-    };
-    let cotypes_arg = cotypes_str.join(",");
-
-    let attribute_spec: String = match &cli.object_attribute {
-        None => "".to_string(),
-        Some(attributes) => attributes.join(","),
-    };
-
+    // Export each tile by merging its selected CityJSONFeature stream in memory.
     let path_output_tiles = cli.output.join("t");
     let path_features_input_dir = cli.output.join("inputs");
     // TODO: need to refactor this parallel loop somehow that it does not only read the
@@ -682,13 +506,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cli.cesium3dtiles_tileset_only {
         fs::create_dir_all(&path_output_tiles)?;
         info!("Created output directory {:#?}", &path_output_tiles);
-        fs::create_dir_all(&path_features_input_dir)?;
-        info!("Created output directory {:#?}", &path_features_input_dir);
+        if cli.debug_tile_inputs {
+            fs::create_dir_all(&path_features_input_dir)?;
+            info!("Created output directory {:#?}", &path_features_input_dir);
+        }
 
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
-            #[allow(unused)]
-            let mut tile_failed: Option<Tile> = None;
             let tileid_grid = &tile.id;
             let qtree_nodeid: spatial_structs::QuadTreeNodeId = tileid_grid.into();
             let qtree_node = quadtree
@@ -698,326 +522,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The Tileset.prune() method removes the empty tiles from the tileset,
                 //  so skipping the tile conversion without failure is ok if it's empty.
                 debug!("Tile is empty ({}), skipping conversion", tileid_grid);
-                return tile_failed;
+                return None;
             }
             let tileid_string = tileid.to_string();
             let file_name = tileid_string;
-            let output_file = path_output_tiles
-                .join(&file_name)
-                .with_extension(&subprocess_config.output_extension);
-            let path_features_input_file = match write_inputs(
-                &world,
-                &path_features_input_dir,
-                qtree_node,
-                file_name.as_str(),
-            ) {
-                Ok(path) => path,
+            let output_file = path_output_tiles.join(&file_name).with_extension("glb");
+            let cityjsonseq_bytes = match build_tile_cityjsonseq(&world, qtree_node) {
+                Ok(bytes) => bytes,
                 Err(error) => {
                     warn!(
-                        "Failed to write NDJSON input for tile {}: {}",
+                        "Failed to build CityJSONFeature stream for tile {}: {}",
                         tileid_grid, error
                     );
                     return Some(tile);
                 }
             };
-
-            // We use the quadtree node bbox here instead of the Tileset.Tile bounding
-            // volume, because the Tile is in EPSG:4979 and we need the input data CRS
-            let b = qtree_node.bbox(&world.grid);
-            // We need to string-format all the arguments with an = separator, because that's what
-            // geof can accept.
-            // TODO: maybe replace the subprocess carte with std::process to remove the dependency
-            let mut cmd = Exec::cmd(&subprocess_config.exe)
-                .arg(&subprocess_config.script)
-                .arg(format!(
-                    "--output_format={}",
-                    &format.to_string().to_lowercase()
-                ))
-                .arg(format!("--output_file={}", &output_file.to_str().unwrap()))
-                .arg(format!(
-                    "--path_metadata={}",
-                    &world.path_metadata.to_str().unwrap()
-                ))
-                .arg(format!(
-                    "--path_features_input_file={}",
-                    &path_features_input_file.to_str().unwrap()
-                ))
-                .arg(format!("--min_x={}", b[0]))
-                .arg(format!("--min_y={}", b[1]))
-                .arg(format!("--min_z={}", b[2]))
-                .arg(format!("--max_x={}", b[3]))
-                .arg(format!("--max_y={}", b[4]))
-                .arg(format!("--max_z={}", b[5]))
-                .arg(format!("--cotypes={}", &cotypes_arg))
-                .arg(format!("--metadata_class={}", &metadata_class))
-                .arg(format!("--attribute_spec={}", &attribute_spec))
-                .arg(format!("--geometric_error={}", &tile.geometric_error))
-                .arg(format!("--bag3dBuildingsMode={}", cli.bag3d_buildings_mode))
-                .arg(format!(
-                    "--bag3dAttributesPerPart={}",
-                    cli.bag3d_attributes_per_part
-                ));
-
-            if cli.verbose_geof {
-                cmd = cmd.arg("--verbose".to_string())
+            if cli.debug_tile_inputs {
+                if let Err(error) = write_debug_tile_input(
+                    &path_features_input_dir,
+                    file_name.as_str(),
+                    &cityjsonseq_bytes,
+                ) {
+                    warn!(
+                        "Failed to write debug CityJSONFeature stream for tile {}: {}",
+                        tileid_grid, error
+                    );
+                    return Some(tile);
+                }
+            }
+            let model = match cityjson_lib::json::merge_cityjsonseq_slice(&cityjsonseq_bytes) {
+                Ok(model) => model,
+                Err(error) => {
+                    warn!(
+                        "Failed to merge CityJSONFeature stream for tile {}: {}",
+                        tileid_grid, error
+                    );
+                    return Some(tile);
+                }
+            };
+            if let Err(error) = cityjson_convert::convert_to_glb(
+                &model,
+                &output_file,
+                &cityjson_convert::ExportOptions::default(),
+            ) {
+                warn!("Tile {} conversion failed: {}", tileid_grid, error);
+                return Some(tile);
+            }
+            if !output_file.exists() {
+                warn!(
+                    "Tile {} conversion failed: {} was not created",
+                    tileid_grid,
+                    output_file.display()
+                );
+                return Some(tile);
             }
 
-            if format == Formats::_3DTiles {
-                // geof specific args
-                // colors
-                if cli.color_building.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBuilding={}",
-                        cli.color_building.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_building_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBuildingPart={}",
-                        cli.color_building_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_building_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBuildingInstallation={}",
-                        cli.color_building_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_tin_relief.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorTINRelief={}",
-                        cli.color_tin_relief.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_road.is_some() {
-                    cmd = cmd.arg(format!("--colorRoad={}", cli.color_road.as_ref().unwrap()));
-                }
-                if cli.color_railway.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorRailway={}",
-                        cli.color_railway.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_transport_square.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorTransportSquare={}",
-                        cli.color_transport_square.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_water_body.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorWaterBody={}",
-                        cli.color_water_body.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_plant_cover.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorPlantCover={}",
-                        cli.color_plant_cover.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_solitary_vegetation_object.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorSolitaryVegetationObject={}",
-                        cli.color_solitary_vegetation_object.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_land_use.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorLandUse={}",
-                        cli.color_land_use.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_city_furniture.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorCityFurniture={}",
-                        cli.color_city_furniture.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_bridge.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBridge={}",
-                        cli.color_bridge.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_bridge_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBridgePart={}",
-                        cli.color_bridge_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_bridge_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBridgeInstallation={}",
-                        cli.color_bridge_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_bridge_construction_element.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorBridgeConstructionElement={}",
-                        cli.color_bridge_construction_element.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_tunnel.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorTunnel={}",
-                        cli.color_tunnel.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_tunnel_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorTunnelPart={}",
-                        cli.color_tunnel_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_tunnel_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorTunnelInstallation={}",
-                        cli.color_tunnel_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.color_generic_city_object.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--colorGenericCityObject={}",
-                        cli.color_generic_city_object.as_ref().unwrap()
-                    ));
-                }
-
-                // lod filter
-                if cli.lod_building.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBuilding={}",
-                        cli.lod_building.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_building_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBuildingPart={}",
-                        cli.lod_building_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_building_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBuildingInstallation={}",
-                        cli.lod_building_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_tin_relief.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodTINRelief={}",
-                        cli.lod_tin_relief.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_road.is_some() {
-                    cmd = cmd.arg(format!("--lodRoad={}", cli.lod_road.as_ref().unwrap()));
-                }
-                if cli.lod_railway.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodRailway={}",
-                        cli.lod_railway.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_transport_square.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodTransportSquare={}",
-                        cli.lod_transport_square.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_water_body.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodWaterBody={}",
-                        cli.lod_water_body.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_plant_cover.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodPlantCover={}",
-                        cli.lod_plant_cover.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_solitary_vegetation_object.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodSolitaryVegetationObject={}",
-                        cli.lod_solitary_vegetation_object.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_land_use.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodLandUse={}",
-                        cli.lod_land_use.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_city_furniture.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodCityFurniture={}",
-                        cli.lod_city_furniture.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_bridge.is_some() {
-                    cmd = cmd.arg(format!("--lodBridge={}", cli.lod_bridge.as_ref().unwrap()));
-                }
-                if cli.lod_bridge_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBridgePart={}",
-                        cli.lod_bridge_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_bridge_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBridgeInstallation={}",
-                        cli.lod_bridge_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_bridge_construction_element.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodBridgeConstructionElement={}",
-                        cli.lod_bridge_construction_element.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_tunnel.is_some() {
-                    cmd = cmd.arg(format!("--lodTunnel={}", cli.lod_tunnel.as_ref().unwrap()));
-                }
-                if cli.lod_tunnel_part.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodTunnelPart={}",
-                        cli.lod_tunnel_part.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_tunnel_installation.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodTunnelInstallation={}",
-                        cli.lod_tunnel_installation.as_ref().unwrap()
-                    ));
-                }
-                if cli.lod_generic_city_object.is_some() {
-                    cmd = cmd.arg(format!(
-                        "--lodGenericCityObject={}",
-                        cli.lod_generic_city_object.as_ref().unwrap()
-                    ));
-                }
-
-                if let Some(ref cotypes) = world.cityobject_types {
-                    if cotypes.contains(&parser::CityObjectType::Building)
-                        || cotypes.contains(&parser::CityObjectType::BuildingPart)
-                    {
-                        cmd = cmd.arg("--simplify_error=0.0").arg("--skip_clip=true");
-                    } else if cli.simplification_max_error.is_some() {
-                        cmd = cmd.arg(format!(
-                            "--simplify_error={}",
-                            cli.simplification_max_error.as_ref().unwrap()
-                        ));
-                    }
-                }
-
-                cmd = cmd.arg(format!("--smooth_normals={}", cli.smooth_normals));
-            }
-
-            if let Some(pd) = &proj_data {
-                cmd = cmd.env("PROJ_DATA", pd);
-            }
-
-            tile_failed = run_subprocess(&subprocess_config, tile, output_file, cmd);
-            tile_failed
+            None
         });
 
         let mut tiles_results: Vec<Option<Tile>> = Vec::with_capacity(tiles_len + 2);
@@ -1040,10 +600,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let tiles_failed: Vec<Tile> = tiles_results.into_iter().flatten().collect();
         info!("Done");
-
-        if !log_enabled!(Level::Debug) {
-            fs::remove_dir_all(path_features_input_dir)?;
-        }
 
         info!("Pruning tileset of {} failed tiles", tiles_failed.len());
         for (i, failed) in tiles_failed.iter().enumerate() {
@@ -1150,15 +706,8 @@ mod tests {
         spatial_structs::QuadTree::from_world(world, spatial_structs::QuadTreeCapacity::Objects(1))
     }
 
-    fn exported_ndjson_path(input_file: &Path) -> PathBuf {
-        fs::read_to_string(input_file)
-            .expect("read input file")
-            .trim()
-            .into()
-    }
-
     #[test]
-    fn write_inputs_exports_legacy_features_as_ndjson() {
+    fn build_tile_cityjsonseq_exports_legacy_features_as_ndjson() {
         let dataset_dir = unique_test_dir("legacy");
         let features_dir = dataset_dir.join("features");
         fs::create_dir_all(&features_dir).expect("create features dir");
@@ -1179,18 +728,38 @@ mod tests {
         .expect("build legacy world");
         world.index_with_grid().expect("index legacy world");
         let quadtree = build_quadtree(&world);
-        let inputs_dir = dataset_dir.join("inputs");
-        let input_file =
-            write_inputs(&world, &inputs_dir, &quadtree, "tile").expect("write inputs");
-        let ndjson_path = exported_ndjson_path(&input_file);
-        let ndjson = fs::read_to_string(ndjson_path).expect("read exported ndjson");
+        let ndjson = String::from_utf8(
+            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+        )
+        .expect("cityjsonseq utf8");
 
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);
     }
 
     #[test]
-    fn write_inputs_exports_cjindex_ndjson_as_ndjson() {
+    fn write_debug_tile_input_writes_cityjsonl() {
+        let dataset_dir = unique_test_dir("debug-tile-input");
+        let inputs_dir = dataset_dir.join("inputs");
+        let path = write_debug_tile_input(&inputs_dir, "tile", b"{\"type\":\"CityJSONFeature\"}\n")
+            .expect("write debug tile input");
+
+        assert_eq!(path, inputs_dir.join("tile.city.jsonl"));
+        assert_eq!(
+            fs::read(&path).expect("read debug tile input"),
+            b"{\"type\":\"CityJSONFeature\"}\n"
+        );
+        assert!(!inputs_dir.join("tile.input").exists());
+
+        let nested_path =
+            write_debug_tile_input(&inputs_dir, "1/2/3", b"{\"type\":\"CityJSONFeature\"}\n")
+                .expect("write nested debug tile input");
+        assert_eq!(nested_path, inputs_dir.join("1/2/3.city.jsonl"));
+        assert!(nested_path.exists());
+    }
+
+    #[test]
+    fn build_tile_cityjsonseq_exports_cjindex_ndjson_as_ndjson() {
         let dataset_dir = unique_test_dir("cjindex-ndjson");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -1233,18 +802,17 @@ mod tests {
         assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let inputs_dir = dataset_dir.join("inputs");
-        let input_file =
-            write_inputs(&world, &inputs_dir, &quadtree, "tile").expect("write inputs");
-        let ndjson_path = exported_ndjson_path(&input_file);
-        let ndjson = fs::read_to_string(ndjson_path).expect("read exported ndjson");
+        let ndjson = String::from_utf8(
+            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+        )
+        .expect("cityjsonseq utf8");
 
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);
     }
 
     #[test]
-    fn write_inputs_exports_cjindex_ndjson_without_type_filter_as_ndjson() {
+    fn build_tile_cityjsonseq_exports_cjindex_ndjson_without_type_filter_as_ndjson() {
         let dataset_dir = unique_test_dir("cjindex-ndjson-unfiltered");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -1275,18 +843,17 @@ mod tests {
         .expect("build cjindex ndjson world");
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let inputs_dir = dataset_dir.join("inputs");
-        let input_file =
-            write_inputs(&world, &inputs_dir, &quadtree, "tile").expect("write inputs");
-        let ndjson_path = exported_ndjson_path(&input_file);
-        let ndjson = fs::read_to_string(ndjson_path).expect("read exported ndjson");
+        let ndjson = String::from_utf8(
+            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+        )
+        .expect("cityjsonseq utf8");
 
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);
     }
 
     #[test]
-    fn write_inputs_exports_cjindex_cityjson_as_ndjson() {
+    fn build_tile_cityjsonseq_exports_cjindex_cityjson_as_ndjson() {
         let dataset_dir = unique_test_dir("cjindex-cityjson");
         let metadata: Value = serde_json::from_slice(
             &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
@@ -1330,11 +897,10 @@ mod tests {
             .index_with_grid()
             .expect("index cjindex cityjson world");
         let quadtree = build_quadtree(&world);
-        let inputs_dir = dataset_dir.join("inputs");
-        let input_file =
-            write_inputs(&world, &inputs_dir, &quadtree, "tile").expect("write inputs");
-        let ndjson_path = exported_ndjson_path(&input_file);
-        let ndjson = fs::read_to_string(ndjson_path).expect("read exported ndjson");
+        let ndjson = String::from_utf8(
+            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+        )
+        .expect("cityjsonseq utf8");
 
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);

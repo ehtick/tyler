@@ -19,8 +19,8 @@ name = "tyler"
 path = "src/main.rs"
 
 [dependencies]
-cityjson-lib = "0.5.2"
-cityjson-index = "0.3.1"
+cityjson-lib = "=0.6.0"
+cityjson-index = "0.4.0"
 cityjson-convert = { path = "cityjson-convert" }
 log = "0.4.17"
 env_logger = "0.10.0"
@@ -29,7 +29,6 @@ serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0.91"
 serde_repr = "0.1.10"
 walkdir = "2.3.2"
-subprocess = "0.2.9"
 rayon = "1.6.1"
 # crates needed for the proj adaptation
 #proj-sys = { version = "0.23.1" , features = ["network"]}

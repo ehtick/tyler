@@ -97,19 +97,9 @@ pub struct Cli {
     /// The maximum number of vertices in a leaf of the quadtree.
     #[arg(long, default_value = "42000")]
     pub qtree_capacity: Option<usize>,
-    /// Path to the geoflow executable for clipping and exporting the gltf files.
-    #[arg(long, value_parser = existing_path)]
-    pub exe_geof: Option<PathBuf>,
-    /// Generate glTF tiles natively in Rust, bypassing geoflow.
-    /// If not specified, the default geoflow pipeline is used for backward compatibility.
-    #[arg(long = "native-glb")]
-    pub native_glb: bool,
-    /// Default PBR base color for native GLB generation, specified as a hex rgb-color value, eg. #FFC0CB is pink.
-    /// Default is #FFC0CB (pink).
-    #[arg(long = "native-glb-color", value_parser = hex_color, default_value = "#FFC0CB")]
-    pub native_glb_color: String,
+    /// Write the per-tile CityJSONFeature streams used for GLB conversion to output/inputs/.
     #[arg(long)]
-    pub verbose_geof: bool,
+    pub debug_tile_inputs: bool,
     /// Maximum error that is allowed in mesh simplification to reduce the number of vertices. Value should be a float that represents that maximum allowed error in meters. Ignored for building object types.
     #[arg(long, default_value = "1.0")]
     pub simplification_max_error: Option<f64>,
@@ -268,19 +258,6 @@ fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
         }
     } else {
         Err(format!("could not resolve the path {:?}", s))
-    }
-}
-
-/// We don't want to canonicalize paths to executables, especially a python exe from a
-/// virtualenv, because the symlink would get resolved and we would end up with a path
-/// to the python interpreter that was used for creating the virtualenv, and not the
-/// interpreter that links to the virtualenv.
-fn existing_path(s: &str) -> Result<PathBuf, String> {
-    let p = Path::new(s).to_path_buf();
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(format!("path {:?} does not exist", &p))
     }
 }
 

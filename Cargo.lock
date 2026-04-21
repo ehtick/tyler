@@ -317,7 +317,7 @@ name = "cityjson-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cityjson-lib 0.6.0",
+ "cityjson-lib",
  "clap 4.6.1",
  "earcutr 0.5.0",
  "env_logger 0.11.10",
@@ -327,11 +327,11 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60c6862ff7b627f7aee9a695834049873889eec649ed1f4b8282414d698bebd6"
+checksum = "fe50fec5e2c11d2df8193472d892d6b4c095054bbef9dc262fd21577be85d11b"
 dependencies = [
- "cityjson-lib 0.5.2",
+ "cityjson-lib",
  "clap 4.6.1",
  "flate2",
  "flatgeobuf",
@@ -358,16 +358,6 @@ dependencies = [
  "derive_more",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cityjson-lib"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4570d6c82997bf970bd12248a5bcede36008f4e9888648f1a5b1a67d4998f7f2"
-dependencies = [
- "cityjson",
- "cityjson-json",
 ]
 
 [[package]]
@@ -2431,16 +2421,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
-name = "subprocess"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c56e8662b206b9892d7a5a3f2ecdbcb455d3d6b259111373b7e08b8055158a8"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2690,7 +2670,7 @@ dependencies = [
  "bitvec",
  "cityjson-convert",
  "cityjson-index",
- "cityjson-lib 0.5.2",
+ "cityjson-lib",
  "clap 4.6.1",
  "earcutr 0.2.0",
  "env_logger 0.10.2",
@@ -2704,7 +2684,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_repr",
- "subprocess",
  "thiserror 1.0.69",
  "walkdir",
 ]
