@@ -97,19 +97,9 @@ pub struct Cli {
     /// The maximum number of vertices in a leaf of the quadtree.
     #[arg(long, default_value = "42000")]
     pub qtree_capacity: Option<usize>,
-    /// Path to the geoflow executable for clipping and exporting the gltf files.
-    #[arg(long, value_parser = existing_path)]
-    pub exe_geof: Option<PathBuf>,
-    /// Generate glTF tiles natively in Rust, bypassing geoflow.
-    /// If not specified, the default geoflow pipeline is used for backward compatibility.
-    #[arg(long = "native-glb")]
-    pub native_glb: bool,
-    /// Default PBR base color for native GLB generation, specified as a hex rgb-color value, eg. #FFC0CB is pink.
-    /// Default is #FFC0CB (pink).
-    #[arg(long = "native-glb-color", value_parser = hex_color, default_value = "#FFC0CB")]
-    pub native_glb_color: String,
+    /// Write the per-tile CityJSONFeature streams used for GLB conversion to output/inputs/.
     #[arg(long)]
-    pub verbose_geof: bool,
+    pub debug_tile_inputs: bool,
     /// Maximum error that is allowed in mesh simplification to reduce the number of vertices. Value should be a float that represents that maximum allowed error in meters. Ignored for building object types.
     #[arg(long, default_value = "1.0")]
     pub simplification_max_error: Option<f64>,
@@ -271,19 +261,6 @@ fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// We don't want to canonicalize paths to executables, especially a python exe from a
-/// virtualenv, because the symlink would get resolved and we would end up with a path
-/// to the python interpreter that was used for creating the virtualenv, and not the
-/// interpreter that links to the virtualenv.
-fn existing_path(s: &str) -> Result<PathBuf, String> {
-    let p = Path::new(s).to_path_buf();
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(format!("path {:?} does not exist", &p))
-    }
-}
-
 /// Checks is `s` constains a 6 digit hexadecimal value preceded by a '#', eg. #FF0000
 fn hex_color(s: &str) -> Result<String, String> {
     if s.len() != 7 || !s.starts_with('#') {
@@ -304,26 +281,59 @@ fn hex_color(s: &str) -> Result<String, String> {
 mod tests {
     use super::Cli;
     use clap::{CommandFactory, Parser};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn required_args() -> Vec<&'static str> {
+    fn resource_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("data")
+            .join(name)
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tyler-{prefix}-{unique}"));
+        fs::create_dir_all(&path).expect("create test dir");
+        path
+    }
+
+    fn legacy_dataset_dir() -> PathBuf {
+        let dataset_dir = unique_test_dir("cli-legacy");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        fs::copy(
+            resource_path("3dbag_x00.city.json"),
+            dataset_dir.join("metadata.city.json"),
+        )
+        .expect("copy metadata");
+        fs::copy(
+            resource_path("3dbag_feature_x71.city.jsonl"),
+            features_dir.join("sample.city.jsonl"),
+        )
+        .expect("copy feature");
+        dataset_dir
+    }
+
+    fn required_args(input_dir: &PathBuf) -> Vec<String> {
         vec![
-            "tyler",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909"
-            ),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            input_dir.display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ]
     }
 
-    fn dataset_args() -> Vec<&'static str> {
+    fn dataset_args() -> Vec<String> {
         vec![
-            "tyler",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/data"),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/data").to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ]
     }
 
@@ -335,10 +345,15 @@ mod tests {
     /// Can we pass multiple CityObject types?
     #[test]
     fn verify_object_types() {
-        let mut types: Vec<&'static str> =
-            vec!["--object-type", "Building", "--object-type", "PlantCover"];
-        let mut args = required_args();
-        args.append(&mut types);
+        let dataset_dir = legacy_dataset_dir();
+        let types: Vec<String> = vec![
+            "--object-type".to_string(),
+            "Building".to_string(),
+            "--object-type".to_string(),
+            "PlantCover".to_string(),
+        ];
+        let mut args = required_args(&dataset_dir);
+        args.extend(types);
         let cli = Cli::try_parse_from(args).unwrap();
         let otypes = &cli.object_type.unwrap();
         assert!(otypes.contains(&crate::parser::CityObjectType::Building));
@@ -360,20 +375,15 @@ mod tests {
 
     #[test]
     fn reject_legacy_input_flags() {
+        let dataset_dir = legacy_dataset_dir();
         let args = vec![
-            "tyler",
-            "--metadata",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909/metadata.city.json"
-            ),
-            "--features",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909/3dbag_v21031_7425c21b_5909_subset"
-            ),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            "--metadata".to_string(),
+            dataset_dir.join("metadata.city.json").display().to_string(),
+            "--features".to_string(),
+            dataset_dir.join("features").display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ];
         assert!(Cli::try_parse_from(args).is_err());
     }

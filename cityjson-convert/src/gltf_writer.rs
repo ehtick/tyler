@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
+use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -52,16 +53,16 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
 
     Ok(json::Material {
         name: None,
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
         pbr_metallic_roughness: json::material::PbrMetallicRoughness {
             base_color_factor: json::material::PbrBaseColorFactor(base_color_rgba),
             metallic_factor: json::material::StrengthFactor(metallic_factor),
             roughness_factor: json::material::StrengthFactor(roughness_factor),
             base_color_texture: None,
             metallic_roughness_texture: None,
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
         },
         normal_texture: None,
         occlusion_texture: None,
@@ -130,9 +131,9 @@ impl Bounds {
     }
 
     fn add_point(&mut self, point: [f32; 3]) {
-        for axis in 0..3 {
-            self.min[axis] = self.min[axis].min(point[axis]);
-            self.max[axis] = self.max[axis].max(point[axis]);
+        for (axis, coordinate) in point.iter().enumerate() {
+            self.min[axis] = self.min[axis].min(*coordinate);
+            self.max[axis] = self.max[axis].max(*coordinate);
         }
     }
 
@@ -168,9 +169,7 @@ impl IndexBuffer {
         }
     }
 
-    fn component_type(
-        &self,
-    ) -> json::validation::Checked<json::accessor::GenericComponentType> {
+    fn component_type(&self) -> json::validation::Checked<json::accessor::GenericComponentType> {
         match self {
             Self::U16(_) => json::validation::Checked::Valid(json::accessor::GenericComponentType(
                 json::accessor::ComponentType::U16,
@@ -227,6 +226,7 @@ struct MeshCollector {
     mesh: RawMesh,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct VertexAccessors {
     positions: json::Index<json::Accessor>,
     normals: json::Index<json::Accessor>,
@@ -268,6 +268,15 @@ struct QuantizedPosition {
 #[repr(C)]
 struct QuantizedNormal {
     normal: [i8; 4],
+}
+
+fn quantize_position_component(value: f32, scale: f32) -> i16 {
+    i16::try_from(quantize_snorm(value / scale, 16))
+        .expect("quantized position component should fit in i16")
+}
+
+fn quantize_normal_component(value: f32) -> i8 {
+    i8::try_from(quantize_snorm(value, 8)).expect("quantized normal component should fit in i8")
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -405,7 +414,8 @@ impl MeshCollector {
             return Ok(());
         }
 
-        self.mesh.emit_triangles(&local_positions, &triangulated, Self::compute_face_normal)
+        self.mesh
+            .emit_triangles(&local_positions, &triangulated, Self::compute_face_normal)
     }
 
     fn compute_position(idx: u32, model: &CityModel) -> Result<[f32; 3], anyhow::Error> {
@@ -428,9 +438,9 @@ impl MeshCollector {
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         for pos in positions {
-            for axis in 0..3 {
-                min[axis] = min[axis].min(pos[axis]);
-                max[axis] = max[axis].max(pos[axis]);
+            for (axis, coordinate) in pos.iter().enumerate() {
+                min[axis] = min[axis].min(*coordinate);
+                max[axis] = max[axis].max(*coordinate);
             }
         }
 
@@ -459,8 +469,7 @@ impl MeshCollector {
             normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
         }
 
-        let length =
-            (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
         if length > f32::EPSILON {
             Some([normal[0] / length, normal[1] / length, normal[2] / length])
         } else {
@@ -470,12 +479,7 @@ impl MeshCollector {
 
     fn dominant_axis(normal: [f32; 3]) -> usize {
         (0..3)
-            .max_by(|&lhs, &rhs| {
-                normal[lhs]
-                    .abs()
-                    .partial_cmp(&normal[rhs].abs())
-                    .unwrap()
-            })
+            .max_by(|&lhs, &rhs| normal[lhs].abs().partial_cmp(&normal[rhs].abs()).unwrap())
             .unwrap_or(2)
     }
 
@@ -487,8 +491,7 @@ impl MeshCollector {
             u[2] * v[0] - u[0] * v[2],
             u[0] * v[1] - u[1] * v[0],
         ];
-        let length =
-            (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
         if length > f32::EPSILON {
             [normal[0] / length, normal[1] / length, normal[2] / length]
         } else {
@@ -668,7 +671,12 @@ impl ProcessedMesh {
         info!("  Indices: {}", index_buffer.count());
         info!(
             "  Local coordinate range: X [{:.2}, {:.2}], Y [{:.2}, {:.2}], Z [{:.2}, {:.2}]",
-            bounds.min[0], bounds.max[0], bounds.min[1], bounds.max[1], bounds.min[2], bounds.max[2]
+            bounds.min[0],
+            bounds.max[0],
+            bounds.min[1],
+            bounds.max[1],
+            bounds.min[2],
+            bounds.max[2]
         );
         info!(
             "  World-space center: [{:.2}, {:.2}, {:.2}]",
@@ -685,7 +693,8 @@ impl ProcessedMesh {
         meshopt_compression: bool,
     ) -> Result<EncodedGlb> {
         if quantize_geometry {
-            self.quantize()?.encode_glb(default_color, meshopt_compression)
+            self.quantize()?
+                .encode_glb(default_color, meshopt_compression)
         } else {
             self.encode_raw_glb(default_color, meshopt_compression)
         }
@@ -727,9 +736,9 @@ impl ProcessedMesh {
             .iter()
             .map(|vertex| QuantizedPosition {
                 position: [
-                    quantize_snorm(vertex.position[0] / position_scale, 16) as i16,
-                    quantize_snorm(vertex.position[1] / position_scale, 16) as i16,
-                    quantize_snorm(vertex.position[2] / position_scale, 16) as i16,
+                    quantize_position_component(vertex.position[0], position_scale),
+                    quantize_position_component(vertex.position[1], position_scale),
+                    quantize_position_component(vertex.position[2], position_scale),
                     0,
                 ],
             })
@@ -740,9 +749,9 @@ impl ProcessedMesh {
             .iter()
             .map(|vertex| QuantizedNormal {
                 normal: [
-                    quantize_snorm(vertex.normal[0], 8) as i8,
-                    quantize_snorm(vertex.normal[1], 8) as i8,
-                    quantize_snorm(vertex.normal[2], 8) as i8,
+                    quantize_normal_component(vertex.normal[0]),
+                    quantize_normal_component(vertex.normal[1]),
+                    quantize_normal_component(vertex.normal[2]),
                     0,
                 ],
             })
@@ -791,8 +800,11 @@ impl QuantizedMesh {
             &self.normalized_bounds,
             meshopt_compression,
         )?;
-        let index_accessor =
-            buffer_builder.push_indices(&self.indices, self.positions.len(), meshopt_compression)?;
+        let index_accessor = buffer_builder.push_indices(
+            &self.indices,
+            self.positions.len(),
+            meshopt_compression,
+        )?;
 
         build_encoded_glb(
             buffer_builder,
@@ -833,15 +845,15 @@ fn build_encoded_glb(
         material: Some(json::Index::new(0)),
         mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
         targets: None,
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
     };
 
     let mesh = json::Mesh {
         primitives: vec![primitive],
         weights: None,
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
         name: None,
     };
 
@@ -855,15 +867,15 @@ fn build_encoded_glb(
         scale: None,
         translation: None,
         weights: None,
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
         name: None,
     };
 
     let scene = json::Scene {
         nodes: vec![json::Index::new(0)],
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
         name: None,
     };
 
@@ -882,16 +894,16 @@ fn build_encoded_glb(
         byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
         uri: None,
         name: Some("buffer0".into()),
-        extensions: Default::default(),
-        extras: Default::default(),
+        extensions: None,
+        extras: json::extras::Void::default(),
     }];
     if meshopt_compression {
         buffers.push(json::Buffer {
             byte_length: json::validation::USize64(buffer_builder.fallback_buffer_length as u64),
             uri: None,
             name: Some("fallback".into()),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
         });
     }
 
@@ -941,7 +953,7 @@ impl BufferBuilder {
             let position_bytes = encode_vertex_buffer(positions)
                 .context("failed to meshopt-encode quantized position stream")?;
             self.push_meshopt_buffer_view(
-                position_bytes,
+                &position_bytes,
                 positions.len() * QUANTIZED_POSITION_STRIDE,
                 Some(QUANTIZED_POSITION_STRIDE),
                 positions.len(),
@@ -972,8 +984,8 @@ impl BufferBuilder {
                 bounds.max.iter().copied().map(json::Value::from).collect(),
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             name: None,
             sparse: None,
         });
@@ -982,7 +994,7 @@ impl BufferBuilder {
             let normal_bytes = encode_vertex_buffer(normals)
                 .context("failed to meshopt-encode quantized normal stream")?;
             self.push_meshopt_buffer_view(
-                normal_bytes,
+                &normal_bytes,
                 normals.len() * QUANTIZED_NORMAL_STRIDE,
                 Some(QUANTIZED_NORMAL_STRIDE),
                 normals.len(),
@@ -1007,8 +1019,8 @@ impl BufferBuilder {
             )),
             normalized: true,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             min: None,
             max: None,
             name: None,
@@ -1044,7 +1056,7 @@ impl BufferBuilder {
             let position_bytes = encode_vertex_buffer(&positions)
                 .context("failed to meshopt-encode float position stream")?;
             self.push_meshopt_buffer_view(
-                position_bytes,
+                &position_bytes,
                 positions.len() * position_stride,
                 Some(position_stride),
                 positions.len(),
@@ -1054,7 +1066,11 @@ impl BufferBuilder {
                 std::mem::align_of::<f32>(),
             )
         } else {
-            self.push_buffer_view(&positions, Some(position_stride), json::buffer::Target::ArrayBuffer)
+            self.push_buffer_view(
+                &positions,
+                Some(position_stride),
+                json::buffer::Target::ArrayBuffer,
+            )
         };
         let positions = self.push_accessor(json::Accessor {
             buffer_view: Some(position_view),
@@ -1071,8 +1087,8 @@ impl BufferBuilder {
                 bounds.max.iter().copied().map(json::Value::from).collect(),
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             name: None,
             sparse: None,
         });
@@ -1081,7 +1097,7 @@ impl BufferBuilder {
             let normal_bytes = encode_vertex_buffer(&normals)
                 .context("failed to meshopt-encode float normal stream")?;
             self.push_meshopt_buffer_view(
-                normal_bytes,
+                &normal_bytes,
                 normals.len() * normal_stride,
                 Some(normal_stride),
                 normals.len(),
@@ -1091,7 +1107,11 @@ impl BufferBuilder {
                 std::mem::align_of::<f32>(),
             )
         } else {
-            self.push_buffer_view(&normals, Some(normal_stride), json::buffer::Target::ArrayBuffer)
+            self.push_buffer_view(
+                &normals,
+                Some(normal_stride),
+                json::buffer::Target::ArrayBuffer,
+            )
         };
         let normals = self.push_accessor(json::Accessor {
             buffer_view: Some(normal_view),
@@ -1102,8 +1122,8 @@ impl BufferBuilder {
             )),
             normalized: false,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             min: None,
             max: None,
             name: None,
@@ -1123,7 +1143,7 @@ impl BufferBuilder {
             let encoded_indices = encode_index_buffer(&index_buffer.as_u32_vec(), vertex_count)
                 .context("failed to meshopt-encode index stream")?;
             self.push_meshopt_buffer_view(
-                encoded_indices,
+                &encoded_indices,
                 index_buffer.byte_length(),
                 None,
                 index_buffer.count(),
@@ -1134,16 +1154,12 @@ impl BufferBuilder {
             )
         } else {
             match index_buffer {
-                IndexBuffer::U16(indices) => self.push_buffer_view(
-                    indices,
-                    None,
-                    json::buffer::Target::ElementArrayBuffer,
-                ),
-                IndexBuffer::U32(indices) => self.push_buffer_view(
-                    indices,
-                    None,
-                    json::buffer::Target::ElementArrayBuffer,
-                ),
+                IndexBuffer::U16(indices) => {
+                    self.push_buffer_view(indices, None, json::buffer::Target::ElementArrayBuffer)
+                }
+                IndexBuffer::U32(indices) => {
+                    self.push_buffer_view(indices, None, json::buffer::Target::ElementArrayBuffer)
+                }
             }
         };
         Ok(self.push_accessor(json::Accessor {
@@ -1155,8 +1171,8 @@ impl BufferBuilder {
             min: Some(json::Value::from(vec![0])),
             max: Some(json::Value::from(vec![index_buffer.max_value()])),
             type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             name: None,
             sparse: None,
         }))
@@ -1170,9 +1186,8 @@ impl BufferBuilder {
     ) -> json::Index<json::buffer::View> {
         let byte_offset = self.bytes.len();
         let byte_length = std::mem::size_of_val(data);
-        let data_bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_length)
-        };
+        let data_bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), byte_length) };
         self.bytes.extend_from_slice(data_bytes);
 
         let index = self.buffer_views.len();
@@ -1182,17 +1197,17 @@ impl BufferBuilder {
             byte_offset: Some(json::validation::USize64(byte_offset as u64)),
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             name: None,
         });
 
-        json::Index::new(index as u32)
+        json::Index::new(u32::try_from(index).expect("buffer view index exceeds u32 range"))
     }
 
     fn push_meshopt_buffer_view(
         &mut self,
-        compressed_data: Vec<u8>,
+        compressed_data: &[u8],
         fallback_byte_length: usize,
         byte_stride: Option<usize>,
         count: usize,
@@ -1203,7 +1218,7 @@ impl BufferBuilder {
     ) -> json::Index<json::buffer::View> {
         let compressed_byte_offset = self.bytes.len();
         let compressed_byte_length = compressed_data.len();
-        self.bytes.extend_from_slice(&compressed_data);
+        self.bytes.extend_from_slice(compressed_data);
 
         let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback_alignment);
         self.fallback_buffer_length = fallback_byte_offset + fallback_byte_length;
@@ -1215,8 +1230,8 @@ impl BufferBuilder {
             byte_offset: Some(json::validation::USize64(fallback_byte_offset as u64)),
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
-            extensions: Default::default(),
-            extras: Default::default(),
+            extensions: None,
+            extras: json::extras::Void::default(),
             name: None,
         });
         self.meshopt_views.push(Some(MeshoptBufferView {
@@ -1229,13 +1244,13 @@ impl BufferBuilder {
             filter,
         }));
 
-        json::Index::new(index as u32)
+        json::Index::new(u32::try_from(index).expect("buffer view index exceeds u32 range"))
     }
 
     fn push_accessor(&mut self, accessor: json::Accessor) -> json::Index<json::Accessor> {
         let index = self.accessors.len();
         self.accessors.push(accessor);
-        json::Index::new(index as u32)
+        json::Index::new(u32::try_from(index).expect("accessor index exceeds u32 range"))
     }
 }
 
@@ -1332,9 +1347,18 @@ fn inject_meshopt_extensions(
 
         let mut extension = JsonMap::new();
         extension.insert("buffer".into(), JsonValue::from(meshopt_view.buffer));
-        extension.insert("byteOffset".into(), JsonValue::from(meshopt_view.byte_offset));
-        extension.insert("byteLength".into(), JsonValue::from(meshopt_view.byte_length));
-        extension.insert("byteStride".into(), JsonValue::from(meshopt_view.byte_stride));
+        extension.insert(
+            "byteOffset".into(),
+            JsonValue::from(meshopt_view.byte_offset),
+        );
+        extension.insert(
+            "byteLength".into(),
+            JsonValue::from(meshopt_view.byte_length),
+        );
+        extension.insert(
+            "byteStride".into(),
+            JsonValue::from(meshopt_view.byte_stride),
+        );
         extension.insert("count".into(), JsonValue::from(meshopt_view.count));
         extension.insert("mode".into(), JsonValue::from(meshopt_view.mode));
         if let Some(filter) = meshopt_view.filter {

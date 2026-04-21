@@ -1621,12 +1621,28 @@ pub mod cesium3dtiles {
     mod tests {
         use super::*;
         use serde_json::to_string_pretty;
+        use std::fs;
         use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         fn test_data_dir() -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("resources")
                 .join("data")
+        }
+
+        fn resource_path(name: &str) -> PathBuf {
+            test_data_dir().join(name)
+        }
+
+        fn unique_test_dir(prefix: &str) -> PathBuf {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("tyler-{prefix}-{unique}"));
+            fs::create_dir_all(&path).expect("create test dir");
+            path
         }
 
         #[test]
@@ -1635,14 +1651,20 @@ pub mod cesium3dtiles {
             // let bbox: crate::spatial_structs::Bbox =
             //     [85162.9, 447106.8, -10.7, 85962.9, 447906.8, 320.5];
             // let grid = crate::spatial_structs::SquareGrid::new(&bbox, 200, 7415, Some(10.0));
+            let dataset_dir = unique_test_dir("implicittiling");
+            let features_dir = dataset_dir.join("features");
+            fs::create_dir_all(&features_dir).expect("create features dir");
+            let metadata_path = dataset_dir.join("metadata.city.json");
+            fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
+            fs::copy(
+                resource_path("3dbag_feature_x71.city.jsonl"),
+                features_dir.join("sample.city.jsonl"),
+            )
+            .expect("copy feature");
 
             let mut world = crate::parser::World::new(
-                test_data_dir()
-                    .join("features_3dbag_5909")
-                    .join("metadata.city.json"),
-                test_data_dir()
-                    .join("features_3dbag_5909")
-                    .join("3dbag_v21031_7425c21b_5909_subset"),
+                &metadata_path,
+                &features_dir,
                 200,
                 Some(vec![
                     crate::parser::CityObjectType::Building,

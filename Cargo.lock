@@ -306,7 +306,7 @@ name = "cityjson-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cityjson-lib 0.6.0",
+ "cityjson-lib",
  "clap",
  "earcutr 0.5.0",
  "env_logger 0.11.10",
@@ -318,11 +318,11 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60c6862ff7b627f7aee9a695834049873889eec649ed1f4b8282414d698bebd6"
+checksum = "fe50fec5e2c11d2df8193472d892d6b4c095054bbef9dc262fd21577be85d11b"
 dependencies = [
- "cityjson-lib 0.5.3",
+ "cityjson-lib",
  "clap",
  "flate2",
  "flatgeobuf",
@@ -349,16 +349,6 @@ dependencies = [
  "derive_more",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cityjson-lib"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff6d9ba7ffd41a9a6d030bdee7b525ba47fed0d8e5143d4959db8788dacb17b2"
-dependencies = [
- "cityjson",
- "cityjson-json",
 ]
 
 [[package]]
@@ -2371,16 +2361,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
-name = "subprocess"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c56e8662b206b9892d7a5a3f2ecdbcb455d3d6b259111373b7e08b8055158a8"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2624,7 +2604,7 @@ dependencies = [
  "bitvec",
  "cityjson-convert",
  "cityjson-index",
- "cityjson-lib 0.5.3",
+ "cityjson-lib",
  "clap",
  "earcutr 0.2.0",
  "env_logger 0.10.2",
@@ -2638,7 +2618,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_repr",
- "subprocess",
  "thiserror 1.0.69",
  "walkdir",
 ]
@@ -2889,22 +2868,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2912,12 +2875,6 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"
