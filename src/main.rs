@@ -106,6 +106,7 @@ struct PreparedInput {
 
 fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOptions {
     let mut feature_type_colors = BTreeMap::new();
+    let mut feature_type_lods = BTreeMap::new();
 
     for (feature_type, color) in [
         ("Building", cli.color_building.as_ref()),
@@ -143,6 +144,42 @@ fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOp
         }
     }
 
+    for (feature_type, lod) in [
+        ("Building", cli.lod_building.as_ref()),
+        ("BuildingPart", cli.lod_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.lod_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.lod_tin_relief.as_ref()),
+        ("Road", cli.lod_road.as_ref()),
+        ("Railway", cli.lod_railway.as_ref()),
+        ("TransportSquare", cli.lod_transport_square.as_ref()),
+        ("WaterBody", cli.lod_water_body.as_ref()),
+        ("PlantCover", cli.lod_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.lod_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.lod_land_use.as_ref()),
+        ("CityFurniture", cli.lod_city_furniture.as_ref()),
+        ("Bridge", cli.lod_bridge.as_ref()),
+        ("BridgePart", cli.lod_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.lod_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.lod_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.lod_tunnel.as_ref()),
+        ("TunnelPart", cli.lod_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.lod_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.lod_generic_city_object.as_ref()),
+    ] {
+        if let Some(lod) = lod {
+            feature_type_lods.insert(feature_type.to_string(), lod.clone());
+        }
+    }
+
     cityjson_convert::ExportOptions {
         native_glb_color: "#FFC0CB".to_string(),
         metadata_class_name: cli
@@ -150,6 +187,7 @@ fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOp
             .clone()
             .unwrap_or_else(|| "cityobject".to_string()),
         feature_type_colors,
+        feature_type_lods,
         quantize_geometry: true,
         meshopt_compression: true,
     }

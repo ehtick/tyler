@@ -25,6 +25,7 @@ pub struct ExportOptions {
     pub native_glb_color: String,
     pub metadata_class_name: String,
     pub feature_type_colors: BTreeMap<String, String>,
+    pub feature_type_lods: BTreeMap<String, String>,
     pub quantize_geometry: bool,
     pub meshopt_compression: bool,
 }
@@ -35,6 +36,7 @@ impl Default for ExportOptions {
             native_glb_color: "#FFC0CB".to_string(),
             metadata_class_name: "cityobject".to_string(),
             feature_type_colors: BTreeMap::new(),
+            feature_type_lods: BTreeMap::new(),
             quantize_geometry: true,
             meshopt_compression: true,
         }

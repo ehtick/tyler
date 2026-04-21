@@ -531,3 +531,38 @@ fn convert_to_glb_compresses_metadata_numeric_columns() {
         "INT8 bool columns remain raw because meshopt attribute encoding requires 4-byte elements"
     );
 }
+
+#[test]
+fn convert_to_glb_filters_geometry_by_requested_lod() {
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_lod_building_part.city.jsonl"))
+            .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("multi-lod-building-part");
+    let options = ExportOptions {
+        feature_type_lods: BTreeMap::from([("BuildingPart".to_string(), "2.2".to_string())]),
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options).expect("GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+    let accessors = root["accessors"]
+        .as_array()
+        .expect("glTF should contain accessors");
+
+    assert_eq!(
+        accessors[3]["count"].as_u64().unwrap(),
+        36,
+        "only the LoD 2.2 cube should be exported"
+    );
+    assert_eq!(
+        root["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"]
+            .as_u64()
+            .unwrap(),
+        1,
+        "metadata rows should stay aligned with the surviving feature geometry"
+    );
+}

@@ -89,7 +89,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     output_path: P,
     options: &ExportOptions,
 ) -> Result<()> {
-    let mut collector = MeshCollector::new();
+    let mut collector = MeshCollector::with_lod_filter(options.feature_type_lods.clone());
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -319,6 +319,7 @@ struct ProcessedScene {
 struct MeshCollector {
     features: Vec<FeatureRecord>,
     primitives: BTreeMap<String, RawPrimitiveMesh>,
+    feature_type_lods: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -440,10 +441,11 @@ struct QuantizedScene {
 }
 
 impl MeshCollector {
-    fn new() -> Self {
+    fn with_lod_filter(feature_type_lods: BTreeMap<String, String>) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),
+            feature_type_lods,
         }
     }
 
@@ -453,21 +455,34 @@ impl MeshCollector {
                 continue;
             };
             let feature_type = cityobject.type_cityobject().to_string();
-            let feature_index = self.features.len();
-            self.features.push(FeatureRecord {
-                object_id: object_id.to_string(),
-                feature_type: feature_type.clone(),
-                attributes: Self::collect_feature_attributes(model, cityobject),
-            });
+            let mut feature_index = None;
             for geometry_handle in geometry_handles {
                 let geometry = model.resolve_geometry(*geometry_handle)?;
+                if let Some(selected_lod) = self.feature_type_lods.get(&feature_type) {
+                    if geometry
+                        .geometry()
+                        .lod()
+                        .is_none_or(|lod| lod.to_string() != *selected_lod)
+                    {
+                        continue;
+                    }
+                }
+                let feature_index = *feature_index.get_or_insert_with(|| {
+                    let feature_index = self.features.len() as u32;
+                    self.features.push(FeatureRecord {
+                        object_id: object_id.to_string(),
+                        feature_type: feature_type.clone(),
+                        attributes: Self::collect_feature_attributes(model, cityobject),
+                    });
+                    feature_index
+                });
                 match geometry.geometry().type_geometry() {
                     GeometryType::MultiSurface | GeometryType::CompositeSurface => {
                         let Some(boundary) = geometry.geometry().boundaries() else {
                             continue;
                         };
                         for surface in boundary.to_nested_multi_or_composite_surface()? {
-                            self.add_surface(&feature_type, feature_index as u32, &surface, model)?;
+                            self.add_surface(&feature_type, feature_index, &surface, model)?;
                         }
                     }
                     GeometryType::Solid => {
@@ -478,7 +493,7 @@ impl MeshCollector {
                             for surface in shell {
                                 self.add_surface(
                                     &feature_type,
-                                    feature_index as u32,
+                                    feature_index,
                                     &surface,
                                     model,
                                 )?;
@@ -494,7 +509,7 @@ impl MeshCollector {
                                 for surface in shell {
                                     self.add_surface(
                                         &feature_type,
-                                        feature_index as u32,
+                                        feature_index,
                                         &surface,
                                         model,
                                     )?;
@@ -816,6 +831,7 @@ impl ProcessedScene {
         let MeshCollector {
             features,
             mut primitives,
+            ..
         } = collector;
         let mut bounds = Bounds::empty();
         let mut has_vertices = false;
