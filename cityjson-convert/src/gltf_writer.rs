@@ -6,13 +6,14 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use crate::proj::Proj;
 use crate::ExportOptions;
 use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
-use log::info;
+use log::{info, warn};
 use meshopt::{
     encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
     optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
@@ -89,7 +90,9 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     output_path: P,
     options: &ExportOptions,
 ) -> Result<()> {
-    let mut collector = MeshCollector::with_lod_filter(options.feature_type_lods.clone());
+    let coordinate_transform = CoordinateTransform::from_model(model, options)?;
+    let mut collector =
+        MeshCollector::with_lod_filter(options.feature_type_lods.clone(), coordinate_transform);
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -312,6 +315,7 @@ struct ProcessedScene {
     primitives: Vec<ProcessedPrimitiveMesh>,
     features: Vec<FeatureRecord>,
     center: [f32; 3],
+    node_translation_base: [f32; 3],
     bounds: Option<Bounds>,
 }
 
@@ -319,6 +323,13 @@ struct MeshCollector {
     features: Vec<FeatureRecord>,
     primitives: BTreeMap<String, RawPrimitiveMesh>,
     feature_type_lods: BTreeMap<String, String>,
+    coordinate_transform: CoordinateTransform,
+}
+
+struct CoordinateTransform {
+    vertex_transformer: Option<Proj>,
+    storage_origin: [f64; 3],
+    node_translation_base: [f32; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -439,12 +450,176 @@ struct QuantizedScene {
     features: Vec<FeatureRecord>,
 }
 
+impl CoordinateTransform {
+    fn from_model(model: &CityModel, options: &ExportOptions) -> Result<Self> {
+        if !options.reproject_to_ecef {
+            return Ok(Self {
+                vertex_transformer: None,
+                storage_origin: [0.0; 3],
+                node_translation_base: [0.0; 3],
+            });
+        }
+
+        let Some(source_crs) = options
+            .source_crs
+            .clone()
+            .or_else(|| source_crs_from_model(model))
+        else {
+            warn!("CityJSON source CRS is missing, skipping ECEF reprojection");
+            return Ok(Self {
+                vertex_transformer: None,
+                storage_origin: [0.0; 3],
+                node_translation_base: [0.0; 3],
+            });
+        };
+
+        let source_crs = canonical_epsg_crs(&source_crs)?;
+        let vertex_transformer = (source_crs != "EPSG:4978")
+            .then(|| Proj::new_known_crs(&source_crs, "EPSG:4978", None))
+            .transpose()
+            .context("failed to create source CRS to ECEF transform")?;
+
+        let storage_origin = if let Some(origin) = options.ecef_origin {
+            origin
+        } else {
+            compute_storage_origin(model, vertex_transformer.as_ref())?
+        };
+        let tileset_origin = options.ecef_origin.unwrap_or([0.0; 3]);
+        let node_translation_base = [
+            f64_to_f32_checked(
+                storage_origin[0] - tileset_origin[0],
+                "ecef translation x",
+                None,
+            )?,
+            f64_to_f32_checked(
+                storage_origin[1] - tileset_origin[1],
+                "ecef translation y",
+                None,
+            )?,
+            f64_to_f32_checked(
+                storage_origin[2] - tileset_origin[2],
+                "ecef translation z",
+                None,
+            )?,
+        ];
+
+        Ok(Self {
+            vertex_transformer,
+            storage_origin,
+            node_translation_base,
+        })
+    }
+
+    fn transform_vertex(&self, vertex_id: u32, model: &CityModel) -> Result<[f32; 3]> {
+        let vertex = model
+            .get_vertex(VertexIndex::new(vertex_id))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_id}"))?;
+        let [x, y, z] = vertex.to_array();
+        let position = if let Some(transformer) = &self.vertex_transformer {
+            let transformed = transformer
+                .convert((x, y, z))
+                .with_context(|| format!("failed to project vertex {vertex_id} to ECEF"))?;
+            [transformed.0, transformed.1, transformed.2]
+        } else {
+            [x, y, z]
+        };
+
+        Ok([
+            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", Some(vertex_id))?,
+            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", Some(vertex_id))?,
+            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", Some(vertex_id))?,
+        ])
+    }
+}
+
+fn source_crs_from_model(model: &CityModel) -> Option<String> {
+    model.metadata().and_then(|metadata| {
+        metadata
+            .reference_system()
+            .map(std::string::ToString::to_string)
+    })
+}
+
+fn canonical_epsg_crs(value: &str) -> Result<String> {
+    if let Some(code) = value.strip_prefix("EPSG:") {
+        let parsed = code.parse::<u32>().context("invalid EPSG code")?;
+        return Ok(format!("EPSG:{parsed}"));
+    }
+
+    let code = value
+        .rsplit(['/', ':'])
+        .find(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not extract EPSG code from {value}"))?;
+    let parsed = code
+        .parse::<u32>()
+        .with_context(|| format!("invalid EPSG code in {value}"))?;
+    Ok(format!("EPSG:{parsed}"))
+}
+
+fn compute_storage_origin(
+    model: &CityModel,
+    vertex_transformer: Option<&Proj>,
+) -> Result<[f64; 3]> {
+    let mut bounds_min = [f64::INFINITY; 3];
+    let mut bounds_max = [f64::NEG_INFINITY; 3];
+    let mut has_vertices = false;
+
+    for vertex_index in 0..model.vertices().len() {
+        let vertex = model
+            .get_vertex(VertexIndex::new(
+                u32::try_from(vertex_index).expect("vertex count within u32 range"),
+            ))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_index}"))?;
+        let [x, y, z] = vertex.to_array();
+        let position = if let Some(transformer) = vertex_transformer {
+            let transformed = transformer
+                .convert((x, y, z))
+                .with_context(|| format!("failed to project vertex {vertex_index} to ECEF"))?;
+            [transformed.0, transformed.1, transformed.2]
+        } else {
+            [x, y, z]
+        };
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(position[axis]);
+            bounds_max[axis] = bounds_max[axis].max(position[axis]);
+        }
+        has_vertices = true;
+    }
+
+    if !has_vertices {
+        return Ok([0.0; 3]);
+    }
+
+    Ok([
+        f64::midpoint(bounds_min[0], bounds_max[0]),
+        f64::midpoint(bounds_min[1], bounds_max[1]),
+        f64::midpoint(bounds_min[2], bounds_max[2]),
+    ])
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn f64_to_f32_checked(value: f64, axis: &str, vertex_id: Option<u32>) -> Result<f32> {
+    if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+        if let Some(vertex_id) = vertex_id {
+            bail!("vertex {vertex_id} {axis} coordinate is outside the f32 range");
+        }
+        bail!("{axis} coordinate is outside the f32 range");
+    }
+    {
+        Ok(value as f32)
+    }
+}
+
 impl MeshCollector {
-    fn with_lod_filter(feature_type_lods: BTreeMap<String, String>) -> Self {
+    fn with_lod_filter(
+        feature_type_lods: BTreeMap<String, String>,
+        coordinate_transform: CoordinateTransform,
+    ) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),
             feature_type_lods,
+            coordinate_transform,
         }
     }
 
@@ -553,7 +728,9 @@ impl MeshCollector {
             }
 
             for &vertex_id in ring {
-                let position = Self::compute_position(vertex_id, model)?;
+                let position = self
+                    .coordinate_transform
+                    .transform_vertex(vertex_id, model)?;
                 local_positions.push(position);
                 vertex_count += 1;
             }
@@ -662,18 +839,6 @@ impl MeshCollector {
         }
     }
 
-    fn compute_position(idx: u32, model: &CityModel) -> Result<[f32; 3], anyhow::Error> {
-        let vertex = model
-            .get_vertex(VertexIndex::new(idx))
-            .ok_or_else(|| anyhow::anyhow!("missing vertex {idx}"))?;
-        let [x, y, z] = vertex.to_array();
-        Ok([
-            Self::f64_to_f32(x, "x", idx)?,
-            Self::f64_to_f32(y, "y", idx)?,
-            Self::f64_to_f32(z, "z", idx)?,
-        ])
-    }
-
     fn find_projection_axis(positions: &[[f32; 3]]) -> usize {
         if let Some(normal) = Self::compute_polygon_normal(positions) {
             return Self::dominant_axis(normal);
@@ -741,14 +906,6 @@ impl MeshCollector {
         } else {
             [0.0, 0.0, 1.0]
         }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn f64_to_f32(value: f64, axis: &str, vertex_id: u32) -> Result<f32> {
-        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
-            anyhow::bail!("vertex {vertex_id} {axis} coordinate is outside the f32 range");
-        }
-        Ok(value as f32)
     }
 }
 
@@ -827,6 +984,7 @@ impl ProcessedScene {
         let MeshCollector {
             features,
             mut primitives,
+            coordinate_transform,
             ..
         } = collector;
         let mut bounds = Bounds::empty();
@@ -873,6 +1031,7 @@ impl ProcessedScene {
             primitives: processed_primitives,
             features: processed_features,
             center,
+            node_translation_base: coordinate_transform.node_translation_base,
             bounds: has_final_vertices.then_some(final_bounds),
         })
     }
@@ -939,8 +1098,10 @@ impl ProcessedScene {
             bounds.max[2]
         );
         info!(
-            "  World-space center: [{:.2}, {:.2}, {:.2}]",
-            self.center[0], self.center[1], self.center[2]
+            "  Node translation: [{:.2}, {:.2}, {:.2}]",
+            self.node_translation_base[0] + self.center[0],
+            self.node_translation_base[1] + self.center[1],
+            self.node_translation_base[2] + self.center[2]
         );
 
         Ok(())
@@ -970,11 +1131,19 @@ impl ProcessedScene {
             buffer_builder,
             primitive_encodings,
             materials,
-            build_node_matrix(1.0, self.center),
+            build_node_matrix(1.0, self.node_translation()),
             false,
             options.meshopt_compression,
             structural_metadata,
         ))
+    }
+
+    fn node_translation(&self) -> [f32; 3] {
+        [
+            self.node_translation_base[0] + self.center[0],
+            self.node_translation_base[1] + self.center[1],
+            self.node_translation_base[2] + self.center[2],
+        ]
     }
 }
 
@@ -1021,7 +1190,7 @@ impl QuantizedScene {
         Ok(Self {
             primitives,
             position_scale,
-            center: scene.center,
+            center: scene.node_translation(),
             features: scene.features.clone(),
         })
     }
@@ -1209,12 +1378,24 @@ fn build_encoded_glb(
     }
 }
 
-fn build_node_matrix(scale: f32, center: [f32; 3]) -> [f32; 16] {
+fn build_node_matrix(scale: f32, translation: [f32; 3]) -> [f32; 16] {
     [
-        scale, 0.0, 0.0, 0.0, //
-        0.0, 0.0, -scale, 0.0, //
-        0.0, scale, 0.0, 0.0, //
-        center[0], center[2], -center[1], 1.0,
+        scale,
+        0.0,
+        0.0,
+        0.0, //
+        0.0,
+        0.0,
+        -scale,
+        0.0, //
+        0.0,
+        scale,
+        0.0,
+        0.0, //
+        translation[0],
+        translation[2],
+        -translation[1],
+        1.0,
     ]
 }
 

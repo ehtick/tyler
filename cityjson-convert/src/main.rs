@@ -38,6 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata_class_name: cli.metadata_class_name,
         feature_type_colors: BTreeMap::default(),
         feature_type_lods: BTreeMap::default(),
+        source_crs: None,
+        ecef_origin: None,
+        reproject_to_ecef: true,
         quantize_geometry: !cli.no_quantization,
         meshopt_compression: !cli.no_meshopt_compression,
     };

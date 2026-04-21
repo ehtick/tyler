@@ -311,9 +311,13 @@ dependencies = [
  "earcutr 0.5.0",
  "env_logger 0.11.10",
  "gltf",
+ "libc",
  "log",
  "meshopt",
+ "num-traits",
+ "proj-sys",
  "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

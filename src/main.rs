@@ -104,7 +104,11 @@ struct PreparedInput {
     feature_base_document: Option<Vec<u8>>,
 }
 
-fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOptions {
+fn build_glb_export_options(
+    cli: &crate::cli::Cli,
+    source_crs: Option<String>,
+    ecef_origin: Option<[f64; 3]>,
+) -> cityjson_convert::ExportOptions {
     let mut feature_type_colors = BTreeMap::new();
     let mut feature_type_lods = BTreeMap::new();
 
@@ -188,9 +192,28 @@ fn build_glb_export_options(cli: &crate::cli::Cli) -> cityjson_convert::ExportOp
             .unwrap_or_else(|| "cityobject".to_string()),
         feature_type_colors,
         feature_type_lods,
+        source_crs,
+        ecef_origin,
+        reproject_to_ecef: true,
         quantize_geometry: true,
         meshopt_compression: true,
     }
+}
+
+fn compute_root_ecef_origin(
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<[f64; 3], Box<dyn std::error::Error>> {
+    let crs_from = format!("EPSG:{}", world.crs.to_epsg()?);
+    let transformer = crate::proj::Proj::new_known_crs(&crs_from, "EPSG:4978", None)?;
+    let root_bbox = quadtree.bbox(&world.grid);
+    let root_center_original = (
+        (root_bbox[0] + root_bbox[3]) * 0.5,
+        (root_bbox[1] + root_bbox[4]) * 0.5,
+        (root_bbox[2] + root_bbox[5]) * 0.5,
+    );
+    let root_center_ecef = transformer.convert(root_center_original)?;
+    Ok([root_center_ecef.0, root_center_ecef.1, root_center_ecef.2])
 }
 
 fn prepare_input(
@@ -600,7 +623,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Created output directory {:#?}", &path_features_input_dir);
         }
 
-        let export_options = build_glb_export_options(&cli);
+        let source_crs = Some(format!("EPSG:{}", world.crs.to_epsg()?));
+        let ecef_origin = Some(compute_root_ecef_origin(&world, &quadtree)?);
+        let export_options = build_glb_export_options(&cli, source_crs, ecef_origin);
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
             let tileid_grid = &tile.id;

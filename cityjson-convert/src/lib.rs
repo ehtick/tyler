@@ -11,6 +11,7 @@
 )]
 
 pub mod gltf_writer;
+mod proj;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,6 +27,9 @@ pub struct ExportOptions {
     pub metadata_class_name: String,
     pub feature_type_colors: BTreeMap<String, String>,
     pub feature_type_lods: BTreeMap<String, String>,
+    pub source_crs: Option<String>,
+    pub ecef_origin: Option<[f64; 3]>,
+    pub reproject_to_ecef: bool,
     pub quantize_geometry: bool,
     pub meshopt_compression: bool,
 }
@@ -37,6 +41,9 @@ impl Default for ExportOptions {
             metadata_class_name: "cityobject".to_string(),
             feature_type_colors: BTreeMap::new(),
             feature_type_lods: BTreeMap::new(),
+            source_crs: None,
+            ecef_origin: None,
+            reproject_to_ecef: true,
             quantize_geometry: true,
             meshopt_compression: true,
         }

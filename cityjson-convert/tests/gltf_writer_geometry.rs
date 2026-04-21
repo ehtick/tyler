@@ -197,6 +197,37 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     );
 }
 
+#[test]
+fn convert_to_glb_can_reproject_geometry_to_ecef() {
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let output_path = stable_output_path("ams-up-ecef");
+    let options = ExportOptions {
+        source_crs: Some("EPSG:7415".to_string()),
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options).expect("ECEF GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+    let node_matrix = root["nodes"][0]["matrix"]
+        .as_array()
+        .expect("root node should carry the local-to-world transform");
+
+    let translation = [
+        node_matrix[12].as_f64().unwrap(),
+        node_matrix[13].as_f64().unwrap(),
+        node_matrix[14].as_f64().unwrap(),
+    ];
+    assert!(
+        translation
+            .iter()
+            .any(|component| component.abs() > 1_000_000.0),
+        "ECEF translation should be in Earth-centered coordinates: {translation:?}"
+    );
+}
+
 #[allow(clippy::float_cmp)]
 #[test]
 fn convert_to_glb_can_disable_quantization_and_compression() {
