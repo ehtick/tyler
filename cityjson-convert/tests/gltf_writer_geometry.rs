@@ -17,6 +17,13 @@ fn test_output_path(name: &str) -> PathBuf {
     ))
 }
 
+fn stable_output_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("output")
+        .join(format!("{name}.glb"))
+}
+
 fn read_glb_json(bytes: &[u8]) -> Value {
     assert!(bytes.len() >= 20, "glb file should contain a header and JSON chunk");
     assert_eq!(&bytes[0..4], b"glTF");
@@ -110,9 +117,29 @@ fn convert_to_glb_writes_expected_geometry_layout() {
 }
 
 #[test]
-#[ignore = "TODO: add a fixture with an interior ring and assert triangulation succeeds without dropping the hole"]
 fn convert_to_glb_triangulates_surfaces_with_holes() {
-    todo!("add a CityJSONFeature fixture with a hole and assert the emitted mesh/index layout");
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
+        .expect("hole fixture feature stream should parse");
+    let output_path = stable_output_path("ams_up_holes");
+
+    convert_to_glb(&model, &output_path, &ExportOptions::default())
+        .expect("GLB conversion should succeed for hole-bearing geometry");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+    let accessors = root["accessors"]
+        .as_array()
+        .expect("glTF should contain accessors");
+
+    assert!(
+        accessors[0]["count"].as_u64().unwrap() > 0,
+        "hole-bearing feature should still produce position data"
+    );
+    assert_eq!(
+        root["meshes"][0]["primitives"][0]["indices"].as_u64().unwrap(),
+        2,
+        "primitive should still reference the shared index accessor"
+    );
 }
 
 #[test]
