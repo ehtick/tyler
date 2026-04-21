@@ -80,15 +80,15 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     output_path: P,
     default_color: &str,
 ) -> Result<()> {
-    let mut builder = MeshBuilder::new();
-    builder.add_model(model)?;
-    builder.finalize_geometry()?;
+    let mut collector = MeshCollector::new();
+    collector.add_model(model)?;
+    let processed = collector.finish()?;
     info!(
         "Processed {} vertices and {} indices for the output GLB",
-        builder.vertices.len(),
-        builder.indices.len()
+        processed.vertex_count(),
+        processed.index_count()
     );
-    builder.write_glb(output_path, default_color)
+    processed.write_glb(output_path, default_color)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -200,20 +200,44 @@ impl IndexBuffer {
     }
 }
 
-struct MeshBuilder {
+#[derive(Default)]
+struct RawMesh {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
+struct ProcessedMesh {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
     center: [f32; 3],
     bounds: Option<Bounds>,
 }
 
-impl MeshBuilder {
+struct MeshCollector {
+    mesh: RawMesh,
+}
+
+struct VertexAccessors {
+    positions: json::Index<json::Accessor>,
+    normals: json::Index<json::Accessor>,
+}
+
+#[derive(Default)]
+struct BufferBuilder {
+    bytes: Vec<u8>,
+    buffer_views: Vec<json::buffer::View>,
+    accessors: Vec<json::Accessor>,
+}
+
+struct EncodedGlb {
+    root: json::Root,
+    bin_buffer: Vec<u8>,
+}
+
+impl MeshCollector {
     fn new() -> Self {
         Self {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-            center: [0.0; 3],
-            bounds: None,
+            mesh: RawMesh::default(),
         }
     }
 
@@ -261,6 +285,10 @@ impl MeshBuilder {
         }
 
         Ok(())
+    }
+
+    fn finish(self) -> Result<ProcessedMesh> {
+        self.mesh.into_processed()
     }
 
     fn add_surface(&mut self, surface: &[Vec<u32>], model: &CityModel) -> Result<()> {
@@ -320,85 +348,7 @@ impl MeshBuilder {
             return Ok(());
         }
 
-        self.emit_triangles(&local_positions, &triangulated)
-    }
-
-    fn emit_triangles(&mut self, positions: &[[f32; 3]], triangulated: &[usize]) -> Result<()> {
-        for tri in triangulated.chunks_exact(3) {
-            let p0 = positions[tri[0]];
-            let p1 = positions[tri[1]];
-            let p2 = positions[tri[2]];
-            let normal = Self::compute_face_normal(p0, p1, p2);
-
-            let base_index =
-                u32::try_from(self.vertices.len()).context("GLB vertex count exceeds u32 range")?;
-            self.vertices.push(Vertex {
-                position: p0,
-                normal,
-            });
-            self.vertices.push(Vertex {
-                position: p1,
-                normal,
-            });
-            self.vertices.push(Vertex {
-                position: p2,
-                normal,
-            });
-            self.indices
-                .extend_from_slice(&[base_index, base_index + 1, base_index + 2]);
-        }
-
-        Ok(())
-    }
-
-    fn finalize_geometry(&mut self) -> Result<()> {
-        if self.vertices.is_empty() {
-            return Ok(());
-        }
-
-        self.center_geometry();
-        self.optimize_geometry()?;
-        self.bounds = Bounds::from_vertices(&self.vertices);
-        Ok(())
-    }
-
-    fn center_geometry(&mut self) {
-        let Some(bounds) = Bounds::from_vertices(&self.vertices) else {
-            return;
-        };
-        self.center = bounds.center();
-        for vertex in &mut self.vertices {
-            vertex.position[0] -= self.center[0];
-            vertex.position[1] -= self.center[1];
-            vertex.position[2] -= self.center[2];
-        }
-    }
-
-    fn optimize_geometry(&mut self) -> Result<()> {
-        if self.vertices.is_empty() || self.indices.is_empty() {
-            return Ok(());
-        }
-
-        let (vertex_count, remap) = generate_vertex_remap(&self.vertices, Some(&self.indices));
-        let remapped_indices = remap_index_buffer(Some(&self.indices), vertex_count, &remap);
-        let remapped_vertices = remap_vertex_buffer(&self.vertices, vertex_count, &remap);
-
-        let mut optimized_indices = optimize_vertex_cache(&remapped_indices, remapped_vertices.len());
-        optimize_overdraw_in_place_decoder(
-            &mut optimized_indices,
-            &remapped_vertices,
-            OVERDRAW_THRESHOLD,
-        );
-        let optimized_vertices = optimize_vertex_fetch(&mut optimized_indices, &remapped_vertices);
-
-        self.vertices = optimized_vertices;
-        self.indices = optimized_indices;
-
-        if self.vertices.len() > u32::MAX as usize {
-            anyhow::bail!("GLB vertex count exceeds u32 index range");
-        }
-
-        Ok(())
+        self.mesh.emit_triangles(&local_positions, &triangulated, Self::compute_face_normal)
     }
 
     fn compute_position(idx: u32, model: &CityModel) -> Result<[f32; 3], anyhow::Error> {
@@ -456,6 +406,112 @@ impl MeshBuilder {
         }
         Ok(value as f32)
     }
+}
+
+impl RawMesh {
+    fn emit_triangles<F>(
+        &mut self,
+        positions: &[[f32; 3]],
+        triangulated: &[usize],
+        compute_face_normal: F,
+    ) -> Result<()>
+    where
+        F: Fn([f32; 3], [f32; 3], [f32; 3]) -> [f32; 3],
+    {
+        for tri in triangulated.chunks_exact(3) {
+            let p0 = positions[tri[0]];
+            let p1 = positions[tri[1]];
+            let p2 = positions[tri[2]];
+            let normal = compute_face_normal(p0, p1, p2);
+
+            let base_index =
+                u32::try_from(self.vertices.len()).context("GLB vertex count exceeds u32 range")?;
+            self.vertices.push(Vertex {
+                position: p0,
+                normal,
+            });
+            self.vertices.push(Vertex {
+                position: p1,
+                normal,
+            });
+            self.vertices.push(Vertex {
+                position: p2,
+                normal,
+            });
+            self.indices
+                .extend_from_slice(&[base_index, base_index + 1, base_index + 2]);
+        }
+
+        Ok(())
+    }
+
+    fn into_processed(mut self) -> Result<ProcessedMesh> {
+        if self.vertices.is_empty() {
+            return Ok(ProcessedMesh {
+                vertices: self.vertices,
+                indices: self.indices,
+                center: [0.0; 3],
+                bounds: None,
+            });
+        }
+
+        let initial_bounds = Bounds::from_vertices(&self.vertices)
+            .ok_or_else(|| anyhow::anyhow!("raw mesh bounds missing for non-empty mesh"))?;
+        let center = initial_bounds.center();
+        for vertex in &mut self.vertices {
+            vertex.position[0] -= center[0];
+            vertex.position[1] -= center[1];
+            vertex.position[2] -= center[2];
+        }
+
+        self.optimize()?;
+        let bounds = Bounds::from_vertices(&self.vertices);
+
+        Ok(ProcessedMesh {
+            vertices: self.vertices,
+            indices: self.indices,
+            center,
+            bounds,
+        })
+    }
+
+    fn optimize(&mut self) -> Result<()> {
+        if self.vertices.is_empty() || self.indices.is_empty() {
+            return Ok(());
+        }
+
+        let (vertex_count, remap) = generate_vertex_remap(&self.vertices, Some(&self.indices));
+        let remapped_indices = remap_index_buffer(Some(&self.indices), vertex_count, &remap);
+        let remapped_vertices = remap_vertex_buffer(&self.vertices, vertex_count, &remap);
+
+        let mut optimized_indices =
+            optimize_vertex_cache(&remapped_indices, remapped_vertices.len());
+        optimize_overdraw_in_place_decoder(
+            &mut optimized_indices,
+            &remapped_vertices,
+            OVERDRAW_THRESHOLD,
+        );
+        let optimized_vertices = optimize_vertex_fetch(&mut optimized_indices, &remapped_vertices);
+
+        self.vertices = optimized_vertices;
+        self.indices = optimized_indices;
+
+        if self.vertices.len() > u32::MAX as usize {
+            anyhow::bail!("GLB vertex count exceeds u32 index range");
+        }
+
+        Ok(())
+    }
+}
+
+impl ProcessedMesh {
+    fn vertex_count(&self) -> usize {
+        self.vertices.len()
+    }
+
+    fn index_count(&self) -> usize {
+        self.indices.len()
+    }
 
     fn select_index_buffer(&self) -> Result<IndexBuffer> {
         if self.vertices.len() <= (u16::MAX as usize) + 1 {
@@ -490,128 +546,60 @@ impl MeshBuilder {
             return Ok(());
         }
 
+        info!(
+            "Writing GLB file with {} vertices and {} indices to {}",
+            self.vertices.len(),
+            self.indices.len(),
+            output_path.as_ref().display()
+        );
+
+        let encoded = self.encode_glb(default_color)?;
+        let bounds = self
+            .bounds
+            .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
+        let index_buffer = self.select_index_buffer()?;
+        encoded.write(output_path.as_ref())?;
+
+        info!("GLB Summary: {}", output_path.as_ref().display());
+        info!("  Vertices: {}", self.vertices.len());
+        info!("  Indices: {}", index_buffer.count());
+        info!(
+            "  Local coordinate range: X [{:.2}, {:.2}], Y [{:.2}, {:.2}], Z [{:.2}, {:.2}]",
+            bounds.min[0], bounds.max[0], bounds.min[1], bounds.max[1], bounds.min[2], bounds.max[2]
+        );
+        info!(
+            "  World-space center: [{:.2}, {:.2}, {:.2}]",
+            self.center[0], self.center[1], self.center[2]
+        );
+
+        Ok(())
+    }
+
+    fn encode_glb(&self, default_color: &str) -> Result<EncodedGlb> {
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
         let index_buffer = self.select_index_buffer()?;
 
-        info!(
-            "Writing GLB file with {} vertices and {} indices to {}",
-            self.vertices.len(),
-            index_buffer.count(),
-            output_path.as_ref().display()
-        );
-
-        let mut bin_buffer: Vec<u8> = Vec::new();
-
-        let vertex_offset = 0usize;
-        for vertex in &self.vertices {
-            for component in vertex.position {
-                bin_buffer.extend_from_slice(&component.to_le_bytes());
-            }
-            for component in vertex.normal {
-                bin_buffer.extend_from_slice(&component.to_le_bytes());
-            }
-        }
-
-        let indices_offset = bin_buffer.len();
-        index_buffer.write_bytes(&mut bin_buffer);
-
-        let accessor_positions = json::Accessor {
-            buffer_view: Some(json::Index::new(0)),
-            byte_offset: Some(json::validation::USize64(0)),
-            count: json::validation::USize64(self.vertices.len() as u64),
-            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
-                json::accessor::ComponentType::F32,
-            )),
-            normalized: false,
-            min: Some(json::Value::Array(
-                bounds.min.iter().copied().map(json::Value::from).collect(),
-            )),
-            max: Some(json::Value::Array(
-                bounds.max.iter().copied().map(json::Value::from).collect(),
-            )),
-            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
-            name: None,
-            sparse: None,
-        };
-
-        let accessor_normals = json::Accessor {
-            buffer_view: Some(json::Index::new(0)),
-            byte_offset: Some(json::validation::USize64(NORMAL_OFFSET as u64)),
-            count: json::validation::USize64(self.vertices.len() as u64),
-            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
-                json::accessor::ComponentType::F32,
-            )),
-            normalized: false,
-            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
-            extensions: Default::default(),
-            extras: Default::default(),
-            min: None,
-            max: None,
-            name: None,
-            sparse: None,
-        };
-
-        let accessor_indices = json::Accessor {
-            buffer_view: Some(json::Index::new(1)),
-            byte_offset: Some(json::validation::USize64(0)),
-            count: json::validation::USize64(index_buffer.count() as u64),
-            component_type: index_buffer.component_type(),
-            normalized: false,
-            min: Some(json::Value::from(vec![0])),
-            max: Some(json::Value::from(vec![index_buffer.max_value()])),
-            type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
-            extensions: Default::default(),
-            extras: Default::default(),
-            name: None,
-            sparse: None,
-        };
-
-        let buffer_views = vec![
-            json::buffer::View {
-                buffer: json::Index::new(0),
-                byte_length: json::validation::USize64((self.vertices.len() * VERTEX_STRIDE) as u64),
-                byte_offset: Some(json::validation::USize64(vertex_offset as u64)),
-                byte_stride: Some(json::buffer::Stride(VERTEX_STRIDE)),
-                target: Some(json::validation::Checked::Valid(
-                    json::buffer::Target::ArrayBuffer,
-                )),
-                extensions: Default::default(),
-                extras: Default::default(),
-                name: None,
-            },
-            json::buffer::View {
-                buffer: json::Index::new(0),
-                byte_length: json::validation::USize64(index_buffer.byte_length() as u64),
-                byte_offset: Some(json::validation::USize64(indices_offset as u64)),
-                byte_stride: None,
-                target: Some(json::validation::Checked::Valid(
-                    json::buffer::Target::ElementArrayBuffer,
-                )),
-                extensions: Default::default(),
-                extras: Default::default(),
-                name: None,
-            },
-        ];
+        let mut buffer_builder = BufferBuilder::default();
+        let vertex_accessors = buffer_builder.push_vertices(&self.vertices, &bounds);
+        let index_accessor = buffer_builder.push_indices(&index_buffer);
 
         let mut attributes = std::collections::BTreeMap::new();
         attributes.insert(
             json::validation::Checked::Valid(json::mesh::Semantic::Positions),
-            json::Index::new(0),
+            vertex_accessors.positions,
         );
         attributes.insert(
             json::validation::Checked::Valid(json::mesh::Semantic::Normals),
-            json::Index::new(1),
+            vertex_accessors.normals,
         );
 
         let material = create_default_material(default_color)?;
 
         let primitive = json::mesh::Primitive {
             attributes,
-            indices: Some(json::Index::new(2)),
+            indices: Some(index_accessor),
             material: Some(json::Index::new(0)),
             mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
             targets: None,
@@ -667,15 +655,15 @@ impl MeshBuilder {
         };
 
         let root = json::Root {
-            accessors: vec![accessor_positions, accessor_normals, accessor_indices],
+            accessors: buffer_builder.accessors,
             buffers: vec![json::Buffer {
-                byte_length: json::validation::USize64(bin_buffer.len() as u64),
+                byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
                 uri: None,
                 name: Some("buffer0".into()),
                 extensions: Default::default(),
                 extras: Default::default(),
             }],
-            buffer_views,
+            buffer_views: buffer_builder.buffer_views,
             materials: vec![material],
             meshes: vec![mesh],
             nodes: vec![node],
@@ -690,10 +678,130 @@ impl MeshBuilder {
             ..Default::default()
         };
 
-        let mut json_bytes = json::serialize::to_string(&root)?.into_bytes();
+        Ok(EncodedGlb {
+            root,
+            bin_buffer: buffer_builder.bytes,
+        })
+    }
+}
+
+impl BufferBuilder {
+    fn push_vertices(&mut self, vertices: &[Vertex], bounds: &Bounds) -> VertexAccessors {
+        let mut vertex_bytes = Vec::with_capacity(vertices.len() * VERTEX_STRIDE);
+        for vertex in vertices {
+            for component in vertex.position {
+                vertex_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+            for component in vertex.normal {
+                vertex_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+
+        let view = self.push_buffer_view(
+            vertex_bytes,
+            Some(VERTEX_STRIDE),
+            json::buffer::Target::ArrayBuffer,
+        );
+        let positions = self.push_accessor(json::Accessor {
+            buffer_view: Some(view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(vertices.len() as u64),
+            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::F32,
+            )),
+            normalized: false,
+            min: Some(json::Value::Array(
+                bounds.min.iter().copied().map(json::Value::from).collect(),
+            )),
+            max: Some(json::Value::Array(
+                bounds.max.iter().copied().map(json::Value::from).collect(),
+            )),
+            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: None,
+            sparse: None,
+        });
+        let normals = self.push_accessor(json::Accessor {
+            buffer_view: Some(view),
+            byte_offset: Some(json::validation::USize64(NORMAL_OFFSET as u64)),
+            count: json::validation::USize64(vertices.len() as u64),
+            component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::F32,
+            )),
+            normalized: false,
+            type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
+            extensions: Default::default(),
+            extras: Default::default(),
+            min: None,
+            max: None,
+            name: None,
+            sparse: None,
+        });
+
+        VertexAccessors { positions, normals }
+    }
+
+    fn push_indices(&mut self, index_buffer: &IndexBuffer) -> json::Index<json::Accessor> {
+        let mut index_bytes = Vec::with_capacity(index_buffer.byte_length());
+        index_buffer.write_bytes(&mut index_bytes);
+        let view =
+            self.push_buffer_view(index_bytes, None, json::buffer::Target::ElementArrayBuffer);
+        self.push_accessor(json::Accessor {
+            buffer_view: Some(view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(index_buffer.count() as u64),
+            component_type: index_buffer.component_type(),
+            normalized: false,
+            min: Some(json::Value::from(vec![0])),
+            max: Some(json::Value::from(vec![index_buffer.max_value()])),
+            type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: None,
+            sparse: None,
+        })
+    }
+
+    fn push_buffer_view(
+        &mut self,
+        data: Vec<u8>,
+        byte_stride: Option<usize>,
+        target: json::buffer::Target,
+    ) -> json::Index<json::buffer::View> {
+        let byte_offset = self.bytes.len();
+        let byte_length = data.len();
+        self.bytes.extend_from_slice(&data);
+
+        let index = self.buffer_views.len();
+        self.buffer_views.push(json::buffer::View {
+            buffer: json::Index::new(0),
+            byte_length: json::validation::USize64(byte_length as u64),
+            byte_offset: Some(json::validation::USize64(byte_offset as u64)),
+            byte_stride: byte_stride.map(json::buffer::Stride),
+            target: Some(json::validation::Checked::Valid(target)),
+            extensions: Default::default(),
+            extras: Default::default(),
+            name: None,
+        });
+
+        json::Index::new(index as u32)
+    }
+
+    fn push_accessor(&mut self, accessor: json::Accessor) -> json::Index<json::Accessor> {
+        let index = self.accessors.len();
+        self.accessors.push(accessor);
+        json::Index::new(index as u32)
+    }
+}
+
+impl EncodedGlb {
+    fn write<P: AsRef<Path>>(self, output_path: P) -> Result<()> {
+        let mut json_bytes = json::serialize::to_string(&self.root)?.into_bytes();
         let json_padding = (4 - (json_bytes.len() % 4)) % 4;
         json_bytes.extend(std::iter::repeat_n(b' ', json_padding));
 
+        let mut bin_buffer = self.bin_buffer;
         let bin_padding = (4 - (bin_buffer.len() % 4)) % 4;
         bin_buffer.extend(std::iter::repeat_n(0u8, bin_padding));
 
@@ -729,18 +837,6 @@ impl MeshBuilder {
 
         let mut file = File::create(output_path.as_ref())?;
         file.write_all(&glb_bytes)?;
-
-        info!("GLB Summary: {}", output_path.as_ref().display());
-        info!("  Vertices: {}", self.vertices.len());
-        info!("  Indices: {}", index_buffer.count());
-        info!(
-            "  Local coordinate range: X [{:.2}, {:.2}], Y [{:.2}, {:.2}], Z [{:.2}, {:.2}]",
-            bounds.min[0], bounds.max[0], bounds.min[1], bounds.max[1], bounds.min[2], bounds.max[2]
-        );
-        info!(
-            "  World-space center: [{:.2}, {:.2}, {:.2}]",
-            self.center[0], self.center[1], self.center[2]
-        );
 
         Ok(())
     }
