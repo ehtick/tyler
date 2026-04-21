@@ -347,7 +347,7 @@ impl MeshCollector {
             return Ok(());
         }
 
-        let drop_axis = Self::find_projection_axis(&local_positions);
+        let drop_axis = Self::find_projection_axis(&local_positions[..exterior.len()]);
         for pos in &local_positions {
             match drop_axis {
                 0 => {
@@ -387,6 +387,10 @@ impl MeshCollector {
     }
 
     fn find_projection_axis(positions: &[[f32; 3]]) -> usize {
+        if let Some(normal) = Self::compute_polygon_normal(positions) {
+            return Self::dominant_axis(normal);
+        }
+
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         for pos in positions {
@@ -400,6 +404,42 @@ impl MeshCollector {
             .min_by(|&lhs, &rhs| {
                 (max[lhs] - min[lhs])
                     .partial_cmp(&(max[rhs] - min[rhs]))
+                    .unwrap()
+            })
+            .unwrap_or(2)
+    }
+
+    fn compute_polygon_normal(positions: &[[f32; 3]]) -> Option<[f32; 3]> {
+        if positions.len() < 3 {
+            return None;
+        }
+
+        let mut normal = [0.0_f32; 3];
+        for (current, next) in positions
+            .iter()
+            .zip(positions.iter().cycle().skip(1))
+            .take(positions.len())
+        {
+            normal[0] += (current[1] - next[1]) * (current[2] + next[2]);
+            normal[1] += (current[2] - next[2]) * (current[0] + next[0]);
+            normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
+        }
+
+        let length =
+            (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        if length > f32::EPSILON {
+            Some([normal[0] / length, normal[1] / length, normal[2] / length])
+        } else {
+            None
+        }
+    }
+
+    fn dominant_axis(normal: [f32; 3]) -> usize {
+        (0..3)
+            .max_by(|&lhs, &rhs| {
+                normal[lhs]
+                    .abs()
+                    .partial_cmp(&normal[rhs].abs())
                     .unwrap()
             })
             .unwrap_or(2)
