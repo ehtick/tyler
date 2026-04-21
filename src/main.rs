@@ -63,7 +63,7 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -102,6 +102,118 @@ struct PreparedInput {
     source: parser::InputSource,
     metadata_path: PathBuf,
     feature_base_document: Option<Vec<u8>>,
+}
+
+fn build_glb_export_options(
+    cli: &crate::cli::Cli,
+    source_crs: Option<String>,
+    ecef_origin: Option<[f64; 3]>,
+) -> cityjson_convert::ExportOptions {
+    let mut feature_type_colors = BTreeMap::new();
+    let mut feature_type_lods = BTreeMap::new();
+
+    for (feature_type, color) in [
+        ("Building", cli.color_building.as_ref()),
+        ("BuildingPart", cli.color_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.color_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.color_tin_relief.as_ref()),
+        ("Road", cli.color_road.as_ref()),
+        ("Railway", cli.color_railway.as_ref()),
+        ("TransportSquare", cli.color_transport_square.as_ref()),
+        ("WaterBody", cli.color_water_body.as_ref()),
+        ("PlantCover", cli.color_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.color_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.color_land_use.as_ref()),
+        ("CityFurniture", cli.color_city_furniture.as_ref()),
+        ("Bridge", cli.color_bridge.as_ref()),
+        ("BridgePart", cli.color_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.color_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.color_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.color_tunnel.as_ref()),
+        ("TunnelPart", cli.color_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.color_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.color_generic_city_object.as_ref()),
+    ] {
+        if let Some(color) = color {
+            feature_type_colors.insert(feature_type.to_string(), color.clone());
+        }
+    }
+
+    for (feature_type, lod) in [
+        ("Building", cli.lod_building.as_ref()),
+        ("BuildingPart", cli.lod_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.lod_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.lod_tin_relief.as_ref()),
+        ("Road", cli.lod_road.as_ref()),
+        ("Railway", cli.lod_railway.as_ref()),
+        ("TransportSquare", cli.lod_transport_square.as_ref()),
+        ("WaterBody", cli.lod_water_body.as_ref()),
+        ("PlantCover", cli.lod_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.lod_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.lod_land_use.as_ref()),
+        ("CityFurniture", cli.lod_city_furniture.as_ref()),
+        ("Bridge", cli.lod_bridge.as_ref()),
+        ("BridgePart", cli.lod_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.lod_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.lod_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.lod_tunnel.as_ref()),
+        ("TunnelPart", cli.lod_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.lod_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.lod_generic_city_object.as_ref()),
+    ] {
+        if let Some(lod) = lod {
+            feature_type_lods.insert(feature_type.to_string(), lod.clone());
+        }
+    }
+
+    cityjson_convert::ExportOptions {
+        native_glb_color: "#FFC0CB".to_string(),
+        metadata_class_name: cli
+            .cesium3dtiles_metadata_class
+            .clone()
+            .unwrap_or_else(|| "cityobject".to_string()),
+        feature_type_colors,
+        feature_type_lods,
+        source_crs,
+        ecef_origin,
+        reproject_to_ecef: true,
+        quantize_geometry: true,
+        meshopt_compression: true,
+    }
+}
+
+fn compute_root_ecef_origin(
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<[f64; 3], Box<dyn std::error::Error>> {
+    let crs_from = format!("EPSG:{}", world.crs.to_epsg()?);
+    let transformer = crate::proj::Proj::new_known_crs(&crs_from, "EPSG:4978", None)?;
+    let root_bbox = quadtree.bbox(&world.grid);
+    let root_center_original = (
+        (root_bbox[0] + root_bbox[3]) * 0.5,
+        (root_bbox[1] + root_bbox[4]) * 0.5,
+        (root_bbox[2] + root_bbox[5]) * 0.5,
+    );
+    let root_center_ecef = transformer.convert(root_center_original)?;
+    Ok([root_center_ecef.0, root_center_ecef.1, root_center_ecef.2])
 }
 
 fn prepare_input(
@@ -511,6 +623,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Created output directory {:#?}", &path_features_input_dir);
         }
 
+        let source_crs = Some(format!("EPSG:{}", world.crs.to_epsg()?));
+        let ecef_origin = Some(compute_root_ecef_origin(&world, &quadtree)?);
+        let export_options = build_glb_export_options(&cli, source_crs, ecef_origin);
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
             let tileid_grid = &tile.id;
@@ -560,11 +675,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(tile);
                 }
             };
-            if let Err(error) = cityjson_convert::convert_to_glb(
-                &model,
-                &output_file,
-                &cityjson_convert::ExportOptions::default(),
-            ) {
+            if let Err(error) =
+                cityjson_convert::convert_to_glb(&model, &output_file, &export_options)
+            {
                 warn!("Tile {} conversion failed: {}", tileid_grid, error);
                 return Some(tile);
             }
@@ -798,8 +911,11 @@ mod tests {
             None,
         )
         .expect("build cjindex ndjson world");
-        assert_eq!(world.grid.bbox[2], indexed_bounds.min_z);
-        assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(world.grid.bbox[2], indexed_bounds.min_z);
+            assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
+        }
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
         let ndjson = String::from_utf8(

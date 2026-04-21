@@ -11,7 +11,9 @@
 )]
 
 pub mod gltf_writer;
+mod proj;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -19,8 +21,15 @@ use anyhow::Result;
 use cityjson_lib::CityModel;
 use log::info;
 
+#[derive(Clone, Debug)]
 pub struct ExportOptions {
     pub native_glb_color: String,
+    pub metadata_class_name: String,
+    pub feature_type_colors: BTreeMap<String, String>,
+    pub feature_type_lods: BTreeMap<String, String>,
+    pub source_crs: Option<String>,
+    pub ecef_origin: Option<[f64; 3]>,
+    pub reproject_to_ecef: bool,
     pub quantize_geometry: bool,
     pub meshopt_compression: bool,
 }
@@ -29,6 +38,12 @@ impl Default for ExportOptions {
     fn default() -> Self {
         Self {
             native_glb_color: "#FFC0CB".to_string(),
+            metadata_class_name: "cityobject".to_string(),
+            feature_type_colors: BTreeMap::new(),
+            feature_type_lods: BTreeMap::new(),
+            source_crs: None,
+            ecef_origin: None,
+            reproject_to_ecef: true,
             quantize_geometry: true,
             meshopt_compression: true,
         }
@@ -51,11 +66,5 @@ pub fn convert_to_glb<P: AsRef<Path>>(
         fs::create_dir_all(parent)?;
     }
     info!("Writing GLB output to {}", output.display());
-    gltf_writer::write_city_model_glb(
-        model,
-        output,
-        &options.native_glb_color,
-        options.quantize_geometry,
-        options.meshopt_compression,
-    )
+    gltf_writer::write_city_model_glb(model, output, options)
 }

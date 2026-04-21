@@ -1,16 +1,19 @@
 #![allow(clippy::too_many_lines)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use cityjson_lib::cityjson::v2_0::{GeometryType, VertexIndex};
+use crate::proj::Proj;
+use crate::ExportOptions;
+use anyhow::{bail, Context, Result};
+use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
-use log::info;
+use log::{info, warn};
 use meshopt::{
     encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
     optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
@@ -22,6 +25,8 @@ const GLTF_VERSION: &str = "2.0";
 const OVERDRAW_THRESHOLD: f32 = 1.05;
 const QUANTIZATION_EXTENSION: &str = "KHR_mesh_quantization";
 const MESHOPT_EXTENSION: &str = "EXT_meshopt_compression";
+const MESH_FEATURES_EXTENSION: &str = "EXT_mesh_features";
+const STRUCTURAL_METADATA_EXTENSION: &str = "EXT_structural_metadata";
 const QUANTIZED_POSITION_STRIDE: usize = std::mem::size_of::<QuantizedPosition>();
 const QUANTIZED_NORMAL_STRIDE: usize = std::mem::size_of::<QuantizedNormal>();
 
@@ -54,7 +59,7 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
     Ok(json::Material {
         name: None,
         extensions: None,
-        extras: json::extras::Void::default(),
+        extras: Option::default(),
         pbr_metallic_roughness: json::material::PbrMetallicRoughness {
             base_color_factor: json::material::PbrBaseColorFactor(base_color_rgba),
             metallic_factor: json::material::StrengthFactor(metallic_factor),
@@ -62,7 +67,7 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
             base_color_texture: None,
             metallic_roughness_texture: None,
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
         },
         normal_texture: None,
         occlusion_texture: None,
@@ -83,11 +88,11 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
 pub fn write_city_model_glb<P: AsRef<Path>>(
     model: &CityModel,
     output_path: P,
-    default_color: &str,
-    quantize_geometry: bool,
-    meshopt_compression: bool,
+    options: &ExportOptions,
 ) -> Result<()> {
-    let mut collector = MeshCollector::new();
+    let coordinate_transform = CoordinateTransform::from_model(model, options)?;
+    let mut collector =
+        MeshCollector::with_lod_filter(options.feature_type_lods.clone(), coordinate_transform);
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -95,12 +100,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
         processed.vertex_count(),
         processed.index_count()
     );
-    processed.write_glb(
-        output_path,
-        default_color,
-        quantize_geometry,
-        meshopt_compression,
-    )
+    processed.write_glb(output_path, options)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -108,6 +108,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
 struct Vertex {
     position: [f32; 3],
     normal: [f32; 3],
+    feature_id: u32,
 }
 
 impl DecodePosition for Vertex {
@@ -209,27 +210,153 @@ impl IndexBuffer {
     }
 }
 
+enum FeatureIdBuffer {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl FeatureIdBuffer {
+    fn from_feature_ids(feature_ids: &[u32]) -> Result<Self> {
+        let max_value = feature_ids.iter().copied().max().unwrap_or(0);
+        if u8::try_from(max_value).is_ok() {
+            Ok(Self::U8(
+                feature_ids
+                    .iter()
+                    .copied()
+                    .map(|feature_id| {
+                        u8::try_from(feature_id)
+                            .expect("feature ID should fit in u8 after max check")
+                    })
+                    .collect(),
+            ))
+        } else if u16::try_from(max_value).is_ok() {
+            Ok(Self::U16(
+                feature_ids
+                    .iter()
+                    .copied()
+                    .map(|feature_id| {
+                        u16::try_from(feature_id)
+                            .expect("feature ID should fit in u16 after max check")
+                    })
+                    .collect(),
+            ))
+        } else {
+            bail!(
+                "feature ID attribute stream exceeds glTF limits: max feature ID {max_value} does not fit in u16"
+            );
+        }
+    }
+
+    fn byte_stride(&self) -> usize {
+        match self {
+            Self::U8(_) => std::mem::size_of::<u8>(),
+            Self::U16(_) => std::mem::size_of::<u16>(),
+        }
+    }
+
+    fn component_type(&self) -> json::validation::Checked<json::accessor::GenericComponentType> {
+        match self {
+            Self::U8(_) => json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::U8,
+            )),
+            Self::U16(_) => json::validation::Checked::Valid(json::accessor::GenericComponentType(
+                json::accessor::ComponentType::U16,
+            )),
+        }
+    }
+
+    fn max_value(&self) -> u32 {
+        match self {
+            Self::U8(feature_ids) => feature_ids.iter().copied().max().map_or(0, u32::from),
+            Self::U16(feature_ids) => feature_ids.iter().copied().max().map_or(0, u32::from),
+        }
+    }
+
+    fn count(&self) -> usize {
+        match self {
+            Self::U8(feature_ids) => feature_ids.len(),
+            Self::U16(feature_ids) => feature_ids.len(),
+        }
+    }
+
+    fn meshopt_byte_stride() -> usize {
+        4
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MetadataValue {
+    Bool(bool),
+    Int(i32),
+    Float(f32),
+    String(String),
+}
+
+#[derive(Clone, Debug)]
+struct FeatureRecord {
+    object_id: String,
+    feature_type: String,
+    attributes: BTreeMap<String, MetadataValue>,
+}
+
 #[derive(Default)]
-struct RawMesh {
+struct RawPrimitiveMesh {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
 }
 
-struct ProcessedMesh {
+struct ProcessedPrimitiveMesh {
+    feature_type: String,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
+}
+
+struct ProcessedScene {
+    primitives: Vec<ProcessedPrimitiveMesh>,
+    features: Vec<FeatureRecord>,
     center: [f32; 3],
+    node_translation_base: [f32; 3],
     bounds: Option<Bounds>,
 }
 
 struct MeshCollector {
-    mesh: RawMesh,
+    features: Vec<FeatureRecord>,
+    primitives: BTreeMap<String, RawPrimitiveMesh>,
+    feature_type_lods: BTreeMap<String, String>,
+    coordinate_transform: CoordinateTransform,
+}
+
+struct CoordinateTransform {
+    vertex_transformer: Option<Proj>,
+    storage_origin: [f64; 3],
+    node_translation_base: [f32; 3],
 }
 
 #[derive(Clone, Copy, Debug)]
 struct VertexAccessors {
     positions: json::Index<json::Accessor>,
     normals: json::Index<json::Accessor>,
+    feature_ids: Option<json::Index<json::Accessor>>,
+}
+
+#[derive(Clone, Debug)]
+struct PrimitiveEncoding {
+    feature_type: String,
+    primitive: json::mesh::Primitive,
+    feature_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct StructuralMetadataColumn {
+    property: JsonValue,
+    property_table_entry: JsonValue,
+}
+
+#[derive(Clone, Debug)]
+struct StructuralMetadataExtension {
+    class_name: String,
+    columns: BTreeMap<String, StructuralMetadataColumn>,
+    feature_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -256,6 +383,8 @@ struct EncodedGlb {
     root: json::Root,
     bin_buffer: Vec<u8>,
     meshopt_views: Vec<Option<MeshoptBufferView>>,
+    primitive_feature_counts: Vec<usize>,
+    structural_metadata: Option<StructuralMetadataExtension>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -268,6 +397,20 @@ struct QuantizedPosition {
 #[repr(C)]
 struct QuantizedNormal {
     normal: [i8; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct PaddedFeatureIdU8 {
+    feature_id: u8,
+    _padding: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct PaddedFeatureIdU16 {
+    feature_id: u16,
+    _padding: u16,
 }
 
 fn quantize_position_component(value: f32, scale: f32) -> i16 {
@@ -291,36 +434,230 @@ struct FloatNormal {
     normal: [f32; 3],
 }
 
-struct QuantizedMesh {
+struct QuantizedPrimitiveMesh {
+    feature_type: String,
     positions: Vec<QuantizedPosition>,
     normals: Vec<QuantizedNormal>,
+    feature_ids: Vec<u32>,
     indices: IndexBuffer,
     normalized_bounds: Bounds,
+}
+
+struct QuantizedScene {
+    primitives: Vec<QuantizedPrimitiveMesh>,
     position_scale: f32,
     center: [f32; 3],
+    features: Vec<FeatureRecord>,
+}
+
+impl CoordinateTransform {
+    fn from_model(model: &CityModel, options: &ExportOptions) -> Result<Self> {
+        if !options.reproject_to_ecef {
+            return Ok(Self {
+                vertex_transformer: None,
+                storage_origin: [0.0; 3],
+                node_translation_base: [0.0; 3],
+            });
+        }
+
+        let Some(source_crs) = options
+            .source_crs
+            .clone()
+            .or_else(|| source_crs_from_model(model))
+        else {
+            warn!("CityJSON source CRS is missing, skipping ECEF reprojection");
+            return Ok(Self {
+                vertex_transformer: None,
+                storage_origin: [0.0; 3],
+                node_translation_base: [0.0; 3],
+            });
+        };
+
+        let source_crs = canonical_epsg_crs(&source_crs)?;
+        let vertex_transformer = (source_crs != "EPSG:4978")
+            .then(|| Proj::new_known_crs(&source_crs, "EPSG:4978", None))
+            .transpose()
+            .context("failed to create source CRS to ECEF transform")?;
+
+        let storage_origin = if let Some(origin) = options.ecef_origin {
+            origin
+        } else {
+            compute_storage_origin(model, vertex_transformer.as_ref())?
+        };
+        let tileset_origin = options.ecef_origin.unwrap_or([0.0; 3]);
+        let node_translation_base = [
+            f64_to_f32_checked(
+                storage_origin[0] - tileset_origin[0],
+                "ecef translation x",
+                None,
+            )?,
+            f64_to_f32_checked(
+                storage_origin[1] - tileset_origin[1],
+                "ecef translation y",
+                None,
+            )?,
+            f64_to_f32_checked(
+                storage_origin[2] - tileset_origin[2],
+                "ecef translation z",
+                None,
+            )?,
+        ];
+
+        Ok(Self {
+            vertex_transformer,
+            storage_origin,
+            node_translation_base,
+        })
+    }
+
+    fn transform_vertex(&self, vertex_id: u32, model: &CityModel) -> Result<[f32; 3]> {
+        let vertex = model
+            .get_vertex(VertexIndex::new(vertex_id))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_id}"))?;
+        let [x, y, z] = vertex.to_array();
+        let position = if let Some(transformer) = &self.vertex_transformer {
+            let transformed = transformer
+                .convert((x, y, z))
+                .with_context(|| format!("failed to project vertex {vertex_id} to ECEF"))?;
+            [transformed.0, transformed.1, transformed.2]
+        } else {
+            [x, y, z]
+        };
+
+        Ok([
+            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", Some(vertex_id))?,
+            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", Some(vertex_id))?,
+            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", Some(vertex_id))?,
+        ])
+    }
+}
+
+fn source_crs_from_model(model: &CityModel) -> Option<String> {
+    model.metadata().and_then(|metadata| {
+        metadata
+            .reference_system()
+            .map(std::string::ToString::to_string)
+    })
+}
+
+fn canonical_epsg_crs(value: &str) -> Result<String> {
+    if let Some(code) = value.strip_prefix("EPSG:") {
+        let parsed = code.parse::<u32>().context("invalid EPSG code")?;
+        return Ok(format!("EPSG:{parsed}"));
+    }
+
+    let code = value
+        .rsplit(['/', ':'])
+        .find(|part| !part.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not extract EPSG code from {value}"))?;
+    let parsed = code
+        .parse::<u32>()
+        .with_context(|| format!("invalid EPSG code in {value}"))?;
+    Ok(format!("EPSG:{parsed}"))
+}
+
+fn compute_storage_origin(
+    model: &CityModel,
+    vertex_transformer: Option<&Proj>,
+) -> Result<[f64; 3]> {
+    let mut bounds_min = [f64::INFINITY; 3];
+    let mut bounds_max = [f64::NEG_INFINITY; 3];
+    let mut has_vertices = false;
+
+    for vertex_index in 0..model.vertices().len() {
+        let vertex = model
+            .get_vertex(VertexIndex::new(
+                u32::try_from(vertex_index).expect("vertex count within u32 range"),
+            ))
+            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_index}"))?;
+        let [x, y, z] = vertex.to_array();
+        let position = if let Some(transformer) = vertex_transformer {
+            let transformed = transformer
+                .convert((x, y, z))
+                .with_context(|| format!("failed to project vertex {vertex_index} to ECEF"))?;
+            [transformed.0, transformed.1, transformed.2]
+        } else {
+            [x, y, z]
+        };
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(position[axis]);
+            bounds_max[axis] = bounds_max[axis].max(position[axis]);
+        }
+        has_vertices = true;
+    }
+
+    if !has_vertices {
+        return Ok([0.0; 3]);
+    }
+
+    Ok([
+        f64::midpoint(bounds_min[0], bounds_max[0]),
+        f64::midpoint(bounds_min[1], bounds_max[1]),
+        f64::midpoint(bounds_min[2], bounds_max[2]),
+    ])
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn f64_to_f32_checked(value: f64, axis: &str, vertex_id: Option<u32>) -> Result<f32> {
+    if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+        if let Some(vertex_id) = vertex_id {
+            bail!("vertex {vertex_id} {axis} coordinate is outside the f32 range");
+        }
+        bail!("{axis} coordinate is outside the f32 range");
+    }
+    {
+        Ok(value as f32)
+    }
 }
 
 impl MeshCollector {
-    fn new() -> Self {
+    fn with_lod_filter(
+        feature_type_lods: BTreeMap<String, String>,
+        coordinate_transform: CoordinateTransform,
+    ) -> Self {
         Self {
-            mesh: RawMesh::default(),
+            features: Vec::new(),
+            primitives: BTreeMap::new(),
+            feature_type_lods,
+            coordinate_transform,
         }
     }
 
     fn add_model(&mut self, model: &CityModel) -> Result<()> {
-        for (_id, cityobject) in model.cityobjects().iter() {
+        for (object_id, cityobject) in model.cityobjects().iter() {
             let Some(geometry_handles) = cityobject.geometry() else {
                 continue;
             };
+            let feature_type = cityobject.type_cityobject().to_string();
+            let mut feature_index = None;
             for geometry_handle in geometry_handles {
                 let geometry = model.resolve_geometry(*geometry_handle)?;
+                if let Some(selected_lod) = self.feature_type_lods.get(&feature_type) {
+                    if geometry
+                        .geometry()
+                        .lod()
+                        .is_none_or(|lod| lod.to_string() != *selected_lod)
+                    {
+                        continue;
+                    }
+                }
+                let feature_index = *feature_index.get_or_insert_with(|| {
+                    let feature_index =
+                        u32::try_from(self.features.len()).expect("feature count within u32 range");
+                    self.features.push(FeatureRecord {
+                        object_id: object_id.to_string(),
+                        feature_type: feature_type.clone(),
+                        attributes: Self::collect_feature_attributes(model, cityobject),
+                    });
+                    feature_index
+                });
                 match geometry.geometry().type_geometry() {
                     GeometryType::MultiSurface | GeometryType::CompositeSurface => {
                         let Some(boundary) = geometry.geometry().boundaries() else {
                             continue;
                         };
                         for surface in boundary.to_nested_multi_or_composite_surface()? {
-                            self.add_surface(&surface, model)?;
+                            self.add_surface(&feature_type, feature_index, &surface, model)?;
                         }
                     }
                     GeometryType::Solid => {
@@ -329,7 +666,7 @@ impl MeshCollector {
                         };
                         for shell in boundary.to_nested_solid()? {
                             for surface in shell {
-                                self.add_surface(&surface, model)?;
+                                self.add_surface(&feature_type, feature_index, &surface, model)?;
                             }
                         }
                     }
@@ -340,7 +677,12 @@ impl MeshCollector {
                         for solid in boundary.to_nested_multi_or_composite_solid()? {
                             for shell in solid {
                                 for surface in shell {
-                                    self.add_surface(&surface, model)?;
+                                    self.add_surface(
+                                        &feature_type,
+                                        feature_index,
+                                        &surface,
+                                        model,
+                                    )?;
                                 }
                             }
                         }
@@ -353,11 +695,17 @@ impl MeshCollector {
         Ok(())
     }
 
-    fn finish(self) -> Result<ProcessedMesh> {
-        self.mesh.into_processed()
+    fn finish(self) -> Result<ProcessedScene> {
+        ProcessedScene::from_collector(self)
     }
 
-    fn add_surface(&mut self, surface: &[Vec<u32>], model: &CityModel) -> Result<()> {
+    fn add_surface(
+        &mut self,
+        feature_type: &str,
+        feature_id: u32,
+        surface: &[Vec<u32>],
+        model: &CityModel,
+    ) -> Result<()> {
         if surface.is_empty() {
             return Ok(());
         }
@@ -380,7 +728,9 @@ impl MeshCollector {
             }
 
             for &vertex_id in ring {
-                let position = Self::compute_position(vertex_id, model)?;
+                let position = self
+                    .coordinate_transform
+                    .transform_vertex(vertex_id, model)?;
                 local_positions.push(position);
                 vertex_count += 1;
             }
@@ -414,20 +764,79 @@ impl MeshCollector {
             return Ok(());
         }
 
-        self.mesh
-            .emit_triangles(&local_positions, &triangulated, Self::compute_face_normal)
+        self.primitives
+            .entry(feature_type.to_string())
+            .or_default()
+            .emit_triangles(
+                feature_id,
+                &local_positions,
+                &triangulated,
+                Self::compute_face_normal,
+            )
     }
 
-    fn compute_position(idx: u32, model: &CityModel) -> Result<[f32; 3], anyhow::Error> {
-        let vertex = model
-            .get_vertex(VertexIndex::new(idx))
-            .ok_or_else(|| anyhow::anyhow!("missing vertex {idx}"))?;
-        let [x, y, z] = vertex.to_array();
-        Ok([
-            Self::f64_to_f32(x, "x", idx)?,
-            Self::f64_to_f32(y, "y", idx)?,
-            Self::f64_to_f32(z, "z", idx)?,
-        ])
+    fn collect_feature_attributes(
+        model: &CityModel,
+        cityobject: &CityObject<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+    ) -> BTreeMap<String, MetadataValue> {
+        let mut attributes = Self::extract_attributes(cityobject);
+        if !attributes.is_empty() {
+            return attributes;
+        }
+
+        let Some(parent_handle) = cityobject
+            .parents()
+            .and_then(|parents| parents.first())
+            .copied()
+        else {
+            return attributes;
+        };
+        let Some(parent) = model.cityobjects().get(parent_handle) else {
+            return attributes;
+        };
+        attributes = Self::extract_attributes(parent);
+        attributes
+    }
+
+    fn extract_attributes(
+        cityobject: &CityObject<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+    ) -> BTreeMap<String, MetadataValue> {
+        let mut attributes = BTreeMap::new();
+        let Some(cityjson_attributes) = cityobject.attributes() else {
+            return attributes;
+        };
+
+        for (name, value) in cityjson_attributes.iter() {
+            let Some(value) = Self::convert_attribute_value(value) else {
+                continue;
+            };
+            attributes.insert(name.clone(), value);
+        }
+
+        attributes
+    }
+
+    fn convert_attribute_value(
+        value: &AttributeValue<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+    ) -> Option<MetadataValue> {
+        match value {
+            AttributeValue::Bool(value) => Some(MetadataValue::Bool(*value)),
+            AttributeValue::Unsigned(value) => i32::try_from(*value).ok().map(MetadataValue::Int),
+            AttributeValue::Integer(value) => i32::try_from(*value).ok().map(MetadataValue::Int),
+            AttributeValue::Float(value) => {
+                if value.is_finite()
+                    && *value >= f64::from(f32::MIN)
+                    && *value <= f64::from(f32::MAX)
+                {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Some(MetadataValue::Float(*value as f32))
+                } else {
+                    None
+                }
+            }
+            AttributeValue::String(value) => Some(MetadataValue::String(value.clone())),
+            _ => None,
+        }
     }
 
     fn find_projection_axis(positions: &[[f32; 3]]) -> usize {
@@ -498,19 +907,12 @@ impl MeshCollector {
             [0.0, 0.0, 1.0]
         }
     }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn f64_to_f32(value: f64, axis: &str, vertex_id: u32) -> Result<f32> {
-        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
-            anyhow::bail!("vertex {vertex_id} {axis} coordinate is outside the f32 range");
-        }
-        Ok(value as f32)
-    }
 }
 
-impl RawMesh {
+impl RawPrimitiveMesh {
     fn emit_triangles<F>(
         &mut self,
+        feature_id: u32,
         positions: &[[f32; 3]],
         triangulated: &[usize],
         compute_face_normal: F,
@@ -529,50 +931,23 @@ impl RawMesh {
             self.vertices.push(Vertex {
                 position: p0,
                 normal,
+                feature_id,
             });
             self.vertices.push(Vertex {
                 position: p1,
                 normal,
+                feature_id,
             });
             self.vertices.push(Vertex {
                 position: p2,
                 normal,
+                feature_id,
             });
             self.indices
                 .extend_from_slice(&[base_index, base_index + 1, base_index + 2]);
         }
 
         Ok(())
-    }
-
-    fn into_processed(mut self) -> Result<ProcessedMesh> {
-        if self.vertices.is_empty() {
-            return Ok(ProcessedMesh {
-                vertices: self.vertices,
-                indices: self.indices,
-                center: [0.0; 3],
-                bounds: None,
-            });
-        }
-
-        let initial_bounds = Bounds::from_vertices(&self.vertices)
-            .ok_or_else(|| anyhow::anyhow!("raw mesh bounds missing for non-empty mesh"))?;
-        let center = initial_bounds.center();
-        for vertex in &mut self.vertices {
-            vertex.position[0] -= center[0];
-            vertex.position[1] -= center[1];
-            vertex.position[2] -= center[2];
-        }
-
-        self.optimize()?;
-        let bounds = Bounds::from_vertices(&self.vertices);
-
-        Ok(ProcessedMesh {
-            vertices: self.vertices,
-            indices: self.indices,
-            center,
-            bounds,
-        })
     }
 
     fn optimize(&mut self) -> Result<()> {
@@ -604,38 +979,83 @@ impl RawMesh {
     }
 }
 
-impl ProcessedMesh {
+impl ProcessedScene {
+    fn from_collector(collector: MeshCollector) -> Result<Self> {
+        let MeshCollector {
+            features,
+            mut primitives,
+            coordinate_transform,
+            ..
+        } = collector;
+        let mut bounds = Bounds::empty();
+        let mut has_vertices = false;
+        for primitive in primitives.values() {
+            for vertex in &primitive.vertices {
+                bounds.add_point(vertex.position);
+                has_vertices = true;
+            }
+        }
+
+        let center = if has_vertices {
+            bounds.center()
+        } else {
+            [0.0; 3]
+        };
+        for primitive in primitives.values_mut() {
+            for vertex in &mut primitive.vertices {
+                vertex.position[0] -= center[0];
+                vertex.position[1] -= center[1];
+                vertex.position[2] -= center[2];
+            }
+            primitive.optimize()?;
+        }
+
+        let mut final_bounds = Bounds::empty();
+        let mut has_final_vertices = false;
+        let mut processed_primitives = Vec::with_capacity(primitives.len());
+        for (feature_type, primitive) in primitives {
+            for vertex in &primitive.vertices {
+                final_bounds.add_point(vertex.position);
+                has_final_vertices = true;
+            }
+            processed_primitives.push(ProcessedPrimitiveMesh {
+                feature_type,
+                vertices: primitive.vertices,
+                indices: primitive.indices,
+            });
+        }
+
+        let processed_features = reorder_features_by_type(features, &mut processed_primitives)?;
+
+        Ok(Self {
+            primitives: processed_primitives,
+            features: processed_features,
+            center,
+            node_translation_base: coordinate_transform.node_translation_base,
+            bounds: has_final_vertices.then_some(final_bounds),
+        })
+    }
+
     fn vertex_count(&self) -> usize {
-        self.vertices.len()
+        self.primitives
+            .iter()
+            .map(|primitive| primitive.vertices.len())
+            .sum()
     }
 
     fn index_count(&self) -> usize {
-        self.indices.len()
+        self.primitives
+            .iter()
+            .map(|primitive| primitive.indices.len())
+            .sum()
     }
 
-    fn select_index_buffer(&self) -> Result<IndexBuffer> {
-        if self.vertices.len() <= (u16::MAX as usize) + 1 {
-            let mut indices = Vec::with_capacity(self.indices.len());
-            for index in &self.indices {
-                indices.push(
-                    u16::try_from(*index)
-                        .context("GLB index exceeds u16 range after mesh optimization")?,
-                );
-            }
-            Ok(IndexBuffer::U16(indices))
-        } else {
-            Ok(IndexBuffer::U32(self.indices.clone()))
-        }
-    }
-
-    fn write_glb<P: AsRef<Path>>(
-        &self,
-        output_path: P,
-        default_color: &str,
-        quantize_geometry: bool,
-        meshopt_compression: bool,
-    ) -> Result<()> {
-        if self.vertices.is_empty() {
+    fn write_glb<P: AsRef<Path>>(&self, output_path: P, options: &ExportOptions) -> Result<()> {
+        if self
+            .primitives
+            .iter()
+            .all(|primitive| primitive.vertices.is_empty())
+        {
             info!(
                 "No geometry to write, creating empty GLB file at {}",
                 output_path.as_ref().display()
@@ -654,21 +1074,20 @@ impl ProcessedMesh {
 
         info!(
             "Writing GLB file with {} vertices and {} indices to {}",
-            self.vertices.len(),
-            self.indices.len(),
+            self.vertex_count(),
+            self.index_count(),
             output_path.as_ref().display()
         );
 
-        let encoded = self.encode_glb(default_color, quantize_geometry, meshopt_compression)?;
+        let encoded = self.encode_glb(options)?;
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
-        let index_buffer = self.select_index_buffer()?;
         encoded.write(output_path.as_ref())?;
 
         info!("GLB Summary: {}", output_path.as_ref().display());
-        info!("  Vertices: {}", self.vertices.len());
-        info!("  Indices: {}", index_buffer.count());
+        info!("  Vertices: {}", self.vertex_count());
+        info!("  Indices: {}", self.index_count());
         info!(
             "  Local coordinate range: X [{:.2}, {:.2}], Y [{:.2}, {:.2}], Z [{:.2}, {:.2}]",
             bounds.min[0],
@@ -679,33 +1098,77 @@ impl ProcessedMesh {
             bounds.max[2]
         );
         info!(
-            "  World-space center: [{:.2}, {:.2}, {:.2}]",
-            self.center[0], self.center[1], self.center[2]
+            "  Node translation: [{:.2}, {:.2}, {:.2}]",
+            self.node_translation_base[0] + self.center[0],
+            self.node_translation_base[1] + self.center[1],
+            self.node_translation_base[2] + self.center[2]
         );
 
         Ok(())
     }
 
-    fn encode_glb(
-        &self,
-        default_color: &str,
-        quantize_geometry: bool,
-        meshopt_compression: bool,
-    ) -> Result<EncodedGlb> {
-        if quantize_geometry {
-            self.quantize()?
-                .encode_glb(default_color, meshopt_compression)
+    fn encode_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
+        if options.quantize_geometry {
+            QuantizedScene::from_processed(self)?.encode_glb(options)
         } else {
-            self.encode_raw_glb(default_color, meshopt_compression)
+            self.encode_raw_glb(options)
         }
     }
 
-    fn quantize(&self) -> Result<QuantizedMesh> {
-        let bounds = self
+    fn encode_raw_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
+        let mut buffer_builder = BufferBuilder::default();
+        let primitive_encodings =
+            self.encode_primitives_raw(&mut buffer_builder, options.meshopt_compression)?;
+        let materials = build_materials(&primitive_encodings, options)?;
+        let structural_metadata = StructuralMetadataExtension::from_features(
+            &self.features,
+            &mut buffer_builder,
+            &options.metadata_class_name,
+            options.meshopt_compression,
+        )?;
+
+        Ok(build_encoded_glb(
+            buffer_builder,
+            primitive_encodings,
+            materials,
+            build_node_matrix(1.0, self.node_translation()),
+            false,
+            options.meshopt_compression,
+            structural_metadata,
+        ))
+    }
+
+    fn node_translation(&self) -> [f32; 3] {
+        [
+            self.node_translation_base[0] + self.center[0],
+            self.node_translation_base[1] + self.center[1],
+            self.node_translation_base[2] + self.center[2],
+        ]
+    }
+}
+
+impl ProcessedPrimitiveMesh {
+    fn select_index_buffer(&self) -> Result<IndexBuffer> {
+        if self.vertices.len() <= (u16::MAX as usize) + 1 {
+            let mut indices = Vec::with_capacity(self.indices.len());
+            for index in &self.indices {
+                indices.push(
+                    u16::try_from(*index)
+                        .context("GLB index exceeds u16 range after mesh optimization")?,
+                );
+            }
+            Ok(IndexBuffer::U16(indices))
+        } else {
+            Ok(IndexBuffer::U32(self.indices.clone()))
+        }
+    }
+}
+
+impl QuantizedScene {
+    fn from_processed(scene: &ProcessedScene) -> Result<Self> {
+        let bounds = scene
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
-        let index_buffer = self.select_index_buffer()?;
-
         let position_scale = [
             bounds.min[0].abs(),
             bounds.max[0].abs(),
@@ -718,6 +1181,48 @@ impl ProcessedMesh {
         .fold(0.0_f32, f32::max)
         .max(f32::EPSILON);
 
+        let primitives = scene
+            .primitives
+            .iter()
+            .map(|primitive| primitive.quantize(position_scale))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            primitives,
+            position_scale,
+            center: scene.node_translation(),
+            features: scene.features.clone(),
+        })
+    }
+
+    fn encode_glb(&self, options: &ExportOptions) -> Result<EncodedGlb> {
+        let mut buffer_builder = BufferBuilder::default();
+        let primitive_encodings =
+            self.encode_primitives(&mut buffer_builder, options.meshopt_compression)?;
+        let materials = build_materials(&primitive_encodings, options)?;
+        let structural_metadata = StructuralMetadataExtension::from_features(
+            &self.features,
+            &mut buffer_builder,
+            &options.metadata_class_name,
+            options.meshopt_compression,
+        )?;
+
+        Ok(build_encoded_glb(
+            buffer_builder,
+            primitive_encodings,
+            materials,
+            build_node_matrix(self.position_scale, self.center),
+            true,
+            options.meshopt_compression,
+            structural_metadata,
+        ))
+    }
+}
+
+impl ProcessedPrimitiveMesh {
+    fn quantize(&self, position_scale: f32) -> Result<QuantizedPrimitiveMesh> {
+        let bounds = Bounds::from_vertices(&self.vertices)
+            .ok_or_else(|| anyhow::anyhow!("primitive bounds missing for non-empty mesh"))?;
         let normalized_bounds = Bounds {
             min: [
                 (bounds.min[0] / position_scale).clamp(-1.0, 1.0),
@@ -731,129 +1236,64 @@ impl ProcessedMesh {
             ],
         };
 
-        let positions = self
-            .vertices
-            .iter()
-            .map(|vertex| QuantizedPosition {
-                position: [
-                    quantize_position_component(vertex.position[0], position_scale),
-                    quantize_position_component(vertex.position[1], position_scale),
-                    quantize_position_component(vertex.position[2], position_scale),
-                    0,
-                ],
-            })
-            .collect();
-
-        let normals = self
-            .vertices
-            .iter()
-            .map(|vertex| QuantizedNormal {
-                normal: [
-                    quantize_normal_component(vertex.normal[0]),
-                    quantize_normal_component(vertex.normal[1]),
-                    quantize_normal_component(vertex.normal[2]),
-                    0,
-                ],
-            })
-            .collect();
-
-        Ok(QuantizedMesh {
-            positions,
-            normals,
-            indices: index_buffer,
+        Ok(QuantizedPrimitiveMesh {
+            feature_type: self.feature_type.clone(),
+            positions: self
+                .vertices
+                .iter()
+                .map(|vertex| QuantizedPosition {
+                    position: [
+                        quantize_position_component(vertex.position[0], position_scale),
+                        quantize_position_component(vertex.position[1], position_scale),
+                        quantize_position_component(vertex.position[2], position_scale),
+                        0,
+                    ],
+                })
+                .collect(),
+            normals: self
+                .vertices
+                .iter()
+                .map(|vertex| QuantizedNormal {
+                    normal: [
+                        quantize_normal_component(vertex.normal[0]),
+                        quantize_normal_component(vertex.normal[1]),
+                        quantize_normal_component(vertex.normal[2]),
+                        0,
+                    ],
+                })
+                .collect(),
+            feature_ids: self
+                .vertices
+                .iter()
+                .map(|vertex| vertex.feature_id)
+                .collect(),
+            indices: self.select_index_buffer()?,
             normalized_bounds,
-            position_scale,
-            center: self.center,
         })
-    }
-
-    fn encode_raw_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
-        let bounds = self
-            .bounds
-            .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
-        let index_buffer = self.select_index_buffer()?;
-
-        let mut buffer_builder = BufferBuilder::default();
-        let vertex_accessors =
-            buffer_builder.push_float_vertices(&self.vertices, &bounds, meshopt_compression)?;
-        let index_accessor =
-            buffer_builder.push_indices(&index_buffer, self.vertices.len(), meshopt_compression)?;
-
-        build_encoded_glb(
-            buffer_builder,
-            default_color,
-            vertex_accessors,
-            index_accessor,
-            build_node_matrix(1.0, self.center),
-            false,
-            meshopt_compression,
-        )
-    }
-}
-
-impl QuantizedMesh {
-    fn encode_glb(&self, default_color: &str, meshopt_compression: bool) -> Result<EncodedGlb> {
-        let mut buffer_builder = BufferBuilder::default();
-        let vertex_accessors = buffer_builder.push_quantized_vertices(
-            &self.positions,
-            &self.normals,
-            &self.normalized_bounds,
-            meshopt_compression,
-        )?;
-        let index_accessor = buffer_builder.push_indices(
-            &self.indices,
-            self.positions.len(),
-            meshopt_compression,
-        )?;
-
-        build_encoded_glb(
-            buffer_builder,
-            default_color,
-            vertex_accessors,
-            index_accessor,
-            build_node_matrix(self.position_scale, self.center),
-            true,
-            meshopt_compression,
-        )
     }
 }
 
 fn build_encoded_glb(
     buffer_builder: BufferBuilder,
-    default_color: &str,
-    vertex_accessors: VertexAccessors,
-    index_accessor: json::Index<json::Accessor>,
+    primitive_encodings: Vec<PrimitiveEncoding>,
+    materials: Vec<json::Material>,
     node_matrix: [f32; 16],
     quantization_enabled: bool,
     meshopt_compression: bool,
-) -> Result<EncodedGlb> {
-    let mut attributes = std::collections::BTreeMap::new();
-    attributes.insert(
-        json::validation::Checked::Valid(json::mesh::Semantic::Positions),
-        vertex_accessors.positions,
-    );
-    attributes.insert(
-        json::validation::Checked::Valid(json::mesh::Semantic::Normals),
-        vertex_accessors.normals,
-    );
-
-    let material = create_default_material(default_color)?;
-
-    let primitive = json::mesh::Primitive {
-        attributes,
-        indices: Some(index_accessor),
-        material: Some(json::Index::new(0)),
-        mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
-        targets: None,
-        extensions: None,
-        extras: json::extras::Void::default(),
-    };
-
+    structural_metadata: Option<StructuralMetadataExtension>,
+) -> EncodedGlb {
+    let primitive_feature_counts = primitive_encodings
+        .iter()
+        .map(|encoding| encoding.feature_count)
+        .collect::<Vec<_>>();
     let mesh = json::Mesh {
-        primitives: vec![primitive],
+        primitives: primitive_encodings
+            .into_iter()
+            .map(|encoding| encoding.primitive)
+            .collect(),
         weights: None,
         extensions: None,
-        extras: json::extras::Void::default(),
+        extras: Option::default(),
         name: None,
     };
 
@@ -868,14 +1308,14 @@ fn build_encoded_glb(
         translation: None,
         weights: None,
         extensions: None,
-        extras: json::extras::Void::default(),
+        extras: Option::default(),
         name: None,
     };
 
     let scene = json::Scene {
         nodes: vec![json::Index::new(0)],
         extensions: None,
-        extras: json::extras::Void::default(),
+        extras: Option::default(),
         name: None,
     };
 
@@ -889,13 +1329,17 @@ fn build_encoded_glb(
         extensions_used.push(MESHOPT_EXTENSION.to_string());
         extensions_required.push(MESHOPT_EXTENSION.to_string());
     }
+    if structural_metadata.is_some() {
+        extensions_used.push(STRUCTURAL_METADATA_EXTENSION.to_string());
+        extensions_used.push(MESH_FEATURES_EXTENSION.to_string());
+    }
 
     let mut buffers = vec![json::Buffer {
         byte_length: json::validation::USize64(buffer_builder.bytes.len() as u64),
         uri: None,
         name: Some("buffer0".into()),
         extensions: None,
-        extras: json::extras::Void::default(),
+        extras: Option::default(),
     }];
     if meshopt_compression {
         buffers.push(json::Buffer {
@@ -903,16 +1347,16 @@ fn build_encoded_glb(
             uri: None,
             name: Some("fallback".into()),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
         });
     }
 
-    Ok(EncodedGlb {
+    EncodedGlb {
         root: json::Root {
             accessors: buffer_builder.accessors,
             buffers,
             buffer_views: buffer_builder.buffer_views,
-            materials: vec![material],
+            materials,
             meshes: vec![mesh],
             nodes: vec![node],
             scenes: vec![scene],
@@ -929,16 +1373,416 @@ fn build_encoded_glb(
         },
         bin_buffer: buffer_builder.bytes,
         meshopt_views: buffer_builder.meshopt_views,
+        primitive_feature_counts,
+        structural_metadata,
+    }
+}
+
+fn build_node_matrix(scale: f32, translation: [f32; 3]) -> [f32; 16] {
+    [
+        scale,
+        0.0,
+        0.0,
+        0.0, //
+        0.0,
+        0.0,
+        -scale,
+        0.0, //
+        0.0,
+        scale,
+        0.0,
+        0.0, //
+        translation[0],
+        translation[2],
+        -translation[1],
+        1.0,
+    ]
+}
+
+fn reorder_features_by_type(
+    mut features: Vec<FeatureRecord>,
+    primitives: &mut [ProcessedPrimitiveMesh],
+) -> Result<Vec<FeatureRecord>> {
+    let mut indexed = features
+        .drain(..)
+        .enumerate()
+        .collect::<Vec<(usize, FeatureRecord)>>();
+    indexed.sort_by(|(_, lhs), (_, rhs)| {
+        lhs.feature_type
+            .cmp(&rhs.feature_type)
+            .then_with(|| lhs.object_id.cmp(&rhs.object_id))
+    });
+
+    let mut remap = vec![0u32; indexed.len()];
+    let mut reordered = Vec::with_capacity(indexed.len());
+    for (new_index, (old_index, feature)) in indexed.into_iter().enumerate() {
+        remap[old_index] = u32::try_from(new_index).expect("feature index within u32 range");
+        reordered.push(feature);
+    }
+
+    for primitive in primitives {
+        for vertex in &mut primitive.vertices {
+            let Some(mapped) = remap.get(vertex.feature_id as usize) else {
+                anyhow::bail!("feature ID remap out of range");
+            };
+            vertex.feature_id = *mapped;
+        }
+    }
+
+    Ok(reordered)
+}
+
+impl ProcessedScene {
+    fn encode_primitives_raw(
+        &self,
+        buffer_builder: &mut BufferBuilder,
+        meshopt_compression: bool,
+    ) -> Result<Vec<PrimitiveEncoding>> {
+        let mut primitive_encodings = Vec::with_capacity(self.primitives.len());
+        for (material_index, primitive) in self.primitives.iter().enumerate() {
+            let bounds = Bounds::from_vertices(&primitive.vertices)
+                .ok_or_else(|| anyhow::anyhow!("primitive bounds missing for non-empty mesh"))?;
+            let vertex_accessors = buffer_builder.push_float_vertices(
+                &primitive.vertices,
+                &bounds,
+                meshopt_compression,
+                true,
+            )?;
+            let index_buffer = primitive.select_index_buffer()?;
+            let index_accessor = buffer_builder.push_indices(
+                &index_buffer,
+                primitive.vertices.len(),
+                meshopt_compression,
+            )?;
+            primitive_encodings.push(PrimitiveEncoding {
+                feature_type: primitive.feature_type.clone(),
+                primitive: build_primitive(
+                    vertex_accessors,
+                    index_accessor,
+                    u32::try_from(material_index).expect("material index within u32 range"),
+                ),
+                feature_count: primitive
+                    .vertices
+                    .iter()
+                    .map(|vertex| vertex.feature_id)
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            });
+        }
+        Ok(primitive_encodings)
+    }
+}
+
+impl QuantizedScene {
+    fn encode_primitives(
+        &self,
+        buffer_builder: &mut BufferBuilder,
+        meshopt_compression: bool,
+    ) -> Result<Vec<PrimitiveEncoding>> {
+        let mut primitive_encodings = Vec::with_capacity(self.primitives.len());
+        for (material_index, primitive) in self.primitives.iter().enumerate() {
+            let vertex_accessors = buffer_builder.push_quantized_vertices(
+                &primitive.positions,
+                &primitive.normals,
+                &primitive.feature_ids,
+                &primitive.normalized_bounds,
+                meshopt_compression,
+            )?;
+            let index_accessor = buffer_builder.push_indices(
+                &primitive.indices,
+                primitive.positions.len(),
+                meshopt_compression,
+            )?;
+            primitive_encodings.push(PrimitiveEncoding {
+                feature_type: primitive.feature_type.clone(),
+                primitive: build_primitive(
+                    vertex_accessors,
+                    index_accessor,
+                    u32::try_from(material_index).expect("material index within u32 range"),
+                ),
+                feature_count: primitive
+                    .feature_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+            });
+        }
+        Ok(primitive_encodings)
+    }
+}
+
+fn build_primitive(
+    vertex_accessors: VertexAccessors,
+    index_accessor: json::Index<json::Accessor>,
+    material_index: u32,
+) -> json::mesh::Primitive {
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        json::validation::Checked::Valid(json::mesh::Semantic::Positions),
+        vertex_accessors.positions,
+    );
+    attributes.insert(
+        json::validation::Checked::Valid(json::mesh::Semantic::Normals),
+        vertex_accessors.normals,
+    );
+    if let Some(feature_ids) = vertex_accessors.feature_ids {
+        attributes.insert(
+            json::validation::Checked::Valid(json::mesh::Semantic::Extras(
+                "FEATURE_ID_0".to_string(),
+            )),
+            feature_ids,
+        );
+    }
+
+    json::mesh::Primitive {
+        attributes,
+        indices: Some(index_accessor),
+        material: Some(json::Index::new(material_index)),
+        mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
+        targets: None,
+        extensions: None,
+        extras: Option::default(),
+    }
+}
+
+fn build_materials(
+    primitive_encodings: &[PrimitiveEncoding],
+    options: &ExportOptions,
+) -> Result<Vec<json::Material>> {
+    primitive_encodings
+        .iter()
+        .map(|encoding| {
+            create_default_material(resolve_feature_type_color(&encoding.feature_type, options))
+        })
+        .collect()
+}
+
+fn resolve_feature_type_color<'a>(feature_type: &str, options: &'a ExportOptions) -> &'a str {
+    if let Some(color) = options.feature_type_colors.get(feature_type) {
+        return color.as_str();
+    }
+
+    default_color_for_feature_type(feature_type).unwrap_or(&options.native_glb_color)
+}
+
+fn default_color_for_feature_type(feature_type: &str) -> Option<&'static str> {
+    match feature_type {
+        "Building" => Some("#d8c3a5"),
+        "BuildingPart" => Some("#e6d5b8"),
+        "BuildingInstallation" => Some("#b89b7a"),
+        "TINRelief" => Some("#9fb37c"),
+        "Road" => Some("#8b8b8b"),
+        "Railway" => Some("#666666"),
+        "TransportSquare" => Some("#a8a8a8"),
+        "WaterBody" => Some("#7db8da"),
+        "PlantCover" => Some("#8dbb6b"),
+        "SolitaryVegetationObject" => Some("#689d45"),
+        "LandUse" => Some("#c0cf8c"),
+        "CityFurniture" => Some("#c78d5b"),
+        "Bridge" => Some("#b39a86"),
+        "BridgePart" => Some("#c2aa96"),
+        "BridgeInstallation" => Some("#927562"),
+        "BridgeConstructiveElement" => Some("#8e705d"),
+        "Tunnel" => Some("#968d84"),
+        "TunnelPart" => Some("#a39a90"),
+        "TunnelInstallation" => Some("#7b726a"),
+        "GenericCityObject" => Some("#b48ead"),
+        "OtherConstruction" => Some("#b5947d"),
+        _ => None,
+    }
+}
+
+fn build_structural_metadata_columns(
+    features: &[FeatureRecord],
+    buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
+) -> Result<BTreeMap<String, StructuralMetadataColumn>> {
+    let mut column_types = BTreeMap::<String, &'static str>::new();
+    for feature in features {
+        for (name, value) in &feature.attributes {
+            let kind = match value {
+                MetadataValue::Bool(_) => "bool",
+                MetadataValue::Int(_) => "int",
+                MetadataValue::Float(_) => "float",
+                MetadataValue::String(_) => "string",
+            };
+            column_types
+                .entry(name.clone())
+                .and_modify(|existing| {
+                    if *existing != kind {
+                        *existing = if *existing == "string" || kind == "string" {
+                            "string"
+                        } else if *existing == "float" || kind == "float" {
+                            "float"
+                        } else {
+                            "int"
+                        };
+                    }
+                })
+                .or_insert(kind);
+        }
+    }
+
+    let mut columns = BTreeMap::new();
+    for (name, kind) in column_types {
+        let column = match kind {
+            "bool" => build_bool_metadata_column(&name, features, buffer_builder),
+            "int" => {
+                build_int_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
+            "float" => {
+                build_float_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
+            "string" => {
+                build_string_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
+            _ => continue,
+        };
+        columns.insert(name, column);
+    }
+
+    Ok(columns)
+}
+
+fn build_bool_metadata_column(
+    name: &str,
+    features: &[FeatureRecord],
+    buffer_builder: &mut BufferBuilder,
+) -> StructuralMetadataColumn {
+    let values = features
+        .iter()
+        .map(|feature| match feature.attributes.get(name) {
+            Some(MetadataValue::Bool(value)) => i8::from(*value),
+            _ => i8::MAX,
+        })
+        .collect::<Vec<_>>();
+    let view = buffer_builder.push_scalar_buffer_view(&values, json::buffer::Target::ArrayBuffer);
+    StructuralMetadataColumn {
+        property: json_value!({
+            "type": "SCALAR",
+            "componentType": "INT8",
+            "noData": i8::MAX,
+        }),
+        property_table_entry: json_value!({
+            "values": view.value(),
+        }),
+    }
+}
+
+fn build_int_metadata_column(
+    name: &str,
+    features: &[FeatureRecord],
+    buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
+) -> Result<StructuralMetadataColumn> {
+    let values = features
+        .iter()
+        .map(|feature| match feature.attributes.get(name) {
+            Some(MetadataValue::Bool(value)) => i32::from(*value),
+            Some(MetadataValue::Int(value)) => *value,
+            #[allow(clippy::cast_possible_truncation)]
+            Some(MetadataValue::Float(value)) => *value as i32,
+            _ => i32::MAX,
+        })
+        .collect::<Vec<_>>();
+    let view = buffer_builder.push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
+    Ok(StructuralMetadataColumn {
+        property: json_value!({
+            "type": "SCALAR",
+            "componentType": "INT32",
+            "noData": i32::MAX,
+        }),
+        property_table_entry: json_value!({
+            "values": view.value(),
+        }),
     })
 }
 
-fn build_node_matrix(scale: f32, center: [f32; 3]) -> [f32; 16] {
-    [
-        scale, 0.0, 0.0, 0.0, //
-        0.0, 0.0, -scale, 0.0, //
-        0.0, scale, 0.0, 0.0, //
-        center[0], center[2], -center[1], 1.0,
-    ]
+fn build_float_metadata_column(
+    name: &str,
+    features: &[FeatureRecord],
+    buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
+) -> Result<StructuralMetadataColumn> {
+    let values = features
+        .iter()
+        .map(|feature| match feature.attributes.get(name) {
+            Some(MetadataValue::Bool(value)) => f32::from(u8::from(*value)),
+            #[allow(clippy::cast_precision_loss)]
+            Some(MetadataValue::Int(value)) => *value as f32,
+            Some(MetadataValue::Float(value)) => *value,
+            _ => f32::MAX,
+        })
+        .collect::<Vec<_>>();
+    let view = buffer_builder.push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
+    Ok(StructuralMetadataColumn {
+        property: json_value!({
+            "type": "SCALAR",
+            "componentType": "FLOAT32",
+            "noData": f32::MAX,
+        }),
+        property_table_entry: json_value!({
+            "values": view.value(),
+        }),
+    })
+}
+
+fn build_string_metadata_column(
+    name: &str,
+    features: &[FeatureRecord],
+    buffer_builder: &mut BufferBuilder,
+    meshopt_compression: bool,
+) -> Result<StructuralMetadataColumn> {
+    let mut values = Vec::<u8>::new();
+    let mut offsets = Vec::<u32>::with_capacity(features.len() + 1);
+    offsets.push(0);
+    for feature in features {
+        if let Some(MetadataValue::String(value)) = feature.attributes.get(name) {
+            values.extend_from_slice(value.as_bytes());
+        }
+        offsets.push(u32::try_from(values.len()).expect("string column offset within u32 range"));
+    }
+
+    let values_view =
+        buffer_builder.push_byte_buffer_view(&values, json::buffer::Target::ArrayBuffer);
+    let offsets_view =
+        buffer_builder.push_metadata_scalar_buffer_view(&offsets, meshopt_compression)?;
+    Ok(StructuralMetadataColumn {
+        property: json_value!({
+            "type": "STRING",
+        }),
+        property_table_entry: json_value!({
+            "values": values_view.value(),
+            "stringOffsets": offsets_view.value(),
+            "stringOffsetType": "UINT32",
+        }),
+    })
+}
+
+impl StructuralMetadataExtension {
+    fn from_features(
+        features: &[FeatureRecord],
+        buffer_builder: &mut BufferBuilder,
+        class_name: &str,
+        meshopt_compression: bool,
+    ) -> Result<Option<Self>> {
+        if features.is_empty() {
+            return Ok(None);
+        }
+
+        let columns =
+            build_structural_metadata_columns(features, buffer_builder, meshopt_compression)?;
+        if columns.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            class_name: class_name.to_string(),
+            columns,
+            feature_count: features.len(),
+        }))
+    }
 }
 
 impl BufferBuilder {
@@ -946,6 +1790,7 @@ impl BufferBuilder {
         &mut self,
         positions: &[QuantizedPosition],
         normals: &[QuantizedNormal],
+        feature_ids: &[u32],
         bounds: &Bounds,
         meshopt_compression: bool,
     ) -> Result<VertexAccessors> {
@@ -985,7 +1830,7 @@ impl BufferBuilder {
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         });
@@ -1020,14 +1865,20 @@ impl BufferBuilder {
             normalized: true,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             min: None,
             max: None,
             name: None,
             sparse: None,
         });
 
-        Ok(VertexAccessors { positions, normals })
+        let feature_ids = Some(self.push_feature_ids(feature_ids, meshopt_compression)?);
+
+        Ok(VertexAccessors {
+            positions,
+            normals,
+            feature_ids,
+        })
     }
 
     fn push_float_vertices(
@@ -1035,6 +1886,7 @@ impl BufferBuilder {
         vertices: &[Vertex],
         bounds: &Bounds,
         meshopt_compression: bool,
+        include_feature_ids: bool,
     ) -> Result<VertexAccessors> {
         let positions: Vec<FloatPosition> = vertices
             .iter()
@@ -1088,7 +1940,7 @@ impl BufferBuilder {
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         });
@@ -1123,14 +1975,113 @@ impl BufferBuilder {
             normalized: false,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             min: None,
             max: None,
             name: None,
             sparse: None,
         });
 
-        Ok(VertexAccessors { positions, normals })
+        let feature_ids = if include_feature_ids {
+            let feature_ids = vertices
+                .iter()
+                .map(|vertex| vertex.feature_id)
+                .collect::<Vec<_>>();
+            Some(self.push_feature_ids(&feature_ids, meshopt_compression)?)
+        } else {
+            None
+        };
+
+        Ok(VertexAccessors {
+            positions,
+            normals,
+            feature_ids,
+        })
+    }
+
+    fn push_feature_ids(
+        &mut self,
+        feature_ids: &[u32],
+        meshopt_compression: bool,
+    ) -> Result<json::Index<json::Accessor>> {
+        let feature_ids = FeatureIdBuffer::from_feature_ids(feature_ids)?;
+        let view = match &feature_ids {
+            FeatureIdBuffer::U8(feature_id_values) => {
+                if meshopt_compression {
+                    let padded_feature_ids = feature_id_values
+                        .iter()
+                        .copied()
+                        .map(|feature_id| PaddedFeatureIdU8 {
+                            feature_id,
+                            _padding: [0; 3],
+                        })
+                        .collect::<Vec<_>>();
+                    let encoded = encode_vertex_buffer(&padded_feature_ids)
+                        .context("failed to meshopt-encode feature ID stream")?;
+                    self.push_meshopt_buffer_view(
+                        &encoded,
+                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        Some(FeatureIdBuffer::meshopt_byte_stride()),
+                        feature_id_values.len(),
+                        json::buffer::Target::ArrayBuffer,
+                        "ATTRIBUTES",
+                        None,
+                        std::mem::align_of::<PaddedFeatureIdU8>(),
+                    )
+                } else {
+                    self.push_buffer_view(
+                        feature_id_values,
+                        Some(feature_ids.byte_stride()),
+                        json::buffer::Target::ArrayBuffer,
+                    )
+                }
+            }
+            FeatureIdBuffer::U16(feature_id_values) => {
+                if meshopt_compression {
+                    let padded_feature_ids = feature_id_values
+                        .iter()
+                        .copied()
+                        .map(|feature_id| PaddedFeatureIdU16 {
+                            feature_id,
+                            _padding: 0,
+                        })
+                        .collect::<Vec<_>>();
+                    let encoded = encode_vertex_buffer(&padded_feature_ids)
+                        .context("failed to meshopt-encode feature ID stream")?;
+                    self.push_meshopt_buffer_view(
+                        &encoded,
+                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        Some(FeatureIdBuffer::meshopt_byte_stride()),
+                        feature_id_values.len(),
+                        json::buffer::Target::ArrayBuffer,
+                        "ATTRIBUTES",
+                        None,
+                        std::mem::align_of::<PaddedFeatureIdU16>(),
+                    )
+                } else {
+                    self.push_buffer_view(
+                        feature_id_values,
+                        Some(feature_ids.byte_stride()),
+                        json::buffer::Target::ArrayBuffer,
+                    )
+                }
+            }
+        };
+
+        Ok(self.push_accessor(json::Accessor {
+            buffer_view: Some(view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(feature_ids.count() as u64),
+            component_type: feature_ids.component_type(),
+            normalized: false,
+            min: Some(json::Value::from(vec![0])),
+            max: Some(json::Value::from(vec![feature_ids.max_value()])),
+            type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
+            extensions: None,
+            extras: Option::default(),
+            name: None,
+            sparse: None,
+        }))
     }
 
     fn push_indices(
@@ -1172,7 +2123,7 @@ impl BufferBuilder {
             max: Some(json::Value::from(vec![index_buffer.max_value()])),
             type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         }))
@@ -1198,11 +2149,51 @@ impl BufferBuilder {
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             name: None,
         });
+        self.meshopt_views.push(None);
 
         json::Index::new(u32::try_from(index).expect("buffer view index exceeds u32 range"))
+    }
+
+    fn push_scalar_buffer_view<T>(
+        &mut self,
+        data: &[T],
+        target: json::buffer::Target,
+    ) -> json::Index<json::buffer::View> {
+        self.push_buffer_view(data, None, target)
+    }
+
+    fn push_metadata_scalar_buffer_view<T>(
+        &mut self,
+        data: &[T],
+        meshopt_compression: bool,
+    ) -> Result<json::Index<json::buffer::View>> {
+        if meshopt_compression && std::mem::size_of::<T>() % 4 == 0 {
+            let encoded = encode_vertex_buffer(data)
+                .context("failed to meshopt-encode structural metadata column")?;
+            Ok(self.push_meshopt_buffer_view(
+                &encoded,
+                std::mem::size_of_val(data),
+                Some(std::mem::size_of::<T>()),
+                data.len(),
+                json::buffer::Target::ArrayBuffer,
+                "ATTRIBUTES",
+                None,
+                std::mem::align_of::<T>(),
+            ))
+        } else {
+            Ok(self.push_scalar_buffer_view(data, json::buffer::Target::ArrayBuffer))
+        }
+    }
+
+    fn push_byte_buffer_view(
+        &mut self,
+        data: &[u8],
+        target: json::buffer::Target,
+    ) -> json::Index<json::buffer::View> {
+        self.push_buffer_view(data, None, target)
     }
 
     fn push_meshopt_buffer_view(
@@ -1231,7 +2222,7 @@ impl BufferBuilder {
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
             extensions: None,
-            extras: json::extras::Void::default(),
+            extras: Option::default(),
             name: None,
         });
         self.meshopt_views.push(Some(MeshoptBufferView {
@@ -1258,8 +2249,14 @@ impl EncodedGlb {
     fn write<P: AsRef<Path>>(self, output_path: P) -> Result<()> {
         let mut root_json =
             serde_json::to_value(&self.root).context("failed to serialize glTF root to JSON")?;
-        if !self.meshopt_views.is_empty() {
+        if self.meshopt_views.iter().any(Option::is_some) {
             inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
+        }
+        if !self.primitive_feature_counts.is_empty() {
+            inject_mesh_feature_extensions(&mut root_json, &self.primitive_feature_counts)?;
+        }
+        if let Some(structural_metadata) = &self.structural_metadata {
+            inject_structural_metadata_extension(&mut root_json, structural_metadata)?;
         }
 
         let mut json_bytes =
@@ -1306,6 +2303,84 @@ impl EncodedGlb {
 
         Ok(())
     }
+}
+
+fn inject_mesh_feature_extensions(
+    root: &mut JsonValue,
+    primitive_feature_counts: &[usize],
+) -> Result<()> {
+    let root_object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must be an object"))?;
+    let meshes = root_object
+        .get_mut("meshes")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain a meshes array"))?;
+    let mesh = meshes
+        .get_mut(0)
+        .and_then(JsonValue::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain a mesh object"))?;
+    let primitives = mesh
+        .get_mut("primitives")
+        .and_then(JsonValue::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("glTF root JSON must contain primitive array"))?;
+
+    if primitives.len() != primitive_feature_counts.len() {
+        anyhow::bail!(
+            "primitive count {} does not match mesh feature metadata {}",
+            primitives.len(),
+            primitive_feature_counts.len()
+        );
+    }
+
+    for (primitive, feature_count) in primitives.iter_mut().zip(primitive_feature_counts.iter()) {
+        insert_extension(
+            primitive,
+            MESH_FEATURES_EXTENSION,
+            json_value!({
+                "featureIds": [{
+                    "featureCount": feature_count,
+                    "attribute": 0,
+                    "propertyTable": 0
+                }]
+            }),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn inject_structural_metadata_extension(
+    root: &mut JsonValue,
+    structural_metadata: &StructuralMetadataExtension,
+) -> Result<()> {
+    let mut class_properties = JsonMap::new();
+    let mut property_table_properties = JsonMap::new();
+    for (name, column) in &structural_metadata.columns {
+        class_properties.insert(name.clone(), column.property.clone());
+        property_table_properties.insert(name.clone(), column.property_table_entry.clone());
+    }
+
+    insert_extension(
+        root,
+        STRUCTURAL_METADATA_EXTENSION,
+        json_value!({
+            "schema": {
+                "id": "schema_0",
+                "classes": {
+                    structural_metadata.class_name.clone(): {
+                        "name": structural_metadata.class_name,
+                        "properties": JsonValue::Object(class_properties),
+                    }
+                }
+            },
+            "propertyTables": [{
+                "class": structural_metadata.class_name,
+                "count": structural_metadata.feature_count,
+                "properties": JsonValue::Object(property_table_properties),
+            }]
+        }),
+    )
 }
 
 fn inject_meshopt_extensions(
