@@ -89,6 +89,8 @@ Required libraries (prefix: `mingw-w64-ucrt-x86_64-`):
 * rust
 * sqlite3
 
+CI also installs `libtiff` on Linux because `proj-sys` falls back to building bundled PROJ with TIFF support when a suitable system `libproj` is not available.
+
 ## Usage
 
 *tyler* is a command line application.
