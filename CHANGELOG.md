@@ -1,5 +1,21 @@
 # Changelog
 
+## tyler 0.4.0 (unreleased)
+
+### Added
+
+- Native GLB generation in Rust through `cityjson-convert`.
+- Optional intermediary tile materialization in CityJSONSeq format for debugging.
+- Support for regular CityJSON documents, CityJSONSeq documents, and the legacy CityJSONFeature-files as input, via the `cityjson-index` crate.
+- A `just ci-check` recipe and a GitHub Actions workflow that runs it.
+- ADRs and supporting documentation for the new `cityjson-index`/CityJSONSeq input model and grid traversal changes.
+
+### Changed
+
+- Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.
+- Tyler no longer depends on an external `geoflow-bundle` installation for GLB export.
+- README, Dockerfiles, Nix flake files, and bundled resources were updated for the new pipeline.
+
 ## tyler 0.3.14 (2025-10-22)
 
 ### Fixed
