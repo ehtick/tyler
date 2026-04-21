@@ -6,8 +6,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
 use crate::ExportOptions;
+use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
@@ -491,12 +491,7 @@ impl MeshCollector {
                         };
                         for shell in boundary.to_nested_solid()? {
                             for surface in shell {
-                                self.add_surface(
-                                    &feature_type,
-                                    feature_index,
-                                    &surface,
-                                    model,
-                                )?;
+                                self.add_surface(&feature_type, feature_index, &surface, model)?;
                             }
                         }
                     }
@@ -895,11 +890,7 @@ impl ProcessedScene {
             .sum()
     }
 
-    fn write_glb<P: AsRef<Path>>(
-        &self,
-        output_path: P,
-        options: &ExportOptions,
-    ) -> Result<()> {
+    fn write_glb<P: AsRef<Path>>(&self, output_path: P, options: &ExportOptions) -> Result<()> {
         if self
             .primitives
             .iter()
@@ -1371,10 +1362,9 @@ fn build_materials(
 ) -> Result<Vec<json::Material>> {
     primitive_encodings
         .iter()
-        .map(|encoding| create_default_material(resolve_feature_type_color(
-            &encoding.feature_type,
-            options,
-        )))
+        .map(|encoding| {
+            create_default_material(resolve_feature_type_color(&encoding.feature_type, options))
+        })
         .collect()
 }
 
@@ -1454,12 +1444,9 @@ fn build_structural_metadata_columns(
             "float" => {
                 build_float_metadata_column(&name, features, buffer_builder, meshopt_compression)?
             }
-            "string" => build_string_metadata_column(
-                &name,
-                features,
-                buffer_builder,
-                meshopt_compression,
-            )?,
+            "string" => {
+                build_string_metadata_column(&name, features, buffer_builder, meshopt_compression)?
+            }
             _ => continue,
         };
         columns.insert(name, column);
@@ -1514,8 +1501,7 @@ fn build_int_metadata_column(
             _ => i32::MAX,
         })
         .collect::<Vec<_>>();
-    let view = buffer_builder
-        .push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
+    let view = buffer_builder.push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "SCALAR",
@@ -1543,8 +1529,7 @@ fn build_float_metadata_column(
             _ => f32::MAX,
         })
         .collect::<Vec<_>>();
-    let view = buffer_builder
-        .push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
+    let view = buffer_builder.push_metadata_scalar_buffer_view(&values, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "SCALAR",
@@ -1575,8 +1560,8 @@ fn build_string_metadata_column(
 
     let values_view =
         buffer_builder.push_byte_buffer_view(&values, json::buffer::Target::ArrayBuffer);
-    let offsets_view = buffer_builder
-        .push_metadata_scalar_buffer_view(&offsets, meshopt_compression)?;
+    let offsets_view =
+        buffer_builder.push_metadata_scalar_buffer_view(&offsets, meshopt_compression)?;
     Ok(StructuralMetadataColumn {
         property: json_value!({
             "type": "STRING",

@@ -650,11 +650,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(tile);
                 }
             };
-            if let Err(error) = cityjson_convert::convert_to_glb(
-                &model,
-                &output_file,
-                &export_options,
-            ) {
+            if let Err(error) =
+                cityjson_convert::convert_to_glb(&model, &output_file, &export_options)
+            {
                 warn!("Tile {} conversion failed: {}", tileid_grid, error);
                 return Some(tile);
             }

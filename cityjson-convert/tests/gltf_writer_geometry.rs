@@ -457,8 +457,9 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
 
 #[test]
 fn convert_to_glb_uses_custom_metadata_class_and_feature_colors() {
-    let model = json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
-        .expect("fixture feature stream should parse");
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture feature stream should parse");
     let output_path = stable_output_path("multi-feature-types-custom");
     let options = ExportOptions {
         metadata_class_name: "test".to_string(),
@@ -474,9 +475,11 @@ fn convert_to_glb_uses_custom_metadata_class_and_feature_colors() {
     let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
     let root = read_glb_json(&glb_bytes);
 
-    assert!(root["extensions"]["EXT_structural_metadata"]["schema"]["classes"]
-        .get("test")
-        .is_some());
+    assert!(
+        root["extensions"]["EXT_structural_metadata"]["schema"]["classes"]
+            .get("test")
+            .is_some()
+    );
     assert_eq!(
         root["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["class"]
             .as_str()
@@ -499,8 +502,9 @@ fn convert_to_glb_uses_custom_metadata_class_and_feature_colors() {
 
 #[test]
 fn convert_to_glb_compresses_metadata_numeric_columns() {
-    let model = json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
-        .expect("fixture feature stream should parse");
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture feature stream should parse");
     let output_path = stable_output_path("multi-feature-types-metadata-compressed");
 
     convert_to_glb(&model, &output_path, &ExportOptions::default())
