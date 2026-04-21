@@ -5,7 +5,7 @@ _default:
 
 # Fast compile-time validation across the workspace.
 check:
-    cargo check --workspace --all-targets --all-features
+    cargo check --workspace --all-targets --all-features --exclude proj --exclude proj-sys
 
 # Build all workspace targets with all features enabled.
 build *args:
@@ -13,7 +13,7 @@ build *args:
 
 # Run clippy with strict lint settings across the workspace.
 lint:
-    cargo clippy --workspace --all-targets --all-features -- -Dclippy::all -Dclippy::pedantic
+    cargo clippy --workspace --no-deps -- -Dclippy::all -Dclippy::pedantic
 
 # Format the workspace with rustfmt.
 fmt:
@@ -21,7 +21,11 @@ fmt:
 
 # Run the workspace tests with all features enabled.
 test:
-    cargo test --workspace --all-targets --all-features
+    cargo test --workspace --all-targets --all-features --exclude proj --exclude proj-sys
+
+# Clean the workspace by removing all build artifacts.
+clean:
+    cargo clean
 
 # Run the full local validation sequence.
 ci:

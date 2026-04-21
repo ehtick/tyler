@@ -528,7 +528,7 @@ impl MeshBuilder {
             scene: Some(json::Index::new(0)),
             asset: json::Asset {
                 version: GLTF_VERSION.into(),
-                generator: Some("cityjson-export".into()),
+                generator: Some("cityjson-convert".into()),
                 copyright: None,
                 ..Default::default()
             },

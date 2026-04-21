@@ -313,14 +313,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "cityjson-export"
+name = "cityjson-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cityjson-lib",
+ "cityjson-lib 0.6.0",
  "clap 4.6.1",
- "earcutr",
- "env_logger 0.10.2",
+ "earcutr 0.5.0",
+ "env_logger 0.11.10",
  "gltf",
  "log",
 ]
@@ -331,7 +331,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60c6862ff7b627f7aee9a695834049873889eec649ed1f4b8282414d698bebd6"
 dependencies = [
- "cityjson-lib",
+ "cityjson-lib 0.5.2",
  "clap 4.6.1",
  "flate2",
  "flatgeobuf",
@@ -365,6 +365,16 @@ name = "cityjson-lib"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4570d6c82997bf970bd12248a5bcede36008f4e9888648f1a5b1a67d4998f7f2"
+dependencies = [
+ "cityjson",
+ "cityjson-json",
+]
+
+[[package]]
+name = "cityjson-lib"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "591192fe44a38662f26bc21e186996b86e9e7c54db42b94c93cc29d8ba8ec379"
 dependencies = [
  "cityjson",
  "cityjson-json",
@@ -608,10 +618,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "earcutr"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc28d89ac6cb489f679fcf51aaa62b4667bb0fb73a30f1d4d23949069707c07"
+dependencies = [
+ "itertools",
+ "num-traits",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "env_filter"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e90c2accc4b07a8456ea0debdc2e7587bdd890680d71173a15d4ae604f6eef"
+dependencies = [
+ "log",
+ "regex",
+]
 
 [[package]]
 name = "env_logger"
@@ -637,6 +667,19 @@ dependencies = [
  "log",
  "regex",
  "termcolor",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0621c04f2196ac3f488dd583365b9c09be011a4ab8b9f37248ffcc8f6198b56a"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "env_filter",
+ "jiff",
+ "log",
 ]
 
 [[package]]
@@ -1325,10 +1368,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jiff"
+version = "0.2.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a3546dc96b6d42c5f24902af9e2538e82e39ad350b0c766eb3fbf2d8f3d8359"
+dependencies = [
+ "jiff-static",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+]
+
+[[package]]
+name = "jiff-static"
+version = "0.2.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a8c8b344124222efd714b73bb41f8b5120b27a7cc1c75593a6ff768d9d05aa4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "jni"
@@ -1756,6 +1832,21 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
+]
+
+[[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
+dependencies = [
+ "portable-atomic",
 ]
 
 [[package]]
@@ -2597,11 +2688,11 @@ dependencies = [
  "anyhow",
  "bincode",
  "bitvec",
- "cityjson-export",
+ "cityjson-convert",
  "cityjson-index",
- "cityjson-lib",
+ "cityjson-lib 0.5.2",
  "clap 4.6.1",
- "earcutr",
+ "earcutr 0.2.0",
  "env_logger 0.10.2",
  "gltf",
  "libc",

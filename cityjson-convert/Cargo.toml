@@ -1,0 +1,20 @@
+[package]
+name = "cityjson-convert"
+version = "0.1.0"
+edition = "2021"
+authors = ["Balázs Dukai <balazs.dukai@3dgi.nl>", "Ravi Peters <ravi.peters@3dgi.nl>"]
+description = "CityJSON format converter"
+license = "Apache-2.0"
+
+[[bin]]
+name = "cjconvert"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+cityjson-lib = "0.6"
+clap = { version = "4.6", features = ["cargo", "derive"] }
+earcutr = "0.5.0"
+env_logger = "0.11.0"
+gltf = "1.4"
+log = "0.4"
