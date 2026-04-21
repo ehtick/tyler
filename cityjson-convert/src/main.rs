@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use cityjson_lib::json;
 use clap::Parser;
 
-use cityjson_export::{convert_to_glb, ExportOptions};
+use cityjson_convert::{convert_to_glb, ExportOptions};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Input CityJSON file (.city.json).
+    /// Input `CityJSON` file (.city.json).
     input: PathBuf,
     /// Path to the output GLB file.
     #[arg(short, long)]

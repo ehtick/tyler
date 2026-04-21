@@ -31,6 +31,12 @@ impl Default for ExportOptions {
     }
 }
 
+/// Converts a `CityJSON` model to a GLB file.
+///
+/// # Errors
+///
+/// Returns an error when the output directory cannot be created or GLB writing
+/// fails.
 pub fn convert_to_glb<P: AsRef<Path>>(
     model: &CityModel,
     output: P,

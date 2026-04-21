@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 cityjson-lib = "0.5.2"
 cityjson-index = "0.3.1"
-cityjson-export = { path = "cityjson-export" }
+cityjson-convert = { path = "cityjson-convert" }
 log = "0.4.17"
 env_logger = "0.10.0"
 clap = { version = "4.0.32", features = ["cargo", "derive"] }
@@ -45,5 +45,5 @@ earcutr = "0.2"
 anyhow = "1.0"
 
 [workspace]
-members = [".", "cityjson-export"]
+members = [".", "cityjson-convert"]
 resolver = "2"

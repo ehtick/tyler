@@ -12,15 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cloned_instead_of_copied,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::explicit_iter_loop,
+    clippy::if_not_else,
+    clippy::assigning_clones,
+    clippy::manual_string_new,
+    clippy::manual_assert,
     clippy::manual_is_multiple_of,
+    clippy::manual_midpoint,
+    clippy::match_bool,
+    clippy::match_same_arms,
     clippy::needless_as_bytes,
     clippy::needless_borrows_for_generic_args,
+    clippy::needless_pass_by_value,
+    clippy::redundant_else,
+    clippy::redundant_closure_for_method_calls,
+    clippy::semicolon_if_nothing_returned,
+    clippy::similar_names,
+    clippy::single_match_else,
+    clippy::struct_excessive_bools,
+    clippy::struct_field_names,
     clippy::to_string_trait_impl,
     clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::trivially_copy_pass_by_ref,
     clippy::type_complexity,
     clippy::unnecessary_fallible_conversions,
+    clippy::unnecessary_debug_formatting,
+    clippy::unnecessary_semicolon,
     clippy::unnecessary_to_owned,
     clippy::unnecessary_unwrap,
+    clippy::unnecessary_wraps,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal,
+    clippy::used_underscore_binding,
+    clippy::used_underscore_items,
+    clippy::stable_sort_primitive,
     clippy::useless_vec
 )]
 mod cli;
@@ -29,7 +63,6 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use cityjson_export as _;
 use core::time::Duration;
 use std::collections::HashSet;
 use std::env;
