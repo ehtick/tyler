@@ -13,7 +13,10 @@ fn stable_output_path(name: &str) -> PathBuf {
 }
 
 fn read_glb_json(bytes: &[u8]) -> Value {
-    assert!(bytes.len() >= 20, "glb file should contain a header and JSON chunk");
+    assert!(
+        bytes.len() >= 20,
+        "glb file should contain a header and JSON chunk"
+    );
     assert_eq!(&bytes[0..4], b"glTF");
     assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
 
@@ -47,7 +50,11 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     let accessors = root["accessors"]
         .as_array()
         .expect("glTF should contain accessors");
-    assert_eq!(accessors.len(), 3, "writer currently emits position, normal, and index accessors");
+    assert_eq!(
+        accessors.len(),
+        3,
+        "writer currently emits position, normal, and index accessors"
+    );
 
     let positions = &accessors[0];
     let normals = &accessors[1];
@@ -59,13 +66,28 @@ fn convert_to_glb_writes_expected_geometry_layout() {
 
     assert!(position_count > 0, "mesh should contain vertices");
     assert_eq!(position_count, normal_count);
-    assert!(index_count > position_count, "triangle soup should be deduplicated into indexed geometry");
+    assert!(
+        index_count > position_count,
+        "triangle soup should be deduplicated into indexed geometry"
+    );
     assert_eq!(index_count % 3, 0, "index stream should describe triangles");
-    assert_eq!(positions["componentType"].as_u64().unwrap(), 5122, "positions should be quantized to i16");
-    assert_eq!(normals["componentType"].as_u64().unwrap(), 5120, "normals should be quantized to i8");
+    assert_eq!(
+        positions["componentType"].as_u64().unwrap(),
+        5122,
+        "positions should be quantized to i16"
+    );
+    assert_eq!(
+        normals["componentType"].as_u64().unwrap(),
+        5120,
+        "normals should be quantized to i8"
+    );
     assert_eq!(positions["normalized"].as_bool().unwrap(), true);
     assert_eq!(normals["normalized"].as_bool().unwrap(), true);
-    assert_eq!(indices["componentType"].as_u64().unwrap(), 5123, "small meshes should use u16 indices");
+    assert_eq!(
+        indices["componentType"].as_u64().unwrap(),
+        5123,
+        "small meshes should use u16 indices"
+    );
 
     let extensions_used = root["extensionsUsed"]
         .as_array()
@@ -73,7 +95,9 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     let extensions_required = root["extensionsRequired"]
         .as_array()
         .expect("quantized glTF should declare extensionsRequired");
-    assert!(extensions_used.iter().any(|value| value.as_str() == Some("KHR_mesh_quantization")));
+    assert!(extensions_used
+        .iter()
+        .any(|value| value.as_str() == Some("KHR_mesh_quantization")));
     assert!(extensions_used
         .iter()
         .any(|value| value.as_str() == Some("EXT_meshopt_compression")));
@@ -89,8 +113,12 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         .expect("compressed glTF should contain explicit source and fallback buffers");
     assert_eq!(buffers.len(), 2);
 
-    let min = positions["min"].as_array().expect("positions accessor should have min");
-    let max = positions["max"].as_array().expect("positions accessor should have max");
+    let min = positions["min"]
+        .as_array()
+        .expect("positions accessor should have min");
+    let max = positions["max"]
+        .as_array()
+        .expect("positions accessor should have max");
     for axis in 0..3 {
         assert!(min[axis].as_f64().unwrap() < 0.0);
         assert!(max[axis].as_f64().unwrap() > 0.0);
@@ -144,8 +172,14 @@ fn convert_to_glb_can_disable_quantization_and_compression() {
     assert!(!has_extension(&root, "KHR_mesh_quantization"));
     assert!(!has_extension(&root, "EXT_meshopt_compression"));
 
-    let buffers = root["buffers"].as_array().expect("glTF should contain buffers");
-    assert_eq!(buffers.len(), 1, "uncompressed output should contain a single GLB buffer");
+    let buffers = root["buffers"]
+        .as_array()
+        .expect("glTF should contain buffers");
+    assert_eq!(
+        buffers.len(),
+        1,
+        "uncompressed output should contain a single GLB buffer"
+    );
 
     let buffer_views = root["bufferViews"]
         .as_array()
@@ -194,7 +228,10 @@ fn convert_to_glb_can_disable_only_meshopt_compression() {
     assert!(has_extension(&root, "KHR_mesh_quantization"));
     assert!(!has_extension(&root, "EXT_meshopt_compression"));
     assert_eq!(
-        root["buffers"].as_array().expect("glTF should contain buffers").len(),
+        root["buffers"]
+            .as_array()
+            .expect("glTF should contain buffers")
+            .len(),
         1,
         "disabling meshopt compression should remove the fallback buffer"
     );
@@ -218,7 +255,9 @@ fn convert_to_glb_can_disable_only_meshopt_compression() {
 #[test]
 #[ignore = "TODO: add a multi-feature fixture and assert merged bounds/root centering stay stable"]
 fn convert_to_glb_merges_multiple_features_into_one_centered_mesh() {
-    todo!("add a merged feature-stream fixture and validate bounds, transform, and index selection");
+    todo!(
+        "add a merged feature-stream fixture and validate bounds, transform, and index selection"
+    );
 }
 
 #[test]
@@ -236,7 +275,11 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
     let buffers = root["buffers"]
         .as_array()
         .expect("compressed glTF should declare buffers");
-    assert_eq!(buffers.len(), 2, "compressed output should carry a source buffer and a fallback placeholder");
+    assert_eq!(
+        buffers.len(),
+        2,
+        "compressed output should carry a source buffer and a fallback placeholder"
+    );
     assert!(
         buffers[1]["extensions"]["EXT_meshopt_compression"]["fallback"]
             .as_bool()
@@ -247,7 +290,11 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
     let buffer_views = root["bufferViews"]
         .as_array()
         .expect("compressed glTF should declare bufferViews");
-    assert_eq!(buffer_views.len(), 3, "writer currently emits position, normal, and index views");
+    assert_eq!(
+        buffer_views.len(),
+        3,
+        "writer currently emits position, normal, and index views"
+    );
 
     for (index, buffer_view) in buffer_views.iter().enumerate() {
         assert_eq!(

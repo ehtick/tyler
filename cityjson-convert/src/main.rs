@@ -19,7 +19,7 @@ struct Cli {
     /// Disable geometry quantization in the generated GLB.
     #[arg(long = "no-quantization", default_value_t = false)]
     no_quantization: bool,
-    /// Disable EXT_meshopt_compression in the generated GLB.
+    /// Disable `EXT_meshopt_compression` in the generated GLB.
     #[arg(long = "no-meshopt-compression", default_value_t = false)]
     no_meshopt_compression: bool,
 }
