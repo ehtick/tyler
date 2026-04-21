@@ -886,8 +886,11 @@ mod tests {
             None,
         )
         .expect("build cjindex ndjson world");
-        assert_eq!(world.grid.bbox[2], indexed_bounds.min_z);
-        assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(world.grid.bbox[2], indexed_bounds.min_z);
+            assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
+        }
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
         let ndjson = String::from_utf8(

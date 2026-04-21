@@ -282,7 +282,7 @@ mod tests {
     use super::Cli;
     use clap::{CommandFactory, Parser};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn resource_path(name: &str) -> PathBuf {
@@ -319,7 +319,7 @@ mod tests {
         dataset_dir
     }
 
-    fn required_args(input_dir: &PathBuf) -> Vec<String> {
+    fn required_args(input_dir: &Path) -> Vec<String> {
         vec![
             "tyler".to_string(),
             input_dir.display().to_string(),

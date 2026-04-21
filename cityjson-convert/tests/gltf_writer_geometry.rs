@@ -60,10 +60,12 @@ fn assert_rgba_eq(actual: &Value, expected: [f64; 4]) {
 }
 
 fn buffer_view_is_meshopt_compressed(root: &Value, buffer_view_index: u64) -> bool {
-    root["bufferViews"][buffer_view_index as usize]["extensions"]["EXT_meshopt_compression"]
+    root["bufferViews"][usize::try_from(buffer_view_index).unwrap()]["extensions"]
+        ["EXT_meshopt_compression"]
         .is_object()
 }
 
+#[allow(clippy::too_many_lines, clippy::float_cmp)]
 #[test]
 fn convert_to_glb_writes_expected_geometry_layout() {
     let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
@@ -108,8 +110,8 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         5120,
         "normals should be quantized to i8"
     );
-    assert_eq!(positions["normalized"].as_bool().unwrap(), true);
-    assert_eq!(normals["normalized"].as_bool().unwrap(), true);
+    assert!(positions["normalized"].as_bool().unwrap());
+    assert!(normals["normalized"].as_bool().unwrap());
     assert!(matches!(
         feature_ids["componentType"].as_u64().unwrap(),
         5121 | 5123
@@ -195,6 +197,7 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     );
 }
 
+#[allow(clippy::float_cmp)]
 #[test]
 fn convert_to_glb_can_disable_quantization_and_compression() {
     let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
@@ -426,29 +429,29 @@ fn convert_to_glb_writes_meshopt_compression_extension() {
         accessors[3]["bufferView"].as_u64().unwrap(),
     ];
     assert_eq!(
-        buffer_views[geometry_buffer_views[0] as usize]["extensions"]["EXT_meshopt_compression"]
-            ["mode"]
+        buffer_views[usize::try_from(geometry_buffer_views[0]).unwrap()]["extensions"]
+            ["EXT_meshopt_compression"]["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        buffer_views[geometry_buffer_views[1] as usize]["extensions"]["EXT_meshopt_compression"]
-            ["mode"]
+        buffer_views[usize::try_from(geometry_buffer_views[1]).unwrap()]["extensions"]
+            ["EXT_meshopt_compression"]["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        buffer_views[geometry_buffer_views[2] as usize]["extensions"]["EXT_meshopt_compression"]
-            ["mode"]
+        buffer_views[usize::try_from(geometry_buffer_views[2]).unwrap()]["extensions"]
+            ["EXT_meshopt_compression"]["mode"]
             .as_str()
             .unwrap(),
         "ATTRIBUTES"
     );
     assert_eq!(
-        buffer_views[geometry_buffer_views[3] as usize]["extensions"]["EXT_meshopt_compression"]
-            ["mode"]
+        buffer_views[usize::try_from(geometry_buffer_views[3]).unwrap()]["extensions"]
+            ["EXT_meshopt_compression"]["mode"]
             .as_str()
             .unwrap(),
         "TRIANGLES"

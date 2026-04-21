@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use cityjson_lib::json;
@@ -35,8 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = ExportOptions {
         native_glb_color: cli.native_glb_color,
         metadata_class_name: cli.metadata_class_name,
-        feature_type_colors: Default::default(),
-        feature_type_lods: Default::default(),
+        feature_type_colors: BTreeMap::default(),
+        feature_type_lods: BTreeMap::default(),
         quantize_geometry: !cli.no_quantization,
         meshopt_compression: !cli.no_meshopt_compression,
     };

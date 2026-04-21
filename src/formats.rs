@@ -1710,7 +1710,6 @@ pub mod cesium3dtiles {
         fn test_boundingvolume_from_bbox() {
             let crs_to = "EPSG:4978";
             let transformer = Proj::new_known_crs("EPSG:7415", crs_to, None).unwrap();
-            let _bbox: Bbox = [171790.0, 472690.0, -15.0, 274190.0, 575090.0, 400.0];
             let bbox: Bbox = [
                 84362.90299999999,
                 446306.814,

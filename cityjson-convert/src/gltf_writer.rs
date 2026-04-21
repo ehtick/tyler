@@ -58,7 +58,7 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
     Ok(json::Material {
         name: None,
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
         pbr_metallic_roughness: json::material::PbrMetallicRoughness {
             base_color_factor: json::material::PbrBaseColorFactor(base_color_rgba),
             metallic_factor: json::material::StrengthFactor(metallic_factor),
@@ -66,7 +66,7 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
             base_color_texture: None,
             metallic_roughness_texture: None,
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
         },
         normal_texture: None,
         occlusion_texture: None,
@@ -239,8 +239,7 @@ impl FeatureIdBuffer {
             ))
         } else {
             bail!(
-                "feature ID attribute stream exceeds glTF limits: max feature ID {} does not fit in u16",
-                max_value
+                "feature ID attribute stream exceeds glTF limits: max feature ID {max_value} does not fit in u16"
             );
         }
     }
@@ -277,7 +276,7 @@ impl FeatureIdBuffer {
         }
     }
 
-    fn meshopt_byte_stride(&self) -> usize {
+    fn meshopt_byte_stride() -> usize {
         4
     }
 }
@@ -468,7 +467,8 @@ impl MeshCollector {
                     }
                 }
                 let feature_index = *feature_index.get_or_insert_with(|| {
-                    let feature_index = self.features.len() as u32;
+                    let feature_index =
+                        u32::try_from(self.features.len()).expect("feature count within u32 range");
                     self.features.push(FeatureRecord {
                         object_id: object_id.to_string(),
                         feature_type: feature_type.clone(),
@@ -633,7 +633,7 @@ impl MeshCollector {
             let Some(value) = Self::convert_attribute_value(value) else {
                 continue;
             };
-            attributes.insert(name.to_string(), value);
+            attributes.insert(name.clone(), value);
         }
 
         attributes
@@ -651,12 +651,13 @@ impl MeshCollector {
                     && *value >= f64::from(f32::MIN)
                     && *value <= f64::from(f32::MAX)
                 {
+                    #[allow(clippy::cast_possible_truncation)]
                     Some(MetadataValue::Float(*value as f32))
                 } else {
                     None
                 }
             }
-            AttributeValue::String(value) => Some(MetadataValue::String(value.to_string())),
+            AttributeValue::String(value) => Some(MetadataValue::String(value.clone())),
             _ => None,
         }
     }
@@ -965,7 +966,7 @@ impl ProcessedScene {
             options.meshopt_compression,
         )?;
 
-        build_encoded_glb(
+        Ok(build_encoded_glb(
             buffer_builder,
             primitive_encodings,
             materials,
@@ -973,7 +974,7 @@ impl ProcessedScene {
             false,
             options.meshopt_compression,
             structural_metadata,
-        )
+        ))
     }
 }
 
@@ -1037,7 +1038,7 @@ impl QuantizedScene {
             options.meshopt_compression,
         )?;
 
-        build_encoded_glb(
+        Ok(build_encoded_glb(
             buffer_builder,
             primitive_encodings,
             materials,
@@ -1045,7 +1046,7 @@ impl QuantizedScene {
             true,
             options.meshopt_compression,
             structural_metadata,
-        )
+        ))
     }
 }
 
@@ -1111,7 +1112,7 @@ fn build_encoded_glb(
     quantization_enabled: bool,
     meshopt_compression: bool,
     structural_metadata: Option<StructuralMetadataExtension>,
-) -> Result<EncodedGlb> {
+) -> EncodedGlb {
     let primitive_feature_counts = primitive_encodings
         .iter()
         .map(|encoding| encoding.feature_count)
@@ -1123,7 +1124,7 @@ fn build_encoded_glb(
             .collect(),
         weights: None,
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
         name: None,
     };
 
@@ -1138,14 +1139,14 @@ fn build_encoded_glb(
         translation: None,
         weights: None,
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
         name: None,
     };
 
     let scene = json::Scene {
         nodes: vec![json::Index::new(0)],
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
         name: None,
     };
 
@@ -1169,7 +1170,7 @@ fn build_encoded_glb(
         uri: None,
         name: Some("buffer0".into()),
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
     }];
     if meshopt_compression {
         buffers.push(json::Buffer {
@@ -1177,11 +1178,11 @@ fn build_encoded_glb(
             uri: None,
             name: Some("fallback".into()),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
         });
     }
 
-    Ok(EncodedGlb {
+    EncodedGlb {
         root: json::Root {
             accessors: buffer_builder.accessors,
             buffers,
@@ -1205,7 +1206,7 @@ fn build_encoded_glb(
         meshopt_views: buffer_builder.meshopt_views,
         primitive_feature_counts,
         structural_metadata,
-    })
+    }
 }
 
 fn build_node_matrix(scale: f32, center: [f32; 3]) -> [f32; 16] {
@@ -1234,7 +1235,7 @@ fn reorder_features_by_type(
     let mut remap = vec![0u32; indexed.len()];
     let mut reordered = Vec::with_capacity(indexed.len());
     for (new_index, (old_index, feature)) in indexed.into_iter().enumerate() {
-        remap[old_index] = new_index as u32;
+        remap[old_index] = u32::try_from(new_index).expect("feature index within u32 range");
         reordered.push(feature);
     }
 
@@ -1274,7 +1275,11 @@ impl ProcessedScene {
             )?;
             primitive_encodings.push(PrimitiveEncoding {
                 feature_type: primitive.feature_type.clone(),
-                primitive: build_primitive(vertex_accessors, index_accessor, material_index as u32),
+                primitive: build_primitive(
+                    vertex_accessors,
+                    index_accessor,
+                    u32::try_from(material_index).expect("material index within u32 range"),
+                ),
                 feature_count: primitive
                     .vertices
                     .iter()
@@ -1309,7 +1314,11 @@ impl QuantizedScene {
             )?;
             primitive_encodings.push(PrimitiveEncoding {
                 feature_type: primitive.feature_type.clone(),
-                primitive: build_primitive(vertex_accessors, index_accessor, material_index as u32),
+                primitive: build_primitive(
+                    vertex_accessors,
+                    index_accessor,
+                    u32::try_from(material_index).expect("material index within u32 range"),
+                ),
                 feature_count: primitive
                     .feature_ids
                     .iter()
@@ -1352,7 +1361,7 @@ fn build_primitive(
         mode: json::validation::Checked::Valid(json::mesh::Mode::Triangles),
         targets: None,
         extensions: None,
-        extras: Default::default(),
+        extras: Option::default(),
     }
 }
 
@@ -1437,7 +1446,7 @@ fn build_structural_metadata_columns(
     let mut columns = BTreeMap::new();
     for (name, kind) in column_types {
         let column = match kind {
-            "bool" => build_bool_metadata_column(&name, features, buffer_builder)?,
+            "bool" => build_bool_metadata_column(&name, features, buffer_builder),
             "int" => {
                 build_int_metadata_column(&name, features, buffer_builder, meshopt_compression)?
             }
@@ -1459,22 +1468,16 @@ fn build_bool_metadata_column(
     name: &str,
     features: &[FeatureRecord],
     buffer_builder: &mut BufferBuilder,
-) -> Result<StructuralMetadataColumn> {
+) -> StructuralMetadataColumn {
     let values = features
         .iter()
         .map(|feature| match feature.attributes.get(name) {
-            Some(MetadataValue::Bool(value)) => {
-                if *value {
-                    1_i8
-                } else {
-                    0_i8
-                }
-            }
+            Some(MetadataValue::Bool(value)) => i8::from(*value),
             _ => i8::MAX,
         })
         .collect::<Vec<_>>();
     let view = buffer_builder.push_scalar_buffer_view(&values, json::buffer::Target::ArrayBuffer);
-    Ok(StructuralMetadataColumn {
+    StructuralMetadataColumn {
         property: json_value!({
             "type": "SCALAR",
             "componentType": "INT8",
@@ -1483,7 +1486,7 @@ fn build_bool_metadata_column(
         property_table_entry: json_value!({
             "values": view.value(),
         }),
-    })
+    }
 }
 
 fn build_int_metadata_column(
@@ -1497,6 +1500,7 @@ fn build_int_metadata_column(
         .map(|feature| match feature.attributes.get(name) {
             Some(MetadataValue::Bool(value)) => i32::from(*value),
             Some(MetadataValue::Int(value)) => *value,
+            #[allow(clippy::cast_possible_truncation)]
             Some(MetadataValue::Float(value)) => *value as i32,
             _ => i32::MAX,
         })
@@ -1524,6 +1528,7 @@ fn build_float_metadata_column(
         .iter()
         .map(|feature| match feature.attributes.get(name) {
             Some(MetadataValue::Bool(value)) => f32::from(u8::from(*value)),
+            #[allow(clippy::cast_precision_loss)]
             Some(MetadataValue::Int(value)) => *value as f32,
             Some(MetadataValue::Float(value)) => *value,
             _ => f32::MAX,
@@ -1555,7 +1560,7 @@ fn build_string_metadata_column(
         if let Some(MetadataValue::String(value)) = feature.attributes.get(name) {
             values.extend_from_slice(value.as_bytes());
         }
-        offsets.push(values.len() as u32);
+        offsets.push(u32::try_from(values.len()).expect("string column offset within u32 range"));
     }
 
     let values_view =
@@ -1644,7 +1649,7 @@ impl BufferBuilder {
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         });
@@ -1679,7 +1684,7 @@ impl BufferBuilder {
             normalized: true,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             min: None,
             max: None,
             name: None,
@@ -1754,7 +1759,7 @@ impl BufferBuilder {
             )),
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         });
@@ -1789,7 +1794,7 @@ impl BufferBuilder {
             normalized: false,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             min: None,
             max: None,
             name: None,
@@ -1834,8 +1839,8 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * feature_ids.meshopt_byte_stride(),
-                        Some(feature_ids.meshopt_byte_stride()),
+                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
                         "ATTRIBUTES",
@@ -1864,8 +1869,8 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * feature_ids.meshopt_byte_stride(),
-                        Some(feature_ids.meshopt_byte_stride()),
+                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
                         "ATTRIBUTES",
@@ -1892,7 +1897,7 @@ impl BufferBuilder {
             max: Some(json::Value::from(vec![feature_ids.max_value()])),
             type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         }))
@@ -1937,7 +1942,7 @@ impl BufferBuilder {
             max: Some(json::Value::from(vec![index_buffer.max_value()])),
             type_: json::validation::Checked::Valid(json::accessor::Type::Scalar),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
             sparse: None,
         }))
@@ -1963,7 +1968,7 @@ impl BufferBuilder {
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
         });
         self.meshopt_views.push(None);
@@ -2036,7 +2041,7 @@ impl BufferBuilder {
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
             extensions: None,
-            extras: Default::default(),
+            extras: Option::default(),
             name: None,
         });
         self.meshopt_views.push(Some(MeshoptBufferView {
