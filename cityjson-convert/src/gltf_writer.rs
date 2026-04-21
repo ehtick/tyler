@@ -1,3 +1,5 @@
+#![allow(clippy::default_trait_access, clippy::too_many_lines)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -24,9 +26,9 @@ fn hex_to_rgba(hex: &str) -> Result<[f32; 4], anyhow::Error> {
     let g = u8::from_str_radix(&hex_digits[2..4], 16)?;
     let b = u8::from_str_radix(&hex_digits[4..6], 16)?;
     Ok([
-        r as f32 / 255.0,
-        g as f32 / 255.0,
-        b as f32 / 255.0,
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
         1.0, // Alpha, always opaque
     ])
 }
@@ -64,6 +66,12 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
     })
 }
 
+/// Writes a `CityJSON` model as a binary glTF file.
+///
+/// # Errors
+///
+/// Returns an error when the model geometry cannot be read or triangulated, or
+/// when the output GLB cannot be created.
 pub fn write_city_model_glb<P: AsRef<Path>>(
     model: &CityModel,
     output_path: P,
@@ -142,15 +150,21 @@ impl MeshBuilder {
         Ok(())
     }
 
-    fn vertex_index(&mut self, idx: u32, position: [f32; 3], cache: &mut HashMap<u32, u32>) -> u32 {
+    fn vertex_index(
+        &mut self,
+        idx: u32,
+        position: [f32; 3],
+        cache: &mut HashMap<u32, u32>,
+    ) -> Result<u32> {
         if let Some(&existing) = cache.get(&idx) {
-            return existing;
+            return Ok(existing);
         }
         self.positions.push(position);
         self.normals.push([0.0, 0.0, 0.0]);
-        let index = (self.positions.len() - 1) as u32;
+        let index = u32::try_from(self.positions.len() - 1)
+            .context("GLB vertex count exceeds u32 index range")?;
         cache.insert(idx, index);
-        index
+        Ok(index)
     }
 
     fn add_surface(
@@ -182,8 +196,8 @@ impl MeshBuilder {
             }
 
             for &vertex_id in ring {
-                let position = self.compute_local_position(vertex_id, model)?;
-                let glb_index = self.vertex_index(vertex_id, position, cache);
+                let position = Self::compute_local_position(vertex_id, model)?;
+                let glb_index = self.vertex_index(vertex_id, position, cache)?;
                 local_positions.push(position);
                 glb_indices.push(glb_index);
                 vertex_count += 1;
@@ -215,27 +229,27 @@ impl MeshBuilder {
             .iter()
             .enumerate()
             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(idx, _)| idx)
-            .unwrap_or(2);
+            .map_or(2, |(idx, _)| idx);
 
         for pos in &local_positions {
             match drop_axis {
                 0 => {
-                    flat_coords.push(pos[1] as f64);
-                    flat_coords.push(pos[2] as f64);
+                    flat_coords.push(f64::from(pos[1]));
+                    flat_coords.push(f64::from(pos[2]));
                 }
                 1 => {
-                    flat_coords.push(pos[0] as f64);
-                    flat_coords.push(pos[2] as f64);
+                    flat_coords.push(f64::from(pos[0]));
+                    flat_coords.push(f64::from(pos[2]));
                 }
                 _ => {
-                    flat_coords.push(pos[0] as f64);
-                    flat_coords.push(pos[1] as f64);
+                    flat_coords.push(f64::from(pos[0]));
+                    flat_coords.push(f64::from(pos[1]));
                 }
             }
         }
 
-        let triangulated = earcut(&flat_coords, &hole_indices, 2);
+        let triangulated =
+            earcut(&flat_coords, &hole_indices, 2).context("Failed to triangulate surface")?;
         if triangulated.len() < 3 {
             return Ok(());
         }
@@ -245,11 +259,11 @@ impl MeshBuilder {
             face_indices.push(glb_indices[idx]);
         }
 
-        self.emit_triangles(face_indices);
+        self.emit_triangles(&face_indices);
         Ok(())
     }
 
-    fn emit_triangles(&mut self, face_indices: Vec<u32>) {
+    fn emit_triangles(&mut self, face_indices: &[u32]) {
         for tri in face_indices.chunks_exact(3) {
             let i0 = tri[0] as usize;
             let i1 = tri[1] as usize;
@@ -278,16 +292,24 @@ impl MeshBuilder {
         }
     }
 
-    fn compute_local_position(
-        &self,
-        idx: u32,
-        model: &CityModel,
-    ) -> Result<[f32; 3], anyhow::Error> {
+    fn compute_local_position(idx: u32, model: &CityModel) -> Result<[f32; 3], anyhow::Error> {
         let vertex = model
             .get_vertex(VertexIndex::new(idx))
             .ok_or_else(|| anyhow::anyhow!("missing vertex {idx}"))?;
         let [x, y, z] = vertex.to_array();
-        Ok([x as f32, y as f32, z as f32])
+        Ok([
+            Self::f64_to_f32(x, "x", idx)?,
+            Self::f64_to_f32(y, "y", idx)?,
+            Self::f64_to_f32(z, "z", idx)?,
+        ])
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn f64_to_f32(value: f64, axis: &str, vertex_id: u32) -> Result<f32> {
+        if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+            anyhow::bail!("vertex {vertex_id} {axis} coordinate is outside the f32 range");
+        }
+        Ok(value as f32)
     }
 
     fn write_glb<P: AsRef<Path>>(&mut self, output_path: P, default_color: &str) -> Result<()> {
@@ -295,14 +317,14 @@ impl MeshBuilder {
 
         if self.positions.is_empty() {
             info!(
-                "No geometry to write, creating empty GLB file at {:?}",
-                output_path.as_ref()
+                "No geometry to write, creating empty GLB file at {}",
+                output_path.as_ref().display()
             );
             if let Some(parent) = output_path.as_ref().parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
-                        "Failed to create parent directory for {:?}",
-                        output_path.as_ref()
+                        "Failed to create parent directory for {}",
+                        output_path.as_ref().display()
                     )
                 })?;
             }
@@ -310,15 +332,15 @@ impl MeshBuilder {
             return Ok(());
         }
         info!(
-            "Writing GLB file with {} vertices and {} indices to {:?}",
+            "Writing GLB file with {} vertices and {} indices to {}",
             self.positions.len(),
             self.indices.len(),
-            output_path.as_ref()
+            output_path.as_ref().display()
         );
 
         let mut bin_buffer: Vec<u8> = Vec::new();
 
-        let positions_offset = 0;
+        let positions_offset = 0usize;
         for p in &self.positions {
             for component in p {
                 bin_buffer.extend_from_slice(&component.to_le_bytes());
@@ -543,24 +565,31 @@ impl MeshBuilder {
         bin_buffer.extend(std::iter::repeat_n(0u8, bin_padding));
 
         let total_length = 12 + 8 + json_bytes.len() + 8 + bin_buffer.len();
+        let total_length_u32 =
+            u32::try_from(total_length).context("GLB total length exceeds u32 range")?;
+        let json_length_u32 =
+            u32::try_from(json_bytes.len()).context("GLB JSON chunk exceeds u32 range")?;
+        let bin_length_u32 =
+            u32::try_from(bin_buffer.len()).context("GLB BIN chunk exceeds u32 range")?;
+
         let mut glb_bytes = Vec::with_capacity(total_length);
         glb_bytes.extend_from_slice(b"glTF");
         glb_bytes.extend_from_slice(&2u32.to_le_bytes());
-        glb_bytes.extend_from_slice(&(total_length as u32).to_le_bytes());
+        glb_bytes.extend_from_slice(&total_length_u32.to_le_bytes());
 
-        glb_bytes.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb_bytes.extend_from_slice(&json_length_u32.to_le_bytes());
         glb_bytes.extend_from_slice(b"JSON");
         glb_bytes.extend_from_slice(&json_bytes);
 
-        glb_bytes.extend_from_slice(&(bin_buffer.len() as u32).to_le_bytes());
+        glb_bytes.extend_from_slice(&bin_length_u32.to_le_bytes());
         glb_bytes.extend_from_slice(b"BIN\0");
         glb_bytes.extend_from_slice(&bin_buffer);
 
         if let Some(parent) = output_path.as_ref().parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
-                    "Failed to create parent directory for {:?}",
-                    output_path.as_ref()
+                    "Failed to create parent directory for {}",
+                    output_path.as_ref().display()
                 )
             })?;
         }
@@ -600,11 +629,11 @@ impl MeshBuilder {
                 .map(|p| p[2])
                 .fold(f32::NEG_INFINITY, f32::max);
 
-            let center_x = (min_x + max_x) / 2.0;
-            let center_y = (min_y + max_y) / 2.0;
-            let center_z = (min_z + max_z) / 2.0;
+            let center_x = f32::midpoint(min_x, max_x);
+            let center_y = f32::midpoint(min_y, max_y);
+            let center_z = f32::midpoint(min_z, max_z);
 
-            info!("GLB Summary: {:?}", output_path.as_ref());
+            info!("GLB Summary: {}", output_path.as_ref().display());
             info!("  Vertices: {}", self.positions.len());
             info!("  Coordinate range:");
             info!(
@@ -625,17 +654,14 @@ impl MeshBuilder {
                 max_z,
                 max_z - min_z
             );
-            info!(
-                "  Coordinate center: [{:.2}, {:.2}, {:.2}]",
-                center_x, center_y, center_z
-            );
+            info!("  Coordinate center: [{center_x:.2}, {center_y:.2}, {center_z:.2}]");
         }
 
         Ok(())
     }
 
     fn normalize_normals(&mut self) {
-        for normal in self.normals.iter_mut() {
+        for normal in &mut self.normals {
             let length =
                 (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
             if length > f32::EPSILON {
