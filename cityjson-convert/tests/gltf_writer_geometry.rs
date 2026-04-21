@@ -60,7 +60,22 @@ fn convert_to_glb_writes_expected_geometry_layout() {
     assert_eq!(position_count, normal_count);
     assert!(index_count > position_count, "triangle soup should be deduplicated into indexed geometry");
     assert_eq!(index_count % 3, 0, "index stream should describe triangles");
+    assert_eq!(positions["componentType"].as_u64().unwrap(), 5122, "positions should be quantized to i16");
+    assert_eq!(normals["componentType"].as_u64().unwrap(), 5120, "normals should be quantized to i8");
+    assert_eq!(positions["normalized"].as_bool().unwrap(), true);
+    assert_eq!(normals["normalized"].as_bool().unwrap(), true);
     assert_eq!(indices["componentType"].as_u64().unwrap(), 5123, "small meshes should use u16 indices");
+
+    let extensions_used = root["extensionsUsed"]
+        .as_array()
+        .expect("quantized glTF should declare extensionsUsed");
+    let extensions_required = root["extensionsRequired"]
+        .as_array()
+        .expect("quantized glTF should declare extensionsRequired");
+    assert!(extensions_used.iter().any(|value| value.as_str() == Some("KHR_mesh_quantization")));
+    assert!(extensions_required
+        .iter()
+        .any(|value| value.as_str() == Some("KHR_mesh_quantization")));
 
     let min = positions["min"].as_array().expect("positions accessor should have min");
     let max = positions["max"].as_array().expect("positions accessor should have max");
@@ -73,10 +88,11 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         .as_array()
         .expect("root node should carry the local-to-world transform");
     assert_eq!(node_matrix.len(), 16);
-    assert_eq!(node_matrix[0].as_f64().unwrap(), 1.0);
+    let dequant_scale = node_matrix[0].as_f64().unwrap();
+    assert!(dequant_scale > 0.0);
     assert_eq!(node_matrix[5].as_f64().unwrap(), 0.0);
-    assert_eq!(node_matrix[6].as_f64().unwrap(), -1.0);
-    assert_eq!(node_matrix[9].as_f64().unwrap(), 1.0);
+    assert_eq!(node_matrix[6].as_f64().unwrap(), -dequant_scale);
+    assert_eq!(node_matrix[9].as_f64().unwrap(), dequant_scale);
     assert_eq!(node_matrix[10].as_f64().unwrap(), 0.0);
     assert_ne!(node_matrix[12].as_f64().unwrap(), 0.0);
     assert_ne!(node_matrix[13].as_f64().unwrap(), 0.0);

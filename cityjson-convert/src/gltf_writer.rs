@@ -12,13 +12,15 @@ use gltf::json;
 use log::info;
 use meshopt::{
     generate_vertex_remap, optimize_overdraw_in_place_decoder, optimize_vertex_cache,
-    optimize_vertex_fetch, remap_index_buffer, remap_vertex_buffer, DecodePosition,
+    optimize_vertex_fetch, quantize_snorm, remap_index_buffer, remap_vertex_buffer,
+    DecodePosition,
 };
 
 const GLTF_VERSION: &str = "2.0";
-const VERTEX_STRIDE: usize = std::mem::size_of::<Vertex>();
-const NORMAL_OFFSET: usize = std::mem::size_of::<[f32; 3]>();
 const OVERDRAW_THRESHOLD: f32 = 1.05;
+const QUANTIZATION_EXTENSION: &str = "KHR_mesh_quantization";
+const QUANTIZED_POSITION_STRIDE: usize = std::mem::size_of::<QuantizedPosition>();
+const QUANTIZED_NORMAL_STRIDE: usize = std::mem::size_of::<QuantizedNormal>();
 
 /// Parse hex color string (#RRGGBB) to RGBA f32 array [R, G, B, A]
 fn hex_to_rgba(hex: &str) -> Result<[f32; 4], anyhow::Error> {
@@ -232,6 +234,27 @@ struct BufferBuilder {
 struct EncodedGlb {
     root: json::Root,
     bin_buffer: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct QuantizedPosition {
+    position: [i16; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct QuantizedNormal {
+    normal: [i8; 4],
+}
+
+struct QuantizedMesh {
+    positions: Vec<QuantizedPosition>,
+    normals: Vec<QuantizedNormal>,
+    indices: IndexBuffer,
+    normalized_bounds: Bounds,
+    position_scale: f32,
+    center: [f32; 3],
 }
 
 impl MeshCollector {
@@ -553,7 +576,8 @@ impl ProcessedMesh {
             output_path.as_ref().display()
         );
 
-        let encoded = self.encode_glb(default_color)?;
+        let quantized = self.quantize()?;
+        let encoded = quantized.encode_glb(default_color)?;
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
@@ -575,15 +599,81 @@ impl ProcessedMesh {
         Ok(())
     }
 
-    fn encode_glb(&self, default_color: &str) -> Result<EncodedGlb> {
+    fn quantize(&self) -> Result<QuantizedMesh> {
         let bounds = self
             .bounds
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
         let index_buffer = self.select_index_buffer()?;
 
+        let position_scale = [
+            bounds.min[0].abs(),
+            bounds.max[0].abs(),
+            bounds.min[1].abs(),
+            bounds.max[1].abs(),
+            bounds.min[2].abs(),
+            bounds.max[2].abs(),
+        ]
+        .into_iter()
+        .fold(0.0_f32, f32::max)
+        .max(f32::EPSILON);
+
+        let normalized_bounds = Bounds {
+            min: [
+                (bounds.min[0] / position_scale).clamp(-1.0, 1.0),
+                (bounds.min[1] / position_scale).clamp(-1.0, 1.0),
+                (bounds.min[2] / position_scale).clamp(-1.0, 1.0),
+            ],
+            max: [
+                (bounds.max[0] / position_scale).clamp(-1.0, 1.0),
+                (bounds.max[1] / position_scale).clamp(-1.0, 1.0),
+                (bounds.max[2] / position_scale).clamp(-1.0, 1.0),
+            ],
+        };
+
+        let positions = self
+            .vertices
+            .iter()
+            .map(|vertex| QuantizedPosition {
+                position: [
+                    quantize_snorm(vertex.position[0] / position_scale, 16) as i16,
+                    quantize_snorm(vertex.position[1] / position_scale, 16) as i16,
+                    quantize_snorm(vertex.position[2] / position_scale, 16) as i16,
+                    0,
+                ],
+            })
+            .collect();
+
+        let normals = self
+            .vertices
+            .iter()
+            .map(|vertex| QuantizedNormal {
+                normal: [
+                    quantize_snorm(vertex.normal[0], 8) as i8,
+                    quantize_snorm(vertex.normal[1], 8) as i8,
+                    quantize_snorm(vertex.normal[2], 8) as i8,
+                    0,
+                ],
+            })
+            .collect();
+
+        Ok(QuantizedMesh {
+            positions,
+            normals,
+            indices: index_buffer,
+            normalized_bounds,
+            position_scale,
+            center: self.center,
+        })
+    }
+}
+
+impl QuantizedMesh {
+    fn encode_glb(&self, default_color: &str) -> Result<EncodedGlb> {
+
         let mut buffer_builder = BufferBuilder::default();
-        let vertex_accessors = buffer_builder.push_vertices(&self.vertices, &bounds);
-        let index_accessor = buffer_builder.push_indices(&index_buffer);
+        let vertex_accessors =
+            buffer_builder.push_quantized_vertices(&self.positions, &self.normals, &self.normalized_bounds);
+        let index_accessor = buffer_builder.push_indices(&self.indices);
 
         let mut attributes = std::collections::BTreeMap::new();
         attributes.insert(
@@ -621,16 +711,16 @@ impl ProcessedMesh {
             children: None,
             skin: None,
             matrix: Some([
-                1.0,
+                self.position_scale,
                 0.0,
                 0.0,
                 0.0, //
                 0.0,
                 0.0,
-                -1.0,
+                -self.position_scale,
                 0.0, //
                 0.0,
-                1.0,
+                self.position_scale,
                 0.0,
                 0.0, //
                 self.center[0],
@@ -669,6 +759,8 @@ impl ProcessedMesh {
             nodes: vec![node],
             scenes: vec![scene],
             scene: Some(json::Index::new(0)),
+            extensions_used: vec![QUANTIZATION_EXTENSION.to_string()],
+            extensions_required: vec![QUANTIZATION_EXTENSION.to_string()],
             asset: json::Asset {
                 version: GLTF_VERSION.into(),
                 generator: Some("cityjson-convert".into()),
@@ -686,30 +778,32 @@ impl ProcessedMesh {
 }
 
 impl BufferBuilder {
-    fn push_vertices(&mut self, vertices: &[Vertex], bounds: &Bounds) -> VertexAccessors {
-        let mut vertex_bytes = Vec::with_capacity(vertices.len() * VERTEX_STRIDE);
-        for vertex in vertices {
-            for component in vertex.position {
-                vertex_bytes.extend_from_slice(&component.to_le_bytes());
-            }
-            for component in vertex.normal {
-                vertex_bytes.extend_from_slice(&component.to_le_bytes());
+    fn push_quantized_vertices(
+        &mut self,
+        positions: &[QuantizedPosition],
+        normals: &[QuantizedNormal],
+        bounds: &Bounds,
+    ) -> VertexAccessors {
+        let mut position_bytes = Vec::with_capacity(positions.len() * QUANTIZED_POSITION_STRIDE);
+        for position in positions {
+            for component in position.position {
+                position_bytes.extend_from_slice(&component.to_le_bytes());
             }
         }
 
-        let view = self.push_buffer_view(
-            vertex_bytes,
-            Some(VERTEX_STRIDE),
+        let position_view = self.push_buffer_view(
+            position_bytes,
+            Some(QUANTIZED_POSITION_STRIDE),
             json::buffer::Target::ArrayBuffer,
         );
         let positions = self.push_accessor(json::Accessor {
-            buffer_view: Some(view),
+            buffer_view: Some(position_view),
             byte_offset: Some(json::validation::USize64(0)),
-            count: json::validation::USize64(vertices.len() as u64),
+            count: json::validation::USize64(positions.len() as u64),
             component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
-                json::accessor::ComponentType::F32,
+                json::accessor::ComponentType::I16,
             )),
-            normalized: false,
+            normalized: true,
             min: Some(json::Value::Array(
                 bounds.min.iter().copied().map(json::Value::from).collect(),
             )),
@@ -722,14 +816,26 @@ impl BufferBuilder {
             name: None,
             sparse: None,
         });
+
+        let mut normal_bytes = Vec::with_capacity(normals.len() * QUANTIZED_NORMAL_STRIDE);
+        for normal in normals {
+            for component in normal.normal {
+                normal_bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let normal_view = self.push_buffer_view(
+            normal_bytes,
+            Some(QUANTIZED_NORMAL_STRIDE),
+            json::buffer::Target::ArrayBuffer,
+        );
         let normals = self.push_accessor(json::Accessor {
-            buffer_view: Some(view),
-            byte_offset: Some(json::validation::USize64(NORMAL_OFFSET as u64)),
-            count: json::validation::USize64(vertices.len() as u64),
+            buffer_view: Some(normal_view),
+            byte_offset: Some(json::validation::USize64(0)),
+            count: json::validation::USize64(normals.len() as u64),
             component_type: json::validation::Checked::Valid(json::accessor::GenericComponentType(
-                json::accessor::ComponentType::F32,
+                json::accessor::ComponentType::I8,
             )),
-            normalized: false,
+            normalized: true,
             type_: json::validation::Checked::Valid(json::accessor::Type::Vec3),
             extensions: Default::default(),
             extras: Default::default(),
