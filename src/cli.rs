@@ -281,26 +281,59 @@ fn hex_color(s: &str) -> Result<String, String> {
 mod tests {
     use super::Cli;
     use clap::{CommandFactory, Parser};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn required_args() -> Vec<&'static str> {
+    fn resource_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("data")
+            .join(name)
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tyler-{prefix}-{unique}"));
+        fs::create_dir_all(&path).expect("create test dir");
+        path
+    }
+
+    fn legacy_dataset_dir() -> PathBuf {
+        let dataset_dir = unique_test_dir("cli-legacy");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        fs::copy(
+            resource_path("3dbag_x00.city.json"),
+            dataset_dir.join("metadata.city.json"),
+        )
+        .expect("copy metadata");
+        fs::copy(
+            resource_path("3dbag_feature_x71.city.jsonl"),
+            features_dir.join("sample.city.jsonl"),
+        )
+        .expect("copy feature");
+        dataset_dir
+    }
+
+    fn required_args(input_dir: &PathBuf) -> Vec<String> {
         vec![
-            "tyler",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909"
-            ),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            input_dir.display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ]
     }
 
-    fn dataset_args() -> Vec<&'static str> {
+    fn dataset_args() -> Vec<String> {
         vec![
-            "tyler",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/data"),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/data").to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ]
     }
 
@@ -312,10 +345,15 @@ mod tests {
     /// Can we pass multiple CityObject types?
     #[test]
     fn verify_object_types() {
-        let mut types: Vec<&'static str> =
-            vec!["--object-type", "Building", "--object-type", "PlantCover"];
-        let mut args = required_args();
-        args.append(&mut types);
+        let dataset_dir = legacy_dataset_dir();
+        let types: Vec<String> = vec![
+            "--object-type".to_string(),
+            "Building".to_string(),
+            "--object-type".to_string(),
+            "PlantCover".to_string(),
+        ];
+        let mut args = required_args(&dataset_dir);
+        args.extend(types);
         let cli = Cli::try_parse_from(args).unwrap();
         let otypes = &cli.object_type.unwrap();
         assert!(otypes.contains(&crate::parser::CityObjectType::Building));
@@ -337,20 +375,15 @@ mod tests {
 
     #[test]
     fn reject_legacy_input_flags() {
+        let dataset_dir = legacy_dataset_dir();
         let args = vec![
-            "tyler",
-            "--metadata",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909/metadata.city.json"
-            ),
-            "--features",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/resources/data/features_3dbag_5909/3dbag_v21031_7425c21b_5909_subset"
-            ),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
+            "tyler".to_string(),
+            "--metadata".to_string(),
+            dataset_dir.join("metadata.city.json").display().to_string(),
+            "--features".to_string(),
+            dataset_dir.join("features").display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ];
         assert!(Cli::try_parse_from(args).is_err());
     }
