@@ -623,13 +623,12 @@ fn convert_to_glb_compresses_metadata_numeric_columns() {
 }
 
 #[test]
-fn convert_to_glb_filters_geometry_by_requested_lod() {
+fn convert_to_glb_writes_all_geometry_it_receives() {
     let model =
         json::merge_feature_stream_slice(include_bytes!("data/multi_lod_building_part.city.jsonl"))
             .expect("fixture feature stream should parse");
     let output_path = stable_output_path("multi-lod-building-part");
     let options = ExportOptions {
-        feature_type_lods: BTreeMap::from([("BuildingPart".to_string(), "2.2".to_string())]),
         quantize_geometry: false,
         meshopt_compression: false,
         ..ExportOptions::default()
@@ -643,10 +642,9 @@ fn convert_to_glb_filters_geometry_by_requested_lod() {
         .as_array()
         .expect("glTF should contain accessors");
 
-    assert_eq!(
-        accessors[3]["count"].as_u64().unwrap(),
-        36,
-        "only the LoD 2.2 cube should be exported"
+    assert!(
+        accessors[3]["count"].as_u64().unwrap() > 36,
+        "the writer should serialize every geometry left in the input model"
     );
     assert_eq!(
         root["extensions"]["EXT_structural_metadata"]["propertyTables"][0]["count"]

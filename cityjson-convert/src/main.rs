@@ -40,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         native_glb_color: cli.native_glb_color,
         metadata_class_name: cli.metadata_class_name,
         feature_type_colors: BTreeMap::default(),
-        feature_type_lods: BTreeMap::default(),
         source_crs: None,
         ecef_origin: None,
         reproject_to_ecef: true,

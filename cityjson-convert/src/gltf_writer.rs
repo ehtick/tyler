@@ -91,9 +91,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     options: &ExportOptions,
 ) -> Result<()> {
     let coordinate_transform = CoordinateTransform::from_model(model, options)?;
-    let mut collector = MeshCollector::with_lod_filter(
-        options.feature_type_lods.clone(),
-        coordinate_transform,
+    let mut collector = MeshCollector::new(coordinate_transform,
         options.smooth_normals,
     );
     collector.add_model(model)?;
@@ -325,7 +323,6 @@ struct ProcessedScene {
 struct MeshCollector {
     features: Vec<FeatureRecord>,
     primitives: BTreeMap<String, RawPrimitiveMesh>,
-    feature_type_lods: BTreeMap<String, String>,
     coordinate_transform: CoordinateTransform,
     smooth_normals: bool,
 }
@@ -579,30 +576,29 @@ fn compute_storage_origin(
     model: &CityModel,
     vertex_transformer: Option<&Proj>,
 ) -> Result<[f64; 3]> {
+    let Some(extent) = model
+        .calculate_geographical_extent()
+        .context("failed to calculate CityModel geographical extent")?
+    else {
+        return Ok([0.0; 3]);
+    };
+
     let mut bounds_min = [f64::INFINITY; 3];
     let mut bounds_max = [f64::NEG_INFINITY; 3];
     let mut has_vertices = false;
 
-    for vertex_index in 0..model.vertices().len() {
-        let vertex = model
-            .get_vertex(VertexIndex::new(
-                u32::try_from(vertex_index).expect("vertex count within u32 range"),
-            ))
-            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_index}"))?;
-        let [x, y, z] = vertex.to_array();
-        let position = if let Some(transformer) = vertex_transformer {
-            let transformed = transformer
-                .convert((x, y, z))
-                .with_context(|| format!("failed to project vertex {vertex_index} to ECEF"))?;
-            [transformed.0, transformed.1, transformed.2]
-        } else {
-            [x, y, z]
-        };
-        for axis in 0..3 {
-            bounds_min[axis] = bounds_min[axis].min(position[axis]);
-            bounds_max[axis] = bounds_max[axis].max(position[axis]);
+    for x in [extent.min_x(), extent.max_x()] {
+        for y in [extent.min_y(), extent.max_y()] {
+            for z in [extent.min_z(), extent.max_z()] {
+                let position = transform_origin_point([x, y, z], vertex_transformer)
+                    .context("failed to project CityModel extent corner to ECEF")?;
+                for axis in 0..3 {
+                    bounds_min[axis] = bounds_min[axis].min(position[axis]);
+                    bounds_max[axis] = bounds_max[axis].max(position[axis]);
+                }
+                has_vertices = true;
+            }
         }
-        has_vertices = true;
     }
 
     if !has_vertices {
@@ -614,6 +610,17 @@ fn compute_storage_origin(
         f64::midpoint(bounds_min[1], bounds_max[1]),
         f64::midpoint(bounds_min[2], bounds_max[2]),
     ])
+}
+
+fn transform_origin_point(point: [f64; 3], vertex_transformer: Option<&Proj>) -> Result<[f64; 3]> {
+    let [x, y, z] = point;
+    let position = if let Some(transformer) = vertex_transformer {
+        let transformed = transformer.convert((x, y, z))?;
+        [transformed.0, transformed.1, transformed.2]
+    } else {
+        [x, y, z]
+    };
+    Ok(position)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -630,15 +637,13 @@ fn f64_to_f32_checked(value: f64, axis: &str, vertex_id: Option<u32>) -> Result<
 }
 
 impl MeshCollector {
-    fn with_lod_filter(
-        feature_type_lods: BTreeMap<String, String>,
+    fn new(
         coordinate_transform: CoordinateTransform,
-        smooth_normals: bool,
+        smooth_normals: bool
     ) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),
-            feature_type_lods,
             coordinate_transform,
             smooth_normals,
         }
@@ -653,15 +658,6 @@ impl MeshCollector {
             let mut feature_index = None;
             for geometry_handle in geometry_handles {
                 let geometry = model.resolve_geometry(*geometry_handle)?;
-                if let Some(selected_lod) = self.feature_type_lods.get(&feature_type) {
-                    if geometry
-                        .geometry()
-                        .lod()
-                        .is_none_or(|lod| lod.to_string() != *selected_lod)
-                    {
-                        continue;
-                    }
-                }
                 let feature_index = *feature_index.get_or_insert_with(|| {
                     let feature_index =
                         u32::try_from(self.features.len()).expect("feature count within u32 range");
