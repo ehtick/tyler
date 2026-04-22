@@ -342,6 +342,58 @@ fn convert_to_glb_can_disable_only_meshopt_compression() {
 }
 
 #[test]
+fn convert_to_glb_can_generate_smooth_normals() {
+    let model = json::merge_feature_stream_slice(include_bytes!("data/ams_up_holes.city.jsonl"))
+        .expect("fixture feature stream should parse");
+    let hard_output_path = stable_output_path("ams-up-hard-normals");
+    let smooth_output_path = stable_output_path("ams-up-smooth-normals");
+
+    let hard_options = ExportOptions {
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+    let smooth_options = ExportOptions {
+        smooth_normals: true,
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &hard_output_path, &hard_options)
+        .expect("hard-normal GLB conversion should succeed");
+    convert_to_glb(&model, &smooth_output_path, &smooth_options)
+        .expect("smooth-normal GLB conversion should succeed");
+
+    let hard_glb_bytes = fs::read(&hard_output_path).expect("hard-normal test GLB should exist");
+    let smooth_glb_bytes =
+        fs::read(&smooth_output_path).expect("smooth-normal test GLB should exist");
+    let hard_root = read_glb_json(&hard_glb_bytes);
+    let smooth_root = read_glb_json(&smooth_glb_bytes);
+
+    let hard_accessors = hard_root["accessors"]
+        .as_array()
+        .expect("hard-normal glTF should contain accessors");
+    let smooth_accessors = smooth_root["accessors"]
+        .as_array()
+        .expect("smooth-normal glTF should contain accessors");
+
+    let hard_vertex_count = hard_accessors[0]["count"].as_u64().unwrap();
+    let smooth_vertex_count = smooth_accessors[0]["count"].as_u64().unwrap();
+    let hard_index_count = hard_accessors[3]["count"].as_u64().unwrap();
+    let smooth_index_count = smooth_accessors[3]["count"].as_u64().unwrap();
+
+    assert!(
+        smooth_vertex_count < hard_vertex_count,
+        "smooth normals should deduplicate shared vertices"
+    );
+    assert_eq!(
+        smooth_index_count, hard_index_count,
+        "smoothing should preserve triangle topology"
+    );
+}
+
+#[test]
 fn convert_to_glb_merges_multiple_features_into_one_centered_mesh() {
     let model =
         json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))

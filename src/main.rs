@@ -195,6 +195,7 @@ fn build_glb_export_options(
         source_crs,
         ecef_origin,
         reproject_to_ecef: true,
+        smooth_normals: cli.smooth_normals,
         quantize_geometry: true,
         meshopt_compression: true,
     }

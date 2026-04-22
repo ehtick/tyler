@@ -30,6 +30,7 @@ pub struct ExportOptions {
     pub source_crs: Option<String>,
     pub ecef_origin: Option<[f64; 3]>,
     pub reproject_to_ecef: bool,
+    pub smooth_normals: bool,
     pub quantize_geometry: bool,
     pub meshopt_compression: bool,
 }
@@ -44,6 +45,7 @@ impl Default for ExportOptions {
             source_crs: None,
             ecef_origin: None,
             reproject_to_ecef: true,
+            smooth_normals: false,
             quantize_geometry: true,
             meshopt_compression: true,
         }
