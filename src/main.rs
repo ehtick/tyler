@@ -70,6 +70,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::formats::cesium3dtiles::{Tile, TileId};
+use cityjson_lib::cityjson::prelude::GeometryHandle;
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
@@ -110,7 +111,6 @@ fn build_glb_export_options(
     ecef_origin: Option<[f64; 3]>,
 ) -> cityjson_convert::ExportOptions {
     let mut feature_type_colors = BTreeMap::new();
-    let mut feature_type_lods = BTreeMap::new();
 
     for (feature_type, color) in [
         ("Building", cli.color_building.as_ref()),
@@ -148,6 +148,25 @@ fn build_glb_export_options(
         }
     }
 
+    cityjson_convert::ExportOptions {
+        native_glb_color: "#FFC0CB".to_string(),
+        metadata_class_name: cli
+            .cesium3dtiles_metadata_class
+            .clone()
+            .unwrap_or_else(|| "cityobject".to_string()),
+        feature_type_colors,
+        source_crs,
+        ecef_origin,
+        reproject_to_ecef: true,
+        quantize_geometry: true,
+        meshopt_compression: true,
+        smooth_normals: cli.smooth_normals,
+    }
+}
+
+fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
+    let mut feature_type_lods = BTreeMap::new();
+
     for (feature_type, lod) in [
         ("Building", cli.lod_building.as_ref()),
         ("BuildingPart", cli.lod_building_part.as_ref()),
@@ -184,21 +203,7 @@ fn build_glb_export_options(
         }
     }
 
-    cityjson_convert::ExportOptions {
-        native_glb_color: "#FFC0CB".to_string(),
-        metadata_class_name: cli
-            .cesium3dtiles_metadata_class
-            .clone()
-            .unwrap_or_else(|| "cityobject".to_string()),
-        feature_type_colors,
-        feature_type_lods,
-        source_crs,
-        ecef_origin,
-        reproject_to_ecef: true,
-        smooth_normals: cli.smooth_normals,
-        quantize_geometry: true,
-        meshopt_compression: true,
-    }
+    feature_type_lods
 }
 
 fn compute_root_ecef_origin(
@@ -300,34 +305,31 @@ fn collect_tile_feature_ids(
     feature_ids
 }
 
-fn build_tile_cityjsonseq(
+fn read_tile_feature_models(
     world: &parser::World,
-    qtree_node: &spatial_structs::QuadTree,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut feature_output = Vec::new();
-    let feature_ids = collect_tile_feature_ids(world, qtree_node);
-
+    feature_ids: &[usize],
+) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
+    let mut models = Vec::with_capacity(feature_ids.len());
     match &world.input_source {
         parser::InputSource::LegacyFeatureFiles { features_root } => {
             for fid in feature_ids {
                 let parser::FeatureReference::LegacyPath(relative_path) =
-                    &world.features[fid].reference
+                    &world.features[*fid].reference
                 else {
                     return Err("legacy input unexpectedly referenced a cjindex feature".into());
                 };
                 let feature_path = features_root.join(relative_path);
-                let bytes = fs::read(&feature_path)?;
-                feature_output.write_all(&bytes)?;
-                if !bytes.ends_with(b"\n") {
-                    feature_output.write_all(b"\n")?;
-                }
+                models.push(cityjson_lib::json::staged::from_feature_file_with_base(
+                    &feature_path,
+                    &world.feature_base_document,
+                )?);
             }
         }
         parser::InputSource::CjIndexDataset { .. } => {
             let city_index = world.input_source.open_index()?;
             for fid in feature_ids {
                 let parser::FeatureReference::CjIndexId(feature_id) =
-                    &world.features[fid].reference
+                    &world.features[*fid].reference
                 else {
                     return Err(
                         "cjindex input unexpectedly referenced a legacy feature path".into(),
@@ -336,13 +338,182 @@ fn build_tile_cityjsonseq(
                 let model = city_index.get(feature_id)?.ok_or_else(|| {
                     format!("feature {feature_id} could not be resolved from cjindex")
                 })?;
-                cityjson_lib::json::to_feature_writer(&mut feature_output, &model)?;
-                feature_output.write_all(b"\n")?;
+                models.push(model);
             }
         }
     }
 
+    Ok(models)
+}
+
+fn build_tile_model_from_feature_ids(
+    world: &parser::World,
+    feature_ids: &[usize],
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let models = prepare_tile_feature_models(world, feature_ids, feature_type_lods)?;
+    if models.is_empty() {
+        return Err("tile model preparation removed all CityObjects".into());
+    }
+    let merged = cityjson_lib::ops::merge(models)?;
+    cleanup_and_update_extents(merged)
+}
+
+#[cfg(test)]
+fn build_tile_model(
+    world: &parser::World,
+    qtree_node: &spatial_structs::QuadTree,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let feature_ids = collect_tile_feature_ids(world, qtree_node);
+    build_tile_model_from_feature_ids(world, &feature_ids, &BTreeMap::new())
+}
+
+fn build_tile_debug_cityjsonseq(
+    world: &parser::World,
+    feature_ids: &[usize],
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let models = prepare_tile_feature_models(world, feature_ids, feature_type_lods)?;
+    let mut feature_output = Vec::new();
+    for model in models {
+        cityjson_lib::json::to_feature_writer(&mut feature_output, &model)?;
+        feature_output.write_all(b"\n")?;
+    }
     Ok(feature_output)
+}
+
+fn prepare_tile_feature_models(
+    world: &parser::World,
+    feature_ids: &[usize],
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
+    read_tile_feature_models(world, feature_ids)?
+        .into_iter()
+        .filter_map(
+            |model| match prepare_feature_model(model, world, feature_type_lods) {
+                Ok(Some(model)) => Some(Ok(model)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
+fn prepare_feature_model(
+    model: cityjson_lib::CityModel,
+    world: &parser::World,
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
+    let mut model = filter_cityobject_types(model, world.cityobject_types.as_ref())?;
+    prune_lod_geometries(&mut model, feature_type_lods)?;
+    let model = remove_empty_geometry_cityobjects(&model)?;
+    if model.cityobjects().is_empty() {
+        return Ok(None);
+    }
+    cleanup_and_update_extents(model).map(Some)
+}
+
+fn filter_cityobject_types(
+    model: cityjson_lib::CityModel,
+    cityobject_types: Option<&Vec<parser::CityObjectType>>,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let Some(cityobject_types) = cityobject_types else {
+        return Ok(model);
+    };
+    let selected = cityobject_types
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<HashSet<_>>();
+    Ok(cityjson_lib::ops::filter(&model, |ctx| {
+        selected.contains(&ctx.cityobject().type_cityobject().to_string())
+    })?)
+}
+
+fn prune_lod_geometries(
+    model: &mut cityjson_lib::CityModel,
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if feature_type_lods.is_empty() {
+        return Ok(());
+    }
+
+    let retained_by_object = model
+        .cityobjects()
+        .iter()
+        .map(|(handle, cityobject)| {
+            let feature_type = cityobject.type_cityobject().to_string();
+            let retained = cityobject
+                .geometry()
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|geometry_handle| {
+                    geometry_matches_lod(
+                        model,
+                        *geometry_handle,
+                        feature_type_lods.get(&feature_type),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (handle, retained)
+        })
+        .collect::<Vec<_>>();
+
+    for (handle, retained) in retained_by_object {
+        let cityobject = model
+            .cityobjects_mut()
+            .get_mut(handle)
+            .ok_or_else(|| format!("missing CityObject handle {handle} during LoD pruning"))?;
+        cityobject.clear_geometry();
+        for geometry_handle in retained {
+            cityobject.add_geometry(geometry_handle);
+        }
+    }
+
+    Ok(())
+}
+
+fn geometry_matches_lod(
+    model: &cityjson_lib::CityModel,
+    geometry_handle: GeometryHandle,
+    selected_lod: Option<&String>,
+) -> bool {
+    let Some(selected_lod) = selected_lod else {
+        return true;
+    };
+    model
+        .get_geometry(geometry_handle)
+        .and_then(|geometry| geometry.lod())
+        .is_some_and(|lod| lod.to_string() == *selected_lod)
+}
+
+fn remove_empty_geometry_cityobjects(
+    model: &cityjson_lib::CityModel,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    Ok(cityjson_lib::ops::filter(model, |ctx| {
+        ctx.cityobject()
+            .geometry()
+            .is_some_and(|geometries| !geometries.is_empty())
+    })?)
+}
+
+fn cleanup_and_update_extents(
+    model: cityjson_lib::CityModel,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let mut model = cityjson_lib::ops::cleanup(&model)?;
+    let handles = model.cityobjects().ids().collect::<Vec<_>>();
+    for handle in handles {
+        let extent = model.calculate_cityobject_geographical_extent(handle)?;
+        let cityobject = model
+            .cityobjects_mut()
+            .get_mut(handle)
+            .ok_or_else(|| format!("missing CityObject handle {handle} during extent update"))?;
+        cityobject.set_geographical_extent(extent);
+    }
+    if let Some(extent) = model.calculate_geographical_extent()? {
+        model.metadata_mut().set_geographical_extent(extent);
+    }
+    Ok(model)
 }
 
 fn write_debug_tile_input(
@@ -627,6 +798,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let source_crs = Some(format!("EPSG:{}", world.crs.to_epsg()?));
         let ecef_origin = Some(compute_root_ecef_origin(&world, &quadtree)?);
         let export_options = build_glb_export_options(&cli, source_crs, ecef_origin);
+        let feature_type_lods = build_feature_type_lods(&cli);
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
             let tileid_grid = &tile.id;
@@ -643,17 +815,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tileid_string = tileid.to_string();
             let file_name = tileid_string;
             let output_file = path_output_tiles.join(&file_name).with_extension("glb");
-            let cityjsonseq_bytes = match build_tile_cityjsonseq(&world, qtree_node) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    warn!(
-                        "Failed to build CityJSONFeature stream for tile {}: {}",
-                        tileid_grid, error
-                    );
-                    return Some(tile);
-                }
-            };
+            let feature_ids = collect_tile_feature_ids(&world, qtree_node);
+            let model =
+                match build_tile_model_from_feature_ids(&world, &feature_ids, &feature_type_lods) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        warn!(
+                            "Failed to build CityJSON model for tile {}: {}",
+                            tileid_grid, error
+                        );
+                        return Some(tile);
+                    }
+                };
             if cli.debug_tile_inputs {
+                let cityjsonseq_bytes =
+                    match build_tile_debug_cityjsonseq(&world, &feature_ids, &feature_type_lods) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            warn!(
+                                "Failed to build debug CityJSONFeature stream for tile {}: {}",
+                                tileid_grid, error
+                            );
+                            return Some(tile);
+                        }
+                    };
                 if let Err(error) = write_debug_tile_input(
                     &path_features_input_dir,
                     file_name.as_str(),
@@ -666,16 +851,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(tile);
                 }
             }
-            let model = match cityjson_lib::json::merge_cityjsonseq_slice(&cityjsonseq_bytes) {
-                Ok(model) => model,
-                Err(error) => {
-                    warn!(
-                        "Failed to merge CityJSONFeature stream for tile {}: {}",
-                        tileid_grid, error
-                    );
-                    return Some(tile);
-                }
-            };
             if let Err(error) =
                 cityjson_convert::convert_to_glb(&model, &output_file, &export_options)
             {
@@ -821,7 +996,67 @@ mod tests {
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_legacy_features_as_ndjson() {
+    fn prepare_model_filters_cityobject_types_and_updates_extent() {
+        let model = cityjson_lib::json::merge_feature_stream_slice(include_bytes!(
+            "../cityjson-convert/tests/data/multi_feature_types.city.jsonl"
+        ))
+        .expect("fixture feature stream should parse");
+        let filtered =
+            filter_cityobject_types(model, Some(&vec![parser::CityObjectType::Building]))
+                .expect("type filter should succeed");
+        let filtered = cleanup_and_update_extents(filtered).expect("cleanup should succeed");
+
+        let cityobject_types = filtered
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(cityobject_types, vec!["Building"]);
+        assert_eq!(
+            filtered
+                .metadata()
+                .and_then(|metadata| metadata.geographical_extent())
+                .copied(),
+            filtered
+                .calculate_geographical_extent()
+                .expect("extent calculation should succeed")
+        );
+    }
+
+    #[test]
+    fn prepare_model_prunes_lod_geometry_before_gltf_writer() {
+        let mut model = cityjson_lib::json::merge_feature_stream_slice(include_bytes!(
+            "../cityjson-convert/tests/data/multi_lod_building_part.city.jsonl"
+        ))
+        .expect("fixture feature stream should parse");
+        let lods = BTreeMap::from([("BuildingPart".to_string(), "2.2".to_string())]);
+
+        prune_lod_geometries(&mut model, &lods).expect("LoD pruning should succeed");
+        let model =
+            remove_empty_geometry_cityobjects(&model).expect("empty object removal should succeed");
+        let model = cleanup_and_update_extents(model).expect("cleanup should succeed");
+
+        let retained_lods = model
+            .cityobjects()
+            .iter()
+            .flat_map(|(_, cityobject)| cityobject.geometry().unwrap_or(&[]))
+            .map(|geometry_handle| {
+                model
+                    .get_geometry(*geometry_handle)
+                    .and_then(|geometry| geometry.lod())
+                    .map(std::string::ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retained_lods, vec![Some("2.2".to_string())]);
+        assert_eq!(
+            model.geometry_count(),
+            1,
+            "cleanup should remove geometries no longer referenced by CityObjects"
+        );
+    }
+
+    #[test]
+    fn build_tile_model_exports_legacy_features() {
         let dataset_dir = unique_test_dir("legacy");
         let features_dir = dataset_dir.join("features");
         fs::create_dir_all(&features_dir).expect("create features dir");
@@ -842,11 +1077,15 @@ mod tests {
         .expect("build legacy world");
         world.index_with_grid().expect("index legacy world");
         let quadtree = build_quadtree(&world);
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
+        let feature_ids = collect_tile_feature_ids(&world, &quadtree);
         let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+            build_tile_debug_cityjsonseq(&world, &feature_ids, &BTreeMap::new())
+                .expect("build debug cityjsonseq"),
         )
-        .expect("cityjsonseq utf8");
+        .expect("debug cityjsonseq utf8");
 
+        assert!(!model.cityobjects().is_empty());
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);
     }
@@ -873,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_ndjson_as_ndjson() {
+    fn build_tile_model_exports_cjindex_ndjson_directly() {
         let dataset_dir = unique_test_dir("cjindex-ndjson");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -919,17 +1158,14 @@ mod tests {
         }
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_ndjson_without_type_filter_as_ndjson() {
+    fn build_tile_model_exports_cjindex_ndjson_without_type_filter_directly() {
         let dataset_dir = unique_test_dir("cjindex-ndjson-unfiltered");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -960,17 +1196,14 @@ mod tests {
         .expect("build cjindex ndjson world");
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_cityjson_as_ndjson() {
+    fn build_tile_model_exports_cjindex_cityjson_directly() {
         let dataset_dir = unique_test_dir("cjindex-cityjson");
         let metadata: Value = serde_json::from_slice(
             &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
@@ -1014,12 +1247,9 @@ mod tests {
             .index_with_grid()
             .expect("index cjindex cityjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 }

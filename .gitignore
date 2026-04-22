@@ -11,7 +11,12 @@
 # misc
 /tmp
 
+# Test data
+/tests/output
+/cityjson-convert/tests/output/
+
 # Debug data
 *.tsv
 *.bincode
 *.log
+

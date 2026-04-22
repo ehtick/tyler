@@ -294,9 +294,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cityjson"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f8af66dd9e9145573db202b0e55d997555e05f2a74ad6ca1880e3b9e44b0317"
+version = "0.7.2"
 dependencies = [
  "num 0.4.3",
 ]
@@ -308,7 +306,7 @@ dependencies = [
  "anyhow",
  "cityjson-lib",
  "clap",
- "earcutr 0.5.0",
+ "earcutr",
  "env_logger 0.11.10",
  "gltf",
  "libc",
@@ -322,9 +320,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe50fec5e2c11d2df8193472d892d6b4c095054bbef9dc262fd21577be85d11b"
+checksum = "7a41ad2f98b989d5dcc8ab7f0b9b61970e191f84581731443d1fe41018d40dce"
 dependencies = [
  "cityjson-lib",
  "clap",
@@ -344,9 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cityjson-json"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af4cfa12e7dca180ead66390855cfb74bed0a89858fe88be8c7e7893938ad715"
+version = "0.7.3"
 dependencies = [
  "ahash",
  "cityjson",
@@ -357,9 +353,7 @@ dependencies = [
 
 [[package]]
 name = "cityjson-lib"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591192fe44a38662f26bc21e186996b86e9e7c54db42b94c93cc29d8ba8ec379"
+version = "0.6.1"
 dependencies = [
  "cityjson",
  "cityjson-json",
@@ -568,15 +562,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "earcutr"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46e5308a83caaa6ba82d78d30a93864294cba51d6c54a4566ff390633b7dde64"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "earcutr"
@@ -2603,16 +2588,13 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tyler"
 version = "0.4.1-alpha1"
 dependencies = [
- "anyhow",
  "bincode",
  "bitvec",
  "cityjson-convert",
  "cityjson-index",
  "cityjson-lib",
  "clap",
- "earcutr 0.2.0",
  "env_logger 0.10.2",
- "gltf",
  "libc",
  "log",
  "morton-encoding",
