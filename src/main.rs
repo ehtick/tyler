@@ -300,34 +300,31 @@ fn collect_tile_feature_ids(
     feature_ids
 }
 
-fn build_tile_cityjsonseq(
+fn read_tile_feature_models(
     world: &parser::World,
-    qtree_node: &spatial_structs::QuadTree,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut feature_output = Vec::new();
-    let feature_ids = collect_tile_feature_ids(world, qtree_node);
-
+    feature_ids: &[usize],
+) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
+    let mut models = Vec::with_capacity(feature_ids.len());
     match &world.input_source {
         parser::InputSource::LegacyFeatureFiles { features_root } => {
             for fid in feature_ids {
                 let parser::FeatureReference::LegacyPath(relative_path) =
-                    &world.features[fid].reference
+                    &world.features[*fid].reference
                 else {
                     return Err("legacy input unexpectedly referenced a cjindex feature".into());
                 };
                 let feature_path = features_root.join(relative_path);
-                let bytes = fs::read(&feature_path)?;
-                feature_output.write_all(&bytes)?;
-                if !bytes.ends_with(b"\n") {
-                    feature_output.write_all(b"\n")?;
-                }
+                models.push(cityjson_lib::json::staged::from_feature_file_with_base(
+                    &feature_path,
+                    &world.feature_base_document,
+                )?);
             }
         }
         parser::InputSource::CjIndexDataset { .. } => {
             let city_index = world.input_source.open_index()?;
             for fid in feature_ids {
                 let parser::FeatureReference::CjIndexId(feature_id) =
-                    &world.features[fid].reference
+                    &world.features[*fid].reference
                 else {
                     return Err(
                         "cjindex input unexpectedly referenced a legacy feature path".into(),
@@ -336,12 +333,41 @@ fn build_tile_cityjsonseq(
                 let model = city_index.get(feature_id)?.ok_or_else(|| {
                     format!("feature {feature_id} could not be resolved from cjindex")
                 })?;
-                cityjson_lib::json::to_feature_writer(&mut feature_output, &model)?;
-                feature_output.write_all(b"\n")?;
+                models.push(model);
             }
         }
     }
 
+    Ok(models)
+}
+
+fn build_tile_model_from_feature_ids(
+    world: &parser::World,
+    feature_ids: &[usize],
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let models = read_tile_feature_models(world, feature_ids)?;
+    Ok(cityjson_lib::ops::merge(models)?)
+}
+
+#[cfg(test)]
+fn build_tile_model(
+    world: &parser::World,
+    qtree_node: &spatial_structs::QuadTree,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let feature_ids = collect_tile_feature_ids(world, qtree_node);
+    build_tile_model_from_feature_ids(world, &feature_ids)
+}
+
+fn build_tile_debug_cityjsonseq(
+    world: &parser::World,
+    feature_ids: &[usize],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let models = read_tile_feature_models(world, feature_ids)?;
+    let mut feature_output = Vec::new();
+    for model in models {
+        cityjson_lib::json::to_feature_writer(&mut feature_output, &model)?;
+        feature_output.write_all(b"\n")?;
+    }
     Ok(feature_output)
 }
 
@@ -643,17 +669,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tileid_string = tileid.to_string();
             let file_name = tileid_string;
             let output_file = path_output_tiles.join(&file_name).with_extension("glb");
-            let cityjsonseq_bytes = match build_tile_cityjsonseq(&world, qtree_node) {
-                Ok(bytes) => bytes,
+            let feature_ids = collect_tile_feature_ids(&world, qtree_node);
+            let model = match build_tile_model_from_feature_ids(&world, &feature_ids) {
+                Ok(model) => model,
                 Err(error) => {
                     warn!(
-                        "Failed to build CityJSONFeature stream for tile {}: {}",
+                        "Failed to build CityJSON model for tile {}: {}",
                         tileid_grid, error
                     );
                     return Some(tile);
                 }
             };
             if cli.debug_tile_inputs {
+                let cityjsonseq_bytes = match build_tile_debug_cityjsonseq(&world, &feature_ids) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!(
+                            "Failed to build debug CityJSONFeature stream for tile {}: {}",
+                            tileid_grid, error
+                        );
+                        return Some(tile);
+                    }
+                };
                 if let Err(error) = write_debug_tile_input(
                     &path_features_input_dir,
                     file_name.as_str(),
@@ -666,16 +703,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(tile);
                 }
             }
-            let model = match cityjson_lib::json::merge_cityjsonseq_slice(&cityjsonseq_bytes) {
-                Ok(model) => model,
-                Err(error) => {
-                    warn!(
-                        "Failed to merge CityJSONFeature stream for tile {}: {}",
-                        tileid_grid, error
-                    );
-                    return Some(tile);
-                }
-            };
             if let Err(error) =
                 cityjson_convert::convert_to_glb(&model, &output_file, &export_options)
             {
@@ -821,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_legacy_features_as_ndjson() {
+    fn build_tile_model_exports_legacy_features() {
         let dataset_dir = unique_test_dir("legacy");
         let features_dir = dataset_dir.join("features");
         fs::create_dir_all(&features_dir).expect("create features dir");
@@ -842,11 +869,14 @@ mod tests {
         .expect("build legacy world");
         world.index_with_grid().expect("index legacy world");
         let quadtree = build_quadtree(&world);
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
+        let feature_ids = collect_tile_feature_ids(&world, &quadtree);
         let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
+            build_tile_debug_cityjsonseq(&world, &feature_ids).expect("build debug cityjsonseq"),
         )
-        .expect("cityjsonseq utf8");
+        .expect("debug cityjsonseq utf8");
 
+        assert!(!model.cityobjects().is_empty());
         assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
         assert_eq!(ndjson.lines().count(), 1);
     }
@@ -873,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_ndjson_as_ndjson() {
+    fn build_tile_model_exports_cjindex_ndjson_directly() {
         let dataset_dir = unique_test_dir("cjindex-ndjson");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -919,17 +949,14 @@ mod tests {
         }
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_ndjson_without_type_filter_as_ndjson() {
+    fn build_tile_model_exports_cjindex_ndjson_without_type_filter_directly() {
         let dataset_dir = unique_test_dir("cjindex-ndjson-unfiltered");
         let metadata =
             fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
@@ -960,17 +987,14 @@ mod tests {
         .expect("build cjindex ndjson world");
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 
     #[test]
-    fn build_tile_cityjsonseq_exports_cjindex_cityjson_as_ndjson() {
+    fn build_tile_model_exports_cjindex_cityjson_directly() {
         let dataset_dir = unique_test_dir("cjindex-cityjson");
         let metadata: Value = serde_json::from_slice(
             &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
@@ -1014,12 +1038,9 @@ mod tests {
             .index_with_grid()
             .expect("index cjindex cityjson world");
         let quadtree = build_quadtree(&world);
-        let ndjson = String::from_utf8(
-            build_tile_cityjsonseq(&world, &quadtree).expect("build tile cityjsonseq"),
-        )
-        .expect("cityjsonseq utf8");
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 }
