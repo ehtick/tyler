@@ -295,8 +295,6 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 [[package]]
 name = "cityjson"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f8af66dd9e9145573db202b0e55d997555e05f2a74ad6ca1880e3b9e44b0317"
 dependencies = [
  "num 0.4.3",
 ]
@@ -345,8 +343,6 @@ dependencies = [
 [[package]]
 name = "cityjson-json"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af4cfa12e7dca180ead66390855cfb74bed0a89858fe88be8c7e7893938ad715"
 dependencies = [
  "ahash",
  "cityjson",
@@ -358,8 +354,6 @@ dependencies = [
 [[package]]
 name = "cityjson-lib"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591192fe44a38662f26bc21e186996b86e9e7c54db42b94c93cc29d8ba8ec379"
 dependencies = [
  "cityjson",
  "cityjson-json",
