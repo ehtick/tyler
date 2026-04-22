@@ -55,6 +55,9 @@ pub struct Cli {
     /// Use the tile boundingVolume as the content boundingVolume, instead of calculating the content boundingVolume from the data.
     #[arg(long = "3dtiles-content-bv-from-tile")]
     pub cesium3dtiles_content_bv_from_tile: bool,
+    /// Clip tile content geometry to the tile bounding box before writing the GLB.
+    #[arg(long = "3dtiles-content-clip-to-tile-bounds")]
+    pub cesium3dtiles_content_clip_to_tile_bounds: bool,
     /// Add the boundingVolume of the content for the the tiles that have content.
     #[arg(long = "3dtiles-content-add-bv")]
     pub cesium3dtiles_content_add_bv: bool,

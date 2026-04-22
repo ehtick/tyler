@@ -109,6 +109,7 @@ fn build_glb_export_options(
     cli: &crate::cli::Cli,
     source_crs: Option<String>,
     ecef_origin: Option<[f64; 3]>,
+    clip_bbox: Option<[f64; 6]>,
 ) -> cityjson_convert::ExportOptions {
     let mut feature_type_colors = BTreeMap::new();
 
@@ -157,10 +158,11 @@ fn build_glb_export_options(
         feature_type_colors,
         source_crs,
         ecef_origin,
+        clip_bbox,
         reproject_to_ecef: true,
+        smooth_normals: cli.smooth_normals,
         quantize_geometry: true,
         meshopt_compression: true,
-        smooth_normals: cli.smooth_normals,
     }
 }
 
@@ -797,7 +799,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let source_crs = Some(format!("EPSG:{}", world.crs.to_epsg()?));
         let ecef_origin = Some(compute_root_ecef_origin(&world, &quadtree)?);
-        let export_options = build_glb_export_options(&cli, source_crs, ecef_origin);
+        let export_options = build_glb_export_options(&cli, source_crs, ecef_origin, None);
         let feature_type_lods = build_feature_type_lods(&cli);
         let tiles_len = tiles.len();
         let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
@@ -851,8 +853,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(tile);
                 }
             }
+            let mut tile_export_options = export_options.clone();
+            if cli.cesium3dtiles_content_clip_to_tile_bounds {
+                tile_export_options.clip_bbox = Some(qtree_node.bbox(&world.grid));
+            }
             if let Err(error) =
-                cityjson_convert::convert_to_glb(&model, &output_file, &export_options)
+                cityjson_convert::convert_to_glb(&model, &output_file, &tile_export_options)
             {
                 warn!("Tile {} conversion failed: {}", tileid_grid, error);
                 return Some(tile);

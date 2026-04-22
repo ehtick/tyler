@@ -5,15 +5,15 @@ _default:
 
 # Fast compile-time validation across the workspace.
 check:
-    cargo check --workspace --all-targets --all-features --exclude proj-sys
+    cargo check --workspace --all-targets --all-features
 
 # Build all workspace targets with all features enabled.
 build *args:
-    cargo build --workspace --all-targets --all-features --exclude proj-sys {{args}}
+    cargo build --workspace --all-targets --all-features {{args}}
 
 # Run clippy with strict lint settings across the workspace.
 lint:
-    cargo clippy --workspace --exclude proj-sys --no-deps -- -Dclippy::all -Dclippy::pedantic
+    RUSTFLAGS='-Dclippy::all -Dclippy::pedantic' RUSTC_WORKSPACE_WRAPPER="$(command -v clippy-driver)" cargo check --workspace --all-targets --all-features
 
 # Format the workspace with rustfmt.
 fmt:
@@ -25,7 +25,7 @@ fmt-check:
 
 # Run the workspace tests with all features enabled.
 test:
-    cargo test --workspace --all-targets --all-features --exclude proj-sys
+    cargo test --workspace --all-targets --all-features
 
 # Clean the workspace by removing all build artifacts and test artifacts.
 clean:

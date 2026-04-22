@@ -91,7 +91,8 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     options: &ExportOptions,
 ) -> Result<()> {
     let coordinate_transform = CoordinateTransform::from_model(model, options)?;
-    let mut collector = MeshCollector::new(coordinate_transform, options.smooth_normals);
+    let mut collector =
+        MeshCollector::new(coordinate_transform, options.smooth_normals, options.clip_bbox);
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -298,8 +299,28 @@ struct FeatureRecord {
     attributes: BTreeMap<String, MetadataValue>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceTriangle {
+    feature_id: u32,
+    source_positions: [[f64; 3]; 3],
+    local_positions: [[f32; 3]; 3],
+    face_normal: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClipVertex {
+    source_position: [f64; 3],
+    barycentric: [f32; 3],
+}
+
 #[derive(Default)]
 struct RawPrimitiveMesh {
+    triangles: Vec<SourceTriangle>,
+    source_vertex_normals: HashMap<SmoothVertexKey, [f32; 3]>,
+}
+
+#[derive(Default)]
+struct BuiltPrimitiveMesh {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
 }
@@ -323,6 +344,7 @@ struct MeshCollector {
     primitives: BTreeMap<String, RawPrimitiveMesh>,
     coordinate_transform: CoordinateTransform,
     smooth_normals: bool,
+    clip_bbox: Option<[f64; 6]>,
 }
 
 struct CoordinateTransform {
@@ -524,24 +546,21 @@ impl CoordinateTransform {
         })
     }
 
-    fn transform_vertex(&self, vertex_id: u32, model: &CityModel) -> Result<[f32; 3]> {
-        let vertex = model
-            .get_vertex(VertexIndex::new(vertex_id))
-            .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_id}"))?;
-        let [x, y, z] = vertex.to_array();
+    fn transform_position(&self, position: [f64; 3]) -> Result<[f32; 3]> {
+        let [x, y, z] = position;
         let position = if let Some(transformer) = &self.vertex_transformer {
             let transformed = transformer
                 .convert((x, y, z))
-                .with_context(|| format!("failed to project vertex {vertex_id} to ECEF"))?;
+                .context("failed to project position to ECEF")?;
             [transformed.0, transformed.1, transformed.2]
         } else {
             [x, y, z]
         };
 
         Ok([
-            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", Some(vertex_id))?,
-            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", Some(vertex_id))?,
-            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", Some(vertex_id))?,
+            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", None)?,
+            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", None)?,
+            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", None)?,
         ])
     }
 }
@@ -635,12 +654,17 @@ fn f64_to_f32_checked(value: f64, axis: &str, vertex_id: Option<u32>) -> Result<
 }
 
 impl MeshCollector {
-    fn new(coordinate_transform: CoordinateTransform, smooth_normals: bool) -> Self {
+    fn new(
+        coordinate_transform: CoordinateTransform,
+        smooth_normals: bool,
+        clip_bbox: Option<[f64; 6]>,
+    ) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),
             coordinate_transform,
             smooth_normals,
+            clip_bbox,
         }
     }
 
@@ -726,6 +750,7 @@ impl MeshCollector {
             return Ok(());
         }
 
+        let mut source_positions: Vec<[f64; 3]> = Vec::new();
         let mut local_positions: Vec<[f32; 3]> = Vec::new();
         let mut flat_coords: Vec<f64> = Vec::new();
         let mut hole_indices: Vec<usize> = Vec::new();
@@ -740,10 +765,15 @@ impl MeshCollector {
             }
 
             for &vertex_id in ring {
-                let position = self
+                let vertex = model
+                    .get_vertex(VertexIndex::new(vertex_id))
+                    .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_id}"))?;
+                let source_position = vertex.to_array();
+                let local_position = self
                     .coordinate_transform
-                    .transform_vertex(vertex_id, model)?;
-                local_positions.push(position);
+                    .transform_position(source_position)?;
+                source_positions.push(source_position);
+                local_positions.push(local_position);
                 vertex_count += 1;
             }
         }
@@ -777,21 +807,27 @@ impl MeshCollector {
         }
 
         let primitive = self.primitives.entry(feature_type.to_string()).or_default();
-        if self.smooth_normals {
-            primitive.emit_triangles_smooth(
+        for tri in triangulated.chunks_exact(3) {
+            let source_triangle = [
+                source_positions[tri[0]],
+                source_positions[tri[1]],
+                source_positions[tri[2]],
+            ];
+            let local_triangle = [
+                local_positions[tri[0]],
+                local_positions[tri[1]],
+                local_positions[tri[2]],
+            ];
+            primitive.add_triangle(
                 feature_id,
-                &local_positions,
-                &triangulated,
+                source_triangle,
+                local_triangle,
                 Self::compute_face_normal,
-            )
-        } else {
-            primitive.emit_triangles_flat(
-                feature_id,
-                &local_positions,
-                &triangulated,
-                Self::compute_face_normal,
-            )
+                self.smooth_normals,
+            );
         }
+
+        Ok(())
     }
 
     fn collect_feature_attributes(
@@ -929,88 +965,188 @@ impl MeshCollector {
 }
 
 impl RawPrimitiveMesh {
-    fn emit_triangles_flat<F>(
+    fn add_triangle<F>(
         &mut self,
         feature_id: u32,
-        positions: &[[f32; 3]],
-        triangulated: &[usize],
+        source_positions: [[f64; 3]; 3],
+        local_positions: [[f32; 3]; 3],
         compute_face_normal: F,
-    ) -> Result<()>
-    where
+        smooth_normals: bool,
+    ) where
         F: Fn([f32; 3], [f32; 3], [f32; 3]) -> [f32; 3],
     {
-        for tri in triangulated.chunks_exact(3) {
-            let p0 = positions[tri[0]];
-            let p1 = positions[tri[1]];
-            let p2 = positions[tri[2]];
-            let normal = compute_face_normal(p0, p1, p2);
+        let face_normal =
+            compute_face_normal(local_positions[0], local_positions[1], local_positions[2]);
+        self.triangles.push(SourceTriangle {
+            feature_id,
+            source_positions,
+            local_positions,
+            face_normal,
+        });
 
-            let base_index =
-                u32::try_from(self.vertices.len()).context("GLB vertex count exceeds u32 range")?;
-            self.vertices.push(Vertex {
-                position: p0,
-                normal,
-                feature_id,
-            });
-            self.vertices.push(Vertex {
-                position: p1,
-                normal,
-                feature_id,
-            });
-            self.vertices.push(Vertex {
-                position: p2,
-                normal,
-                feature_id,
-            });
-            self.indices
-                .extend_from_slice(&[base_index, base_index + 1, base_index + 2]);
+        if !smooth_normals {
+            return;
         }
 
-        Ok(())
+        for position in local_positions {
+            let key = SmoothVertexKey::new(position, feature_id);
+            let entry = self.source_vertex_normals.entry(key).or_insert([0.0; 3]);
+            entry[0] += face_normal[0];
+            entry[1] += face_normal[1];
+            entry[2] += face_normal[2];
+        }
     }
 
-    fn emit_triangles_smooth<F>(
-        &mut self,
-        feature_id: u32,
-        positions: &[[f32; 3]],
-        triangulated: &[usize],
-        compute_face_normal: F,
-    ) -> Result<()>
-    where
-        F: Fn([f32; 3], [f32; 3], [f32; 3]) -> [f32; 3],
-    {
+    fn build(
+        &self,
+        coordinate_transform: &CoordinateTransform,
+        smooth_normals: bool,
+        clip_bbox: Option<[f64; 6]>,
+    ) -> Result<BuiltPrimitiveMesh> {
+        let mut built = BuiltPrimitiveMesh::default();
+        let source_vertex_normals = smooth_normals.then(|| self.normalized_source_vertex_normals());
         let mut vertex_map = HashMap::new();
-        for (index, vertex) in self.vertices.iter().enumerate() {
-            vertex_map.insert(
-                SmoothVertexKey::new(vertex.position, vertex.feature_id),
-                index,
-            );
-        }
 
-        for tri in triangulated.chunks_exact(3) {
-            let p0 = positions[tri[0]];
-            let p1 = positions[tri[1]];
-            let p2 = positions[tri[2]];
-            let normal = compute_face_normal(p0, p1, p2);
+        for triangle in &self.triangles {
+            let clipped_triangles = if let Some(bbox) = clip_bbox {
+                Self::clip_triangle_to_bbox(triangle.source_positions, bbox)
+            } else {
+                vec![[
+                    ClipVertex {
+                        source_position: triangle.source_positions[0],
+                        barycentric: [1.0, 0.0, 0.0],
+                    },
+                    ClipVertex {
+                        source_position: triangle.source_positions[1],
+                        barycentric: [0.0, 1.0, 0.0],
+                    },
+                    ClipVertex {
+                        source_position: triangle.source_positions[2],
+                        barycentric: [0.0, 0.0, 1.0],
+                    },
+                ]]
+            };
 
-            for position in [p0, p1, p2] {
-                let vertex_index =
-                    self.vertex_index_for_position(position, feature_id, &mut vertex_map);
-                self.vertices[vertex_index].normal[0] += normal[0];
-                self.vertices[vertex_index].normal[1] += normal[1];
-                self.vertices[vertex_index].normal[2] += normal[2];
-                self.indices.push(
-                    u32::try_from(vertex_index).context("GLB vertex count exceeds u32 range")?,
-                );
+            let source_keys = triangle
+                .local_positions
+                .map(|position| SmoothVertexKey::new(position, triangle.feature_id));
+
+            for clipped_triangle in clipped_triangles {
+                let mut positions = [[0.0; 3]; 3];
+                let mut normals = [[0.0; 3]; 3];
+
+                for corner in 0..3 {
+                    let clipped_corner = clipped_triangle[corner];
+                    positions[corner] = if clip_bbox.is_some() {
+                        coordinate_transform.transform_position(clipped_corner.source_position)?
+                    } else {
+                        triangle.local_positions[corner]
+                    };
+                    normals[corner] = if let Some(source_vertex_normals) = &source_vertex_normals {
+                        let interpolated = interpolate_normal(
+                            clipped_corner.barycentric,
+                            source_keys,
+                            source_vertex_normals,
+                        );
+                        normalize_vector(interpolated)
+                    } else {
+                        triangle.face_normal
+                    };
+                }
+
+                if is_degenerate_triangle(positions) {
+                    continue;
+                }
+
+                if smooth_normals {
+                    for corner in 0..3 {
+                        let vertex_index = built.vertex_index_for_position(
+                            positions[corner],
+                            normals[corner],
+                            triangle.feature_id,
+                            &mut vertex_map,
+                        );
+                        built.indices.push(
+                            u32::try_from(vertex_index)
+                                .context("GLB vertex count exceeds u32 range")?,
+                        );
+                    }
+                } else {
+                    let base_index = u32::try_from(built.vertices.len())
+                        .context("GLB vertex count exceeds u32 range")?;
+                    for corner in 0..3 {
+                        built.vertices.push(Vertex {
+                            position: positions[corner],
+                            normal: normals[corner],
+                            feature_id: triangle.feature_id,
+                        });
+                    }
+                    built
+                        .indices
+                        .extend_from_slice(&[base_index, base_index + 1, base_index + 2]);
+                }
             }
         }
 
-        Ok(())
+        Ok(built)
     }
 
+    fn normalized_source_vertex_normals(&self) -> HashMap<SmoothVertexKey, [f32; 3]> {
+        self.source_vertex_normals
+            .iter()
+            .map(|(key, normal)| (*key, normalize_vector(*normal)))
+            .collect()
+    }
+
+    fn clip_triangle_to_bbox(triangle: [[f64; 3]; 3], bbox: [f64; 6]) -> Vec<[ClipVertex; 3]> {
+        let mut polygon = vec![
+            ClipVertex {
+                source_position: triangle[0],
+                barycentric: [1.0, 0.0, 0.0],
+            },
+            ClipVertex {
+                source_position: triangle[1],
+                barycentric: [0.0, 1.0, 0.0],
+            },
+            ClipVertex {
+                source_position: triangle[2],
+                barycentric: [0.0, 0.0, 1.0],
+            },
+        ];
+
+        for (axis, boundary, keep_less_equal) in [
+            (0, bbox[0], false),
+            (0, bbox[3], true),
+            (1, bbox[1], false),
+            (1, bbox[4], true),
+            (2, bbox[2], false),
+            (2, bbox[5], true),
+        ] {
+            polygon = clip_polygon_against_plane(polygon, axis, boundary, keep_less_equal);
+            if polygon.len() < 3 {
+                return Vec::new();
+            }
+        }
+
+        let mut triangles = Vec::with_capacity(polygon.len().saturating_sub(2));
+        for index in 1..polygon.len() - 1 {
+            let clipped_triangle = [polygon[0], polygon[index], polygon[index + 1]];
+            if is_degenerate_source_triangle(clipped_triangle.map(|vertex| vertex.source_position))
+            {
+                continue;
+            }
+            triangles.push(clipped_triangle);
+        }
+
+        triangles
+    }
+}
+
+impl BuiltPrimitiveMesh {
     fn vertex_index_for_position(
         &mut self,
         position: [f32; 3],
+        normal: [f32; 3],
         feature_id: u32,
         vertex_map: &mut HashMap<SmoothVertexKey, usize>,
     ) -> usize {
@@ -1022,27 +1158,11 @@ impl RawPrimitiveMesh {
         let index = self.vertices.len();
         self.vertices.push(Vertex {
             position,
-            normal: [0.0; 3],
+            normal,
             feature_id,
         });
         vertex_map.insert(key, index);
         index
-    }
-
-    fn normalize_normals(&mut self) {
-        for vertex in &mut self.vertices {
-            let length = (vertex.normal[0] * vertex.normal[0]
-                + vertex.normal[1] * vertex.normal[1]
-                + vertex.normal[2] * vertex.normal[2])
-                .sqrt();
-            if length > f32::EPSILON {
-                vertex.normal[0] /= length;
-                vertex.normal[1] /= length;
-                vertex.normal[2] /= length;
-            } else {
-                vertex.normal = [0.0, 0.0, 1.0];
-            }
-        }
     }
 
     fn optimize(&mut self) -> Result<()> {
@@ -1074,14 +1194,163 @@ impl RawPrimitiveMesh {
     }
 }
 
+fn interpolate_normal(
+    barycentric: [f32; 3],
+    keys: [SmoothVertexKey; 3],
+    source_vertex_normals: &HashMap<SmoothVertexKey, [f32; 3]>,
+) -> [f32; 3] {
+    let normals = keys.map(|key| {
+        source_vertex_normals
+            .get(&key)
+            .copied()
+            .unwrap_or([0.0, 0.0, 1.0])
+    });
+    [
+        barycentric[0] * normals[0][0]
+            + barycentric[1] * normals[1][0]
+            + barycentric[2] * normals[2][0],
+        barycentric[0] * normals[0][1]
+            + barycentric[1] * normals[1][1]
+            + barycentric[2] * normals[2][1],
+        barycentric[0] * normals[0][2]
+            + barycentric[1] * normals[1][2]
+            + barycentric[2] * normals[2][2],
+    ]
+}
+
+fn normalize_vector(vector: [f32; 3]) -> [f32; 3] {
+    let length = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+    if length > f32::EPSILON {
+        [vector[0] / length, vector[1] / length, vector[2] / length]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
+fn clip_polygon_against_plane(
+    polygon: Vec<ClipVertex>,
+    axis: usize,
+    boundary: f64,
+    keep_less_equal: bool,
+) -> Vec<ClipVertex> {
+    if polygon.is_empty() {
+        return polygon;
+    }
+
+    let mut clipped = Vec::new();
+    let epsilon = 1.0e-9_f64;
+
+    for index in 0..polygon.len() {
+        let current = polygon[index];
+        let next = polygon[(index + 1) % polygon.len()];
+        let current_distance = current.source_position[axis] - boundary;
+        let next_distance = next.source_position[axis] - boundary;
+        let current_inside = if keep_less_equal {
+            current_distance <= epsilon
+        } else {
+            current_distance >= -epsilon
+        };
+        let next_inside = if keep_less_equal {
+            next_distance <= epsilon
+        } else {
+            next_distance >= -epsilon
+        };
+
+        if current_inside && next_inside {
+            clipped.push(next);
+            continue;
+        }
+
+        if current_inside != next_inside {
+            let delta = next.source_position[axis] - current.source_position[axis];
+            if delta.abs() > epsilon {
+                let t = (boundary - current.source_position[axis]) / delta;
+                clipped.push(interpolate_clip_vertex(current, next, t));
+            }
+        }
+
+        if !current_inside && next_inside {
+            clipped.push(next);
+        }
+    }
+
+    clipped
+}
+
+fn interpolate_clip_vertex(start: ClipVertex, end: ClipVertex, t: f64) -> ClipVertex {
+    let tf32 = t as f32;
+    ClipVertex {
+        source_position: [
+            start.source_position[0] + (end.source_position[0] - start.source_position[0]) * t,
+            start.source_position[1] + (end.source_position[1] - start.source_position[1]) * t,
+            start.source_position[2] + (end.source_position[2] - start.source_position[2]) * t,
+        ],
+        barycentric: [
+            start.barycentric[0] + (end.barycentric[0] - start.barycentric[0]) * tf32,
+            start.barycentric[1] + (end.barycentric[1] - start.barycentric[1]) * tf32,
+            start.barycentric[2] + (end.barycentric[2] - start.barycentric[2]) * tf32,
+        ],
+    }
+}
+
+fn is_degenerate_source_triangle(points: [[f64; 3]; 3]) -> bool {
+    let u = [
+        points[1][0] - points[0][0],
+        points[1][1] - points[0][1],
+        points[1][2] - points[0][2],
+    ];
+    let v = [
+        points[2][0] - points[0][0],
+        points[2][1] - points[0][1],
+        points[2][2] - points[0][2],
+    ];
+    let cross = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let area_sq = cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+    area_sq <= 1.0e-18
+}
+
+fn is_degenerate_triangle(points: [[f32; 3]; 3]) -> bool {
+    let u = [
+        points[1][0] - points[0][0],
+        points[1][1] - points[0][1],
+        points[1][2] - points[0][2],
+    ];
+    let v = [
+        points[2][0] - points[0][0],
+        points[2][1] - points[0][1],
+        points[2][2] - points[0][2],
+    ];
+    let cross = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    let area_sq = cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+    area_sq <= 1.0e-12
+}
+
 impl ProcessedScene {
     fn from_collector(collector: MeshCollector) -> Result<Self> {
         let MeshCollector {
             features,
-            mut primitives,
+            primitives,
             coordinate_transform,
+            smooth_normals,
+            clip_bbox,
             ..
         } = collector;
+        let mut primitives: BTreeMap<String, BuiltPrimitiveMesh> = primitives
+            .into_iter()
+            .map(|(feature_type, primitive)| {
+                primitive
+                    .build(&coordinate_transform, smooth_normals, clip_bbox)
+                    .map(|built| (feature_type, built))
+            })
+            .collect::<Result<_>>()?;
         let mut bounds = Bounds::empty();
         let mut has_vertices = false;
         for primitive in primitives.values() {
@@ -1097,7 +1366,6 @@ impl ProcessedScene {
             [0.0; 3]
         };
         for primitive in primitives.values_mut() {
-            primitive.normalize_normals();
             for vertex in &mut primitive.vertices {
                 vertex.position[0] -= center[0];
                 vertex.position[1] -= center[1];
