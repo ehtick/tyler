@@ -91,8 +91,11 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     options: &ExportOptions,
 ) -> Result<()> {
     let coordinate_transform = CoordinateTransform::from_model(model, options)?;
-    let mut collector =
-        MeshCollector::new(coordinate_transform, options.smooth_normals, options.clip_bbox);
+    let mut collector = MeshCollector::new(
+        coordinate_transform,
+        options.smooth_normals,
+        options.clip_bbox,
+    );
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -1277,6 +1280,7 @@ fn clip_polygon_against_plane(
     clipped
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn interpolate_clip_vertex(start: ClipVertex, end: ClipVertex, t: f64) -> ClipVertex {
     let tf32 = t as f32;
     ClipVertex {

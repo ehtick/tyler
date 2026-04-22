@@ -30,6 +30,7 @@ fn read_glb_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(&bytes[20..20 + json_length]).expect("GLB JSON chunk should parse")
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn read_glb_bin(bytes: &[u8]) -> &[u8] {
     let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     let bin_header_offset = 20 + json_length;
@@ -45,6 +46,7 @@ fn read_glb_bin(bytes: &[u8]) -> &[u8] {
     &bytes[bin_header_offset + 8..bin_header_offset + 8 + bin_length]
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn read_f32_vec3_accessor(root: &Value, bin: &[u8], accessor_index: usize) -> Vec<[f32; 3]> {
     let accessor = &root["accessors"][accessor_index];
     assert_eq!(accessor["componentType"].as_u64().unwrap(), 5126);
@@ -83,6 +85,7 @@ fn normalize(vector: [f32; 3]) -> [f32; 3] {
     [vector[0] / length, vector[1] / length, vector[2] / length]
 }
 
+#[allow(clippy::uninlined_format_args)]
 fn assert_vec3_approx_eq(actual: [f32; 3], expected: [f32; 3]) {
     for axis in 0..3 {
         assert!(
