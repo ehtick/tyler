@@ -1004,7 +1004,7 @@ impl RawPrimitiveMesh {
 
             for position in [p0, p1, p2] {
                 let vertex_index =
-                    self.vertex_index_for_position(position, feature_id, &mut vertex_map)?;
+                    self.vertex_index_for_position(position, feature_id, &mut vertex_map);
                 self.vertices[vertex_index].normal[0] += normal[0];
                 self.vertices[vertex_index].normal[1] += normal[1];
                 self.vertices[vertex_index].normal[2] += normal[2];
@@ -1022,10 +1022,10 @@ impl RawPrimitiveMesh {
         position: [f32; 3],
         feature_id: u32,
         vertex_map: &mut HashMap<SmoothVertexKey, usize>,
-    ) -> Result<usize> {
+    ) -> usize {
         let key = SmoothVertexKey::new(position, feature_id);
         if let Some(index) = vertex_map.get(&key).copied() {
-            return Ok(index);
+            return index;
         }
 
         let index = self.vertices.len();
@@ -1035,7 +1035,7 @@ impl RawPrimitiveMesh {
             feature_id,
         });
         vertex_map.insert(key, index);
-        Ok(index)
+        index
     }
 
     fn normalize_normals(&mut self) {

@@ -22,6 +22,7 @@ use cityjson_lib::CityModel;
 use log::info;
 
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExportOptions {
     pub native_glb_color: String,
     pub metadata_class_name: String,
