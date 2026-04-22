@@ -31,6 +31,7 @@ test:
 clean:
     cargo clean
     rm -rf tests/output
+    rm -rf cityjson-convert/tests/output
 
 # Run the full local validation sequence.
 ci:
