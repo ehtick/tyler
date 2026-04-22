@@ -91,9 +91,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     options: &ExportOptions,
 ) -> Result<()> {
     let coordinate_transform = CoordinateTransform::from_model(model, options)?;
-    let mut collector = MeshCollector::new(coordinate_transform,
-        options.smooth_normals,
-    );
+    let mut collector = MeshCollector::new(coordinate_transform, options.smooth_normals);
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -637,10 +635,7 @@ fn f64_to_f32_checked(value: f64, axis: &str, vertex_id: Option<u32>) -> Result<
 }
 
 impl MeshCollector {
-    fn new(
-        coordinate_transform: CoordinateTransform,
-        smooth_normals: bool
-    ) -> Self {
+    fn new(coordinate_transform: CoordinateTransform, smooth_normals: bool) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),

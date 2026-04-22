@@ -160,6 +160,7 @@ fn build_glb_export_options(
         reproject_to_ecef: true,
         quantize_geometry: true,
         meshopt_compression: true,
+        smooth_normals: cli.smooth_normals,
     }
 }
 
