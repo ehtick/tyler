@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
@@ -91,8 +91,11 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
     options: &ExportOptions,
 ) -> Result<()> {
     let coordinate_transform = CoordinateTransform::from_model(model, options)?;
-    let mut collector =
-        MeshCollector::with_lod_filter(options.feature_type_lods.clone(), coordinate_transform);
+    let mut collector = MeshCollector::with_lod_filter(
+        options.feature_type_lods.clone(),
+        coordinate_transform,
+        options.smooth_normals,
+    );
     collector.add_model(model)?;
     let processed = collector.finish()?;
     info!(
@@ -324,12 +327,19 @@ struct MeshCollector {
     primitives: BTreeMap<String, RawPrimitiveMesh>,
     feature_type_lods: BTreeMap<String, String>,
     coordinate_transform: CoordinateTransform,
+    smooth_normals: bool,
 }
 
 struct CoordinateTransform {
     vertex_transformer: Option<Proj>,
     storage_origin: [f64; 3],
     node_translation_base: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SmoothVertexKey {
+    position_bits: [u32; 3],
+    feature_id: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -448,6 +458,15 @@ struct QuantizedScene {
     position_scale: f32,
     center: [f32; 3],
     features: Vec<FeatureRecord>,
+}
+
+impl SmoothVertexKey {
+    fn new(position: [f32; 3], feature_id: u32) -> Self {
+        Self {
+            position_bits: position.map(f32::to_bits),
+            feature_id,
+        }
+    }
 }
 
 impl CoordinateTransform {
@@ -614,12 +633,14 @@ impl MeshCollector {
     fn with_lod_filter(
         feature_type_lods: BTreeMap<String, String>,
         coordinate_transform: CoordinateTransform,
+        smooth_normals: bool,
     ) -> Self {
         Self {
             features: Vec::new(),
             primitives: BTreeMap::new(),
             feature_type_lods,
             coordinate_transform,
+            smooth_normals,
         }
     }
 
@@ -764,15 +785,22 @@ impl MeshCollector {
             return Ok(());
         }
 
-        self.primitives
-            .entry(feature_type.to_string())
-            .or_default()
-            .emit_triangles(
+        let primitive = self.primitives.entry(feature_type.to_string()).or_default();
+        if self.smooth_normals {
+            primitive.emit_triangles_smooth(
                 feature_id,
                 &local_positions,
                 &triangulated,
                 Self::compute_face_normal,
             )
+        } else {
+            primitive.emit_triangles_flat(
+                feature_id,
+                &local_positions,
+                &triangulated,
+                Self::compute_face_normal,
+            )
+        }
     }
 
     fn collect_feature_attributes(
@@ -910,7 +938,7 @@ impl MeshCollector {
 }
 
 impl RawPrimitiveMesh {
-    fn emit_triangles<F>(
+    fn emit_triangles_flat<F>(
         &mut self,
         feature_id: u32,
         positions: &[[f32; 3]],
@@ -948,6 +976,82 @@ impl RawPrimitiveMesh {
         }
 
         Ok(())
+    }
+
+    fn emit_triangles_smooth<F>(
+        &mut self,
+        feature_id: u32,
+        positions: &[[f32; 3]],
+        triangulated: &[usize],
+        compute_face_normal: F,
+    ) -> Result<()>
+    where
+        F: Fn([f32; 3], [f32; 3], [f32; 3]) -> [f32; 3],
+    {
+        let mut vertex_map = HashMap::new();
+        for (index, vertex) in self.vertices.iter().enumerate() {
+            vertex_map.insert(
+                SmoothVertexKey::new(vertex.position, vertex.feature_id),
+                index,
+            );
+        }
+
+        for tri in triangulated.chunks_exact(3) {
+            let p0 = positions[tri[0]];
+            let p1 = positions[tri[1]];
+            let p2 = positions[tri[2]];
+            let normal = compute_face_normal(p0, p1, p2);
+
+            for position in [p0, p1, p2] {
+                let vertex_index =
+                    self.vertex_index_for_position(position, feature_id, &mut vertex_map);
+                self.vertices[vertex_index].normal[0] += normal[0];
+                self.vertices[vertex_index].normal[1] += normal[1];
+                self.vertices[vertex_index].normal[2] += normal[2];
+                self.indices.push(
+                    u32::try_from(vertex_index).context("GLB vertex count exceeds u32 range")?,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn vertex_index_for_position(
+        &mut self,
+        position: [f32; 3],
+        feature_id: u32,
+        vertex_map: &mut HashMap<SmoothVertexKey, usize>,
+    ) -> usize {
+        let key = SmoothVertexKey::new(position, feature_id);
+        if let Some(index) = vertex_map.get(&key).copied() {
+            return index;
+        }
+
+        let index = self.vertices.len();
+        self.vertices.push(Vertex {
+            position,
+            normal: [0.0; 3],
+            feature_id,
+        });
+        vertex_map.insert(key, index);
+        index
+    }
+
+    fn normalize_normals(&mut self) {
+        for vertex in &mut self.vertices {
+            let length = (vertex.normal[0] * vertex.normal[0]
+                + vertex.normal[1] * vertex.normal[1]
+                + vertex.normal[2] * vertex.normal[2])
+                .sqrt();
+            if length > f32::EPSILON {
+                vertex.normal[0] /= length;
+                vertex.normal[1] /= length;
+                vertex.normal[2] /= length;
+            } else {
+                vertex.normal = [0.0, 0.0, 1.0];
+            }
+        }
     }
 
     fn optimize(&mut self) -> Result<()> {
@@ -1002,6 +1106,7 @@ impl ProcessedScene {
             [0.0; 3]
         };
         for primitive in primitives.values_mut() {
+            primitive.normalize_normals();
             for vertex in &mut primitive.vertices {
                 vertex.position[0] -= center[0];
                 vertex.position[1] -= center[1];

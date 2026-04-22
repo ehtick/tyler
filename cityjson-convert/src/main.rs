@@ -20,6 +20,9 @@ struct Cli {
     /// Disable geometry quantization in the generated GLB.
     #[arg(long = "no-quantization", default_value_t = false)]
     no_quantization: bool,
+    /// Share vertices and average incident face normals.
+    #[arg(long = "smooth-normals", default_value_t = false)]
+    smooth_normals: bool,
     /// Disable `EXT_meshopt_compression` in the generated GLB.
     #[arg(long = "no-meshopt-compression", default_value_t = false)]
     no_meshopt_compression: bool,
@@ -41,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         source_crs: None,
         ecef_origin: None,
         reproject_to_ecef: true,
+        smooth_normals: cli.smooth_normals,
         quantize_geometry: !cli.no_quantization,
         meshopt_compression: !cli.no_meshopt_compression,
     };
