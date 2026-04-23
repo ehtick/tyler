@@ -322,9 +322,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a41ad2f98b989d5dcc8ab7f0b9b61970e191f84581731443d1fe41018d40dce"
+checksum = "8fc10d4949fe45887025cb038c9cbea212ad717d9911baa894c274918f87d024"
 dependencies = [
  "cityjson-lib",
  "clap",
