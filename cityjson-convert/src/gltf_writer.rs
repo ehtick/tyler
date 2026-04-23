@@ -7,13 +7,13 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::proj::Proj;
-use crate::ExportOptions;
+use crate::{ExportOptions, GeometryPlacement};
 use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
-use log::{info, warn};
+use log::info;
 use meshopt::{
     encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
     optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
@@ -351,9 +351,23 @@ struct MeshCollector {
 }
 
 struct CoordinateTransform {
-    vertex_transformer: Option<Proj>,
-    storage_origin: [f64; 3],
+    placement: CoordinatePlacement,
     node_translation_base: [f32; 3],
+}
+
+enum CoordinatePlacement {
+    SourceCoordinates,
+    EcefRelative {
+        vertex_transformer: Option<Proj>,
+        origin: [f64; 3],
+    },
+    Enu {
+        vertex_transformer: Option<Proj>,
+        ecef_origin: [f64; 3],
+        east: [f64; 3],
+        north: [f64; 3],
+        up: [f64; 3],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -490,90 +504,81 @@ impl SmoothVertexKey {
 }
 
 impl CoordinateTransform {
-    fn from_model(model: &CityModel, options: &ExportOptions) -> Result<Self> {
-        if !options.reproject_to_ecef {
-            return Ok(Self {
-                vertex_transformer: None,
-                storage_origin: [0.0; 3],
-                node_translation_base: [0.0; 3],
-            });
-        }
-
-        let Some(source_crs) = options
-            .source_crs
-            .clone()
-            .or_else(|| source_crs_from_model(model))
-        else {
-            warn!("CityJSON source CRS is missing, skipping ECEF reprojection");
-            return Ok(Self {
-                vertex_transformer: None,
-                storage_origin: [0.0; 3],
-                node_translation_base: [0.0; 3],
-            });
+    fn from_model(_model: &CityModel, options: &ExportOptions) -> Result<Self> {
+        let placement = match &options.geometry_placement {
+            GeometryPlacement::SourceCoordinates => CoordinatePlacement::SourceCoordinates,
+            GeometryPlacement::EcefRelative { source_crs, origin } => {
+                let source_crs = canonical_epsg_crs(source_crs)?;
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
+                CoordinatePlacement::EcefRelative {
+                    vertex_transformer,
+                    origin: *origin,
+                }
+            }
+            GeometryPlacement::Enu {
+                source_crs,
+                ecef_origin,
+                east,
+                north,
+                up,
+            } => {
+                let source_crs = canonical_epsg_crs(source_crs)?;
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
+                CoordinatePlacement::Enu {
+                    vertex_transformer,
+                    ecef_origin: *ecef_origin,
+                    east: *east,
+                    north: *north,
+                    up: *up,
+                }
+            }
         };
-
-        let source_crs = canonical_epsg_crs(&source_crs)?;
-        let vertex_transformer = (source_crs != "EPSG:4978")
-            .then(|| Proj::new_known_crs(&source_crs, "EPSG:4978", None))
-            .transpose()
-            .context("failed to create source CRS to ECEF transform")?;
-
-        let storage_origin = if let Some(origin) = options.ecef_origin {
-            origin
-        } else {
-            compute_storage_origin(model, vertex_transformer.as_ref())?
-        };
-        let tileset_origin = options.ecef_origin.unwrap_or([0.0; 3]);
-        let node_translation_base = [
-            f64_to_f32_checked(
-                storage_origin[0] - tileset_origin[0],
-                "ecef translation x",
-                None,
-            )?,
-            f64_to_f32_checked(
-                storage_origin[1] - tileset_origin[1],
-                "ecef translation y",
-                None,
-            )?,
-            f64_to_f32_checked(
-                storage_origin[2] - tileset_origin[2],
-                "ecef translation z",
-                None,
-            )?,
-        ];
 
         Ok(Self {
-            vertex_transformer,
-            storage_origin,
-            node_translation_base,
+            placement,
+            node_translation_base: [0.0; 3],
         })
     }
 
     fn transform_position(&self, position: [f64; 3]) -> Result<[f32; 3]> {
-        let [x, y, z] = position;
-        let position = if let Some(transformer) = &self.vertex_transformer {
-            let transformed = transformer
-                .convert((x, y, z))
-                .context("failed to project position to ECEF")?;
-            [transformed.0, transformed.1, transformed.2]
-        } else {
-            [x, y, z]
-        };
-
-        Ok([
-            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", None)?,
-            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", None)?,
-            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", None)?,
-        ])
+        match &self.placement {
+            CoordinatePlacement::SourceCoordinates => Ok([
+                f64_to_f32_checked(position[0], "x", None)?,
+                f64_to_f32_checked(position[1], "y", None)?,
+                f64_to_f32_checked(position[2], "z", None)?,
+            ]),
+            CoordinatePlacement::EcefRelative {
+                vertex_transformer,
+                origin,
+            } => {
+                let ecef = transform_to_ecef(position, vertex_transformer.as_ref())?;
+                Ok([
+                    f64_to_f32_checked(ecef[0] - origin[0], "ecef relative x", None)?,
+                    f64_to_f32_checked(ecef[1] - origin[1], "ecef relative y", None)?,
+                    f64_to_f32_checked(ecef[2] - origin[2], "ecef relative z", None)?,
+                ])
+            }
+            CoordinatePlacement::Enu {
+                vertex_transformer,
+                ecef_origin,
+                east,
+                north,
+                up,
+            } => {
+                let ecef = transform_to_ecef(position, vertex_transformer.as_ref())?;
+                let delta = [
+                    ecef[0] - ecef_origin[0],
+                    ecef[1] - ecef_origin[1],
+                    ecef[2] - ecef_origin[2],
+                ];
+                Ok([
+                    f64_to_f32_checked(dot(delta, *east), "enu east", None)?,
+                    f64_to_f32_checked(dot(delta, *north), "enu north", None)?,
+                    f64_to_f32_checked(dot(delta, *up), "enu up", None)?,
+                ])
+            }
+        }
     }
-}
-
-fn source_crs_from_model(model: &CityModel) -> Option<String> {
-    model.metadata().and_then(|metadata| {
-        metadata
-            .reference_system()
-            .map(std::string::ToString::to_string)
-    })
 }
 
 fn canonical_epsg_crs(value: &str) -> Result<String> {
@@ -592,55 +597,27 @@ fn canonical_epsg_crs(value: &str) -> Result<String> {
     Ok(format!("EPSG:{parsed}"))
 }
 
-fn compute_storage_origin(
-    model: &CityModel,
-    vertex_transformer: Option<&Proj>,
-) -> Result<[f64; 3]> {
-    let Some(extent) = model
-        .calculate_geographical_extent()
-        .context("failed to calculate CityModel geographical extent")?
-    else {
-        return Ok([0.0; 3]);
-    };
-
-    let mut bounds_min = [f64::INFINITY; 3];
-    let mut bounds_max = [f64::NEG_INFINITY; 3];
-    let mut has_vertices = false;
-
-    for x in [extent.min_x(), extent.max_x()] {
-        for y in [extent.min_y(), extent.max_y()] {
-            for z in [extent.min_z(), extent.max_z()] {
-                let position = transform_origin_point([x, y, z], vertex_transformer)
-                    .context("failed to project CityModel extent corner to ECEF")?;
-                for axis in 0..3 {
-                    bounds_min[axis] = bounds_min[axis].min(position[axis]);
-                    bounds_max[axis] = bounds_max[axis].max(position[axis]);
-                }
-                has_vertices = true;
-            }
-        }
-    }
-
-    if !has_vertices {
-        return Ok([0.0; 3]);
-    }
-
-    Ok([
-        f64::midpoint(bounds_min[0], bounds_max[0]),
-        f64::midpoint(bounds_min[1], bounds_max[1]),
-        f64::midpoint(bounds_min[2], bounds_max[2]),
-    ])
+fn source_to_ecef_transformer(source_crs: &str) -> Result<Option<Proj>> {
+    (source_crs != "EPSG:4978")
+        .then(|| Proj::new_known_crs(source_crs, "EPSG:4978", None))
+        .transpose()
+        .context("failed to create source CRS to ECEF transform")
 }
 
-fn transform_origin_point(point: [f64; 3], vertex_transformer: Option<&Proj>) -> Result<[f64; 3]> {
+fn transform_to_ecef(point: [f64; 3], vertex_transformer: Option<&Proj>) -> Result<[f64; 3]> {
     let [x, y, z] = point;
-    let position = if let Some(transformer) = vertex_transformer {
-        let transformed = transformer.convert((x, y, z))?;
-        [transformed.0, transformed.1, transformed.2]
+    if let Some(transformer) = vertex_transformer {
+        let transformed = transformer
+            .convert((x, y, z))
+            .context("failed to project position to ECEF")?;
+        Ok([transformed.0, transformed.1, transformed.2])
     } else {
-        [x, y, z]
-    };
-    Ok(position)
+        Ok(point)
+    }
+}
+
+fn dot(lhs: [f64; 3], rhs: [f64; 3]) -> f64 {
+    lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
 }
 
 #[allow(clippy::cast_possible_truncation)]

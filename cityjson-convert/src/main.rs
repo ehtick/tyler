@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use cityjson_lib::json;
 use clap::Parser;
 
-use cityjson_convert::{convert_to_glb, ExportOptions};
+use cityjson_convert::{convert_to_glb, ExportOptions, GeometryPlacement};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -40,10 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         native_glb_color: cli.native_glb_color,
         metadata_class_name: cli.metadata_class_name,
         feature_type_colors: BTreeMap::default(),
-        source_crs: None,
-        ecef_origin: None,
+        geometry_placement: GeometryPlacement::SourceCoordinates,
         clip_bbox: None,
-        reproject_to_ecef: true,
         smooth_normals: cli.smooth_normals,
         quantize_geometry: !cli.no_quantization,
         meshopt_compression: !cli.no_meshopt_compression,

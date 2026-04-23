@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use cityjson_convert::{convert_to_glb, ExportOptions};
+use cityjson_convert::{convert_to_glb, ExportOptions, GeometryPlacement};
 use cityjson_lib::json;
 use serde_json::Value;
 
@@ -95,6 +95,27 @@ fn assert_vec3_approx_eq(actual: [f32; 3], expected: [f32; 3]) {
             actual
         );
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn node_matrix_local_translation(node_matrix: &[Value]) -> [f32; 3] {
+    [
+        node_matrix[12].as_f64().unwrap() as f32,
+        -node_matrix[14].as_f64().unwrap() as f32,
+        node_matrix[13].as_f64().unwrap() as f32,
+    ]
+}
+
+fn assert_positions_contain(positions: &[[f32; 3]], expected: [f32; 3]) {
+    assert!(
+        positions.iter().any(|actual| {
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (*actual - expected).abs() < 1.0e-4)
+        }),
+        "expected positions to contain {expected:?}, got {positions:?}"
+    );
 }
 
 fn has_extension(root: &Value, name: &str) -> bool {
@@ -270,7 +291,10 @@ fn convert_to_glb_can_reproject_geometry_to_ecef() {
         .expect("fixture feature stream should parse");
     let output_path = stable_output_path("ams-up-ecef");
     let options = ExportOptions {
-        source_crs: Some("EPSG:7415".to_string()),
+        geometry_placement: GeometryPlacement::EcefRelative {
+            source_crs: "EPSG:7415".to_string(),
+            origin: [0.0; 3],
+        },
         ..ExportOptions::default()
     };
 
@@ -293,6 +317,88 @@ fn convert_to_glb_can_reproject_geometry_to_ecef() {
             .any(|component| component.abs() > 1_000_000.0),
         "ECEF translation should be in Earth-centered coordinates: {translation:?}"
     );
+}
+
+#[allow(clippy::float_cmp)]
+#[test]
+fn convert_to_glb_can_place_geometry_in_enu() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building-1":{
+                    "type":"Building",
+                    "geometry":[
+                        {
+                            "type":"MultiSurface",
+                            "lod":"2.2",
+                            "boundaries":[
+                                [[0,1,2]]
+                            ]
+                        }
+                    ]
+                }
+            },
+            "vertices":[
+                [1000.0,2000.0,3000.0],
+                [1010.0,2000.0,3000.0],
+                [1000.0,2020.0,3030.0]
+            ]
+        }"#,
+    )
+    .expect("inline CityJSON fixture should parse");
+    let output_path = stable_output_path("enu-placement");
+    let options = ExportOptions {
+        geometry_placement: GeometryPlacement::Enu {
+            source_crs: "EPSG:4978".to_string(),
+            ecef_origin: [1000.0, 2000.0, 3000.0],
+            east: [1.0, 0.0, 0.0],
+            north: [0.0, 1.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+        },
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options).expect("ENU GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+    let bin = read_glb_bin(&glb_bytes);
+    let node_matrix = root["nodes"][0]["matrix"]
+        .as_array()
+        .expect("root node should carry the local-to-world transform");
+
+    assert_eq!(node_matrix[0].as_f64().unwrap(), 1.0);
+    assert_eq!(node_matrix[5].as_f64().unwrap(), 0.0);
+    assert_eq!(node_matrix[6].as_f64().unwrap(), -1.0);
+    assert_eq!(node_matrix[9].as_f64().unwrap(), 1.0);
+    assert_eq!(node_matrix[10].as_f64().unwrap(), 0.0);
+
+    let center = node_matrix_local_translation(node_matrix);
+    assert_vec3_approx_eq(center, [5.0, 10.0, 15.0]);
+    assert!(
+        center.iter().all(|component| component.abs() < 100.0),
+        "ENU node translation should stay local-scale: {center:?}"
+    );
+
+    let centered_positions = read_f32_vec3_accessor(&root, bin, 0);
+    let local_positions = centered_positions
+        .into_iter()
+        .map(|position| {
+            [
+                position[0] + center[0],
+                position[1] + center[1],
+                position[2] + center[2],
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    assert_positions_contain(&local_positions, [0.0, 0.0, 0.0]);
+    assert_positions_contain(&local_positions, [10.0, 0.0, 0.0]);
+    assert_positions_contain(&local_positions, [0.0, 20.0, 30.0]);
 }
 
 #[allow(clippy::float_cmp)]
@@ -493,7 +599,6 @@ fn convert_to_glb_can_clip_to_bbox_with_preclip_smooth_normals() {
     let output_path = stable_output_path("clipped-preclip-smooth-normals");
     let options = ExportOptions {
         clip_bbox: Some([-1.0, -1.0, -1.0, 0.5, 2.0, 2.0]),
-        reproject_to_ecef: false,
         smooth_normals: true,
         quantize_geometry: false,
         meshopt_compression: false,
