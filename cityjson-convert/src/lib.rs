@@ -21,16 +21,31 @@ use anyhow::Result;
 use cityjson_lib::CityModel;
 use log::info;
 
+#[derive(Clone, Debug, Default)]
+pub enum GeometryPlacement {
+    #[default]
+    SourceCoordinates,
+    EcefRelative {
+        source_crs: String,
+        origin: [f64; 3],
+    },
+    Enu {
+        source_crs: String,
+        ecef_origin: [f64; 3],
+        east: [f64; 3],
+        north: [f64; 3],
+        up: [f64; 3],
+    },
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ExportOptions {
     pub native_glb_color: String,
     pub metadata_class_name: String,
     pub feature_type_colors: BTreeMap<String, String>,
-    pub source_crs: Option<String>,
-    pub ecef_origin: Option<[f64; 3]>,
+    pub geometry_placement: GeometryPlacement,
     pub clip_bbox: Option<[f64; 6]>,
-    pub reproject_to_ecef: bool,
     pub smooth_normals: bool,
     pub quantize_geometry: bool,
     pub meshopt_compression: bool,
@@ -42,10 +57,8 @@ impl Default for ExportOptions {
             native_glb_color: "#FFC0CB".to_string(),
             metadata_class_name: "cityobject".to_string(),
             feature_type_colors: BTreeMap::new(),
-            source_crs: None,
-            ecef_origin: None,
+            geometry_placement: GeometryPlacement::default(),
             clip_bbox: None,
-            reproject_to_ecef: true,
             smooth_normals: false,
             quantize_geometry: true,
             meshopt_compression: true,

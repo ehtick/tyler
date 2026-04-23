@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 cityjson-lib = "0.6.1"
-cityjson-index = "0.4.1"
+cityjson-index = "0.4.2"
 cityjson-convert = { path = "cityjson-convert" }
 log = "0.4.17"
 env_logger = "0.10.0"

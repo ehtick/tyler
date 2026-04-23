@@ -31,6 +31,7 @@ pub mod cesium3dtiles {
     use serde::{Deserialize, Serialize};
     use serde_repr::{Deserialize_repr, Serialize_repr};
 
+    use crate::coordinates::RootEnuFrame;
     use crate::proj::Proj;
     use crate::spatial_structs::{Bbox, CellId, QuadTree, QuadTreeNodeId, SquareGrid};
 
@@ -159,16 +160,10 @@ pub mod cesium3dtiles {
             arg_maxz: Option<i32>,
             content_bv_from_tile: bool,
             content_add_bv: bool,
+            root_enu_frame: &RootEnuFrame,
         ) -> Self {
             let crs_from = format!("EPSG:{}", world.crs.to_epsg().unwrap());
-            // Use EPSG:4979 (geographic 3D) for boundingVolume.region, matching pg2b3dm 2.0.0+ approach
-            // This is more compatible with viewers and matches the 3D Tiles spec better
-            let crs_to = "EPSG:4979";
-            let transformer = Proj::new_known_crs(&crs_from, crs_to, None).unwrap();
-
-            // Transform to ECEF for root transform - pg2b3dm still uses ECEF for root transform
-            // GLB content is in input CRS, but root transform is in ECEF
-            let transformer_to_ecef = Proj::new_known_crs(&crs_from, "EPSG:4978", None).unwrap();
+            let transformer = Proj::new_known_crs(&crs_from, "EPSG:4979", None).unwrap();
 
             let root = Self::generate_tiles(
                 quadtree,
@@ -181,49 +176,19 @@ pub mod cesium3dtiles {
                 content_bv_from_tile,
                 content_add_bv,
             );
-
-            // Add root transform to translate to ECEF center - matches pg2b3dm 2.0.0+ approach
-            // GLB content is in ECEF (relative to root center in ECEF) to match root transform coordinate system
-            // Root transform translates to ECEF center to position the content correctly
-            // Calculate root center from quadtree bbox - this must match the root center used in gltf_writer.rs
-            // Use the same root center calculation for both tileset transform and GLB coordinates
-            let root_bbox = quadtree.bbox(&world.grid);
-            let root_center_original = [
-                (root_bbox[0] + root_bbox[3]) * 0.5,
-                (root_bbox[1] + root_bbox[4]) * 0.5,
-                (root_bbox[2] + root_bbox[5]) * 0.5,
-            ];
-            let root_center_ecef = transformer_to_ecef
-                .convert((
-                    root_center_original[0],
-                    root_center_original[1],
-                    root_center_original[2],
-                ))
-                .unwrap();
-
-            log::info!("Root center for tileset transform - input CRS: [{:.2}, {:.2}, {:.2}], ECEF: [{:.2}, {:.2}, {:.2}]",
-                root_center_original[0], root_center_original[1], root_center_original[2],
-                root_center_ecef.0, root_center_ecef.1, root_center_ecef.2);
-
-            // Create identity transform with translation to ECEF center
-            let root_transform = Transform([
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                root_center_ecef.0,
-                root_center_ecef.1,
-                root_center_ecef.2,
-                1.0,
-            ]);
+            log::info!(
+                "Root ENU frame - input CRS origin: [{:.2}, {:.2}, {:.2}], geodetic: [{:.8}, {:.8}, {:.2}], ECEF: [{:.2}, {:.2}, {:.2}]",
+                root_enu_frame.source_origin[0],
+                root_enu_frame.source_origin[1],
+                root_enu_frame.source_origin[2],
+                root_enu_frame.geodetic_origin[0],
+                root_enu_frame.geodetic_origin[1],
+                root_enu_frame.geodetic_origin[2],
+                root_enu_frame.ecef_origin[0],
+                root_enu_frame.ecef_origin[1],
+                root_enu_frame.ecef_origin[2],
+            );
+            let root_transform = Transform(root_enu_frame.transform());
 
             // Using gltf tile content
             let mut extensions: Extensions = HashMap::new();
@@ -333,7 +298,7 @@ pub mod cesium3dtiles {
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
-                    BoundingVolume::box_from_bbox(&tile_bbox, transformer).unwrap();
+                    BoundingVolume::region_from_bbox(&tile_bbox, transformer).unwrap();
                 let mut content: Option<Content> = None;
 
                 if quadtree.nr_items > 0 {
@@ -369,7 +334,8 @@ pub mod cesium3dtiles {
                             tile_content_bbox_rw[2] + tile_content_bbox_rw[2] * 0.01;
                     }
                     let content_bounding_volume =
-                        BoundingVolume::box_from_bbox(&tile_content_bbox_rw, transformer).unwrap();
+                        BoundingVolume::region_from_bbox(&tile_content_bbox_rw, transformer)
+                            .unwrap();
 
                     content = Some(Content {
                         bounding_volume: if content_add_bv {
@@ -392,9 +358,6 @@ pub mod cesium3dtiles {
                                                              // Ensure minimum value of 0.1 to avoid issues with very small tiles
                 let geometric_error = leaf_geometric_error.max(0.1);
 
-                // For 3D Tiles with geographic 3D bounding volumes, GLB content uses input CRS (local coordinate system)
-                // This matches pg2b3dm 2.0.0+ approach - coordinates are in input CRS, not geographic 3D
-                // Root transform handles positioning in tileset.json
                 Tile {
                     id: tile_id,
                     bounding_volume,
@@ -1402,15 +1365,30 @@ pub mod cesium3dtiles {
             bbox: &Bbox,
             transformer: &Proj,
         ) -> Result<Self, Box<dyn std::error::Error>> {
-            let (west, south, minh) = transformer.convert((bbox[0], bbox[1], bbox[2]))?;
-            let (east, north, maxh) = transformer.convert((bbox[3], bbox[4], bbox[5]))?;
+            let mut west = f64::INFINITY;
+            let mut south = f64::INFINITY;
+            let mut min_h = f64::INFINITY;
+            let mut east = f64::NEG_INFINITY;
+            let mut north = f64::NEG_INFINITY;
+            let mut max_h = f64::NEG_INFINITY;
+
+            for [x, y, z] in bbox_corners(bbox) {
+                let (lon, lat, height) = transformer.convert((x, y, z))?;
+                west = west.min(lon);
+                south = south.min(lat);
+                min_h = min_h.min(height);
+                east = east.max(lon);
+                north = north.max(lat);
+                max_h = max_h.max(height);
+            }
+
             Ok(BoundingVolume::Region([
                 west.to_radians(),
                 south.to_radians(),
                 east.to_radians(),
                 north.to_radians(),
-                minh,
-                maxh,
+                min_h,
+                max_h,
             ]))
         }
 
@@ -1476,6 +1454,19 @@ pub mod cesium3dtiles {
                 maxy = maxy
             )
         }
+    }
+
+    fn bbox_corners(bbox: &Bbox) -> [[f64; 3]; 8] {
+        [
+            [bbox[0], bbox[1], bbox[2]],
+            [bbox[0], bbox[1], bbox[5]],
+            [bbox[0], bbox[4], bbox[2]],
+            [bbox[0], bbox[4], bbox[5]],
+            [bbox[3], bbox[1], bbox[2]],
+            [bbox[3], bbox[1], bbox[5]],
+            [bbox[3], bbox[4], bbox[2]],
+            [bbox[3], bbox[4], bbox[5]],
+        ]
     }
 
     /// [Tile.refine](https://github.com/CesiumGS/3d-tiles/tree/main/specification#tilerefine).
@@ -1645,6 +1636,28 @@ pub mod cesium3dtiles {
             path
         }
 
+        fn assert_tile_bounding_volumes_are_regions(tile: &Tile) {
+            assert!(
+                matches!(tile.bounding_volume, BoundingVolume::Region(_)),
+                "tile {} bounding volume should be a region",
+                tile.id
+            );
+            if let Some(content) = &tile.content {
+                if let Some(bounding_volume) = &content.bounding_volume {
+                    assert!(
+                        matches!(bounding_volume, BoundingVolume::Region(_)),
+                        "tile {} content bounding volume should be a region",
+                        tile.id
+                    );
+                }
+            }
+            if let Some(children) = &tile.children {
+                for child in children {
+                    assert_tile_bounding_volumes_are_regions(child);
+                }
+            }
+        }
+
         #[test]
         fn test_implicittiling() {
             // 85162.9 447106.8 85562.9 447706.8
@@ -1684,8 +1697,29 @@ pub mod cesium3dtiles {
             );
             quadtree.export(&world, None).unwrap();
 
-            let _tileset =
-                Tileset::from_quadtree(&quadtree, &world, 16_f64, 200, None, None, true, true);
+            let source_crs = format!("EPSG:{}", world.crs.to_epsg().unwrap());
+            let root_bbox = quadtree.bbox(&world.grid);
+            let root_enu_frame =
+                RootEnuFrame::from_bbox(&source_crs, &root_bbox).expect("root ENU frame");
+            let tileset = Tileset::from_quadtree(
+                &quadtree,
+                &world,
+                16_f64,
+                200,
+                None,
+                None,
+                true,
+                true,
+                &root_enu_frame,
+            );
+            assert_tile_bounding_volumes_are_regions(&tileset.root);
+            let root_transform = tileset
+                .root
+                .transform
+                .as_ref()
+                .expect("root tile should have ENU-to-ECEF transform");
+            assert!((root_transform.0[0] - 1.0).abs() > 1.0e-6);
+            assert!(root_transform.0[12].abs() > 1.0);
 
             // tileset.make_implicit(&world.grid, &quadtree, );
 
@@ -1727,8 +1761,56 @@ pub mod cesium3dtiles {
             let crs_to = "EPSG:4979";
             let transformer = Proj::new_known_crs("EPSG:7415", crs_to, None).unwrap();
             let bbox: Bbox = [84995.279, 446316.813, -5.333, 85644.748, 446996.132, 52.881];
-            let bounding_volume = BoundingVolume::region_from_bbox(&bbox, &transformer);
-            println!("{:?}", bounding_volume);
+            let bounding_volume = BoundingVolume::region_from_bbox(&bbox, &transformer)
+                .expect("bbox should transform to EPSG:4979 region");
+            let BoundingVolume::Region(region) = bounding_volume else {
+                panic!("region_from_bbox should return a region");
+            };
+
+            let mut expected = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for [x, y, z] in bbox_corners(&bbox) {
+                let (lon, lat, height) = transformer.convert((x, y, z)).unwrap();
+                expected[0] = expected[0].min(lon.to_radians());
+                expected[1] = expected[1].min(lat.to_radians());
+                expected[2] = expected[2].max(lon.to_radians());
+                expected[3] = expected[3].max(lat.to_radians());
+                expected[4] = expected[4].min(height);
+                expected[5] = expected[5].max(height);
+            }
+
+            for (actual, expected) in region.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 1.0e-12,
+                    "expected {expected}, got {actual}"
+                );
+            }
+            assert!(region[0].abs() < std::f64::consts::PI);
+            assert!(region[1].abs() < std::f64::consts::FRAC_PI_2);
+            assert!(region[0] < region[2]);
+            assert!(region[1] < region[3]);
+            assert!(region[4] <= region[5]);
+        }
+
+        #[test]
+        fn test_bbox_corners_returns_all_eight_corners() {
+            let bbox: Bbox = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let corners = bbox_corners(&bbox);
+            assert_eq!(corners.len(), 8);
+            assert!(corners.contains(&[1.0, 2.0, 3.0]));
+            assert!(corners.contains(&[1.0, 2.0, 6.0]));
+            assert!(corners.contains(&[1.0, 5.0, 3.0]));
+            assert!(corners.contains(&[1.0, 5.0, 6.0]));
+            assert!(corners.contains(&[4.0, 2.0, 3.0]));
+            assert!(corners.contains(&[4.0, 2.0, 6.0]));
+            assert!(corners.contains(&[4.0, 5.0, 3.0]));
+            assert!(corners.contains(&[4.0, 5.0, 6.0]));
         }
 
         #[test]

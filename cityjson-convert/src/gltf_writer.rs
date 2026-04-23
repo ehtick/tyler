@@ -7,13 +7,13 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::proj::Proj;
-use crate::ExportOptions;
+use crate::{ExportOptions, GeometryPlacement};
 use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
-use log::{info, warn};
+use log::info;
 use meshopt::{
     encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
     optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
@@ -351,9 +351,23 @@ struct MeshCollector {
 }
 
 struct CoordinateTransform {
-    vertex_transformer: Option<Proj>,
-    storage_origin: [f64; 3],
+    placement: CoordinatePlacement,
     node_translation_base: [f32; 3],
+}
+
+enum CoordinatePlacement {
+    SourceCoordinates,
+    EcefRelative {
+        vertex_transformer: Option<Proj>,
+        origin: [f64; 3],
+    },
+    Enu {
+        vertex_transformer: Option<Proj>,
+        ecef_origin: [f64; 3],
+        east: [f64; 3],
+        north: [f64; 3],
+        up: [f64; 3],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -470,7 +484,13 @@ struct QuantizedPrimitiveMesh {
     normals: Vec<QuantizedNormal>,
     feature_ids: Vec<u32>,
     indices: IndexBuffer,
-    normalized_bounds: Bounds,
+    position_bounds: QuantizedBounds,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuantizedBounds {
+    min: [i16; 3],
+    max: [i16; 3],
 }
 
 struct QuantizedScene {
@@ -490,90 +510,81 @@ impl SmoothVertexKey {
 }
 
 impl CoordinateTransform {
-    fn from_model(model: &CityModel, options: &ExportOptions) -> Result<Self> {
-        if !options.reproject_to_ecef {
-            return Ok(Self {
-                vertex_transformer: None,
-                storage_origin: [0.0; 3],
-                node_translation_base: [0.0; 3],
-            });
-        }
-
-        let Some(source_crs) = options
-            .source_crs
-            .clone()
-            .or_else(|| source_crs_from_model(model))
-        else {
-            warn!("CityJSON source CRS is missing, skipping ECEF reprojection");
-            return Ok(Self {
-                vertex_transformer: None,
-                storage_origin: [0.0; 3],
-                node_translation_base: [0.0; 3],
-            });
+    fn from_model(_model: &CityModel, options: &ExportOptions) -> Result<Self> {
+        let placement = match &options.geometry_placement {
+            GeometryPlacement::SourceCoordinates => CoordinatePlacement::SourceCoordinates,
+            GeometryPlacement::EcefRelative { source_crs, origin } => {
+                let source_crs = canonical_epsg_crs(source_crs)?;
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
+                CoordinatePlacement::EcefRelative {
+                    vertex_transformer,
+                    origin: *origin,
+                }
+            }
+            GeometryPlacement::Enu {
+                source_crs,
+                ecef_origin,
+                east,
+                north,
+                up,
+            } => {
+                let source_crs = canonical_epsg_crs(source_crs)?;
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
+                CoordinatePlacement::Enu {
+                    vertex_transformer,
+                    ecef_origin: *ecef_origin,
+                    east: *east,
+                    north: *north,
+                    up: *up,
+                }
+            }
         };
-
-        let source_crs = canonical_epsg_crs(&source_crs)?;
-        let vertex_transformer = (source_crs != "EPSG:4978")
-            .then(|| Proj::new_known_crs(&source_crs, "EPSG:4978", None))
-            .transpose()
-            .context("failed to create source CRS to ECEF transform")?;
-
-        let storage_origin = if let Some(origin) = options.ecef_origin {
-            origin
-        } else {
-            compute_storage_origin(model, vertex_transformer.as_ref())?
-        };
-        let tileset_origin = options.ecef_origin.unwrap_or([0.0; 3]);
-        let node_translation_base = [
-            f64_to_f32_checked(
-                storage_origin[0] - tileset_origin[0],
-                "ecef translation x",
-                None,
-            )?,
-            f64_to_f32_checked(
-                storage_origin[1] - tileset_origin[1],
-                "ecef translation y",
-                None,
-            )?,
-            f64_to_f32_checked(
-                storage_origin[2] - tileset_origin[2],
-                "ecef translation z",
-                None,
-            )?,
-        ];
 
         Ok(Self {
-            vertex_transformer,
-            storage_origin,
-            node_translation_base,
+            placement,
+            node_translation_base: [0.0; 3],
         })
     }
 
     fn transform_position(&self, position: [f64; 3]) -> Result<[f32; 3]> {
-        let [x, y, z] = position;
-        let position = if let Some(transformer) = &self.vertex_transformer {
-            let transformed = transformer
-                .convert((x, y, z))
-                .context("failed to project position to ECEF")?;
-            [transformed.0, transformed.1, transformed.2]
-        } else {
-            [x, y, z]
-        };
-
-        Ok([
-            f64_to_f32_checked(position[0] - self.storage_origin[0], "x", None)?,
-            f64_to_f32_checked(position[1] - self.storage_origin[1], "y", None)?,
-            f64_to_f32_checked(position[2] - self.storage_origin[2], "z", None)?,
-        ])
+        match &self.placement {
+            CoordinatePlacement::SourceCoordinates => Ok([
+                f64_to_f32_checked(position[0], "x", None)?,
+                f64_to_f32_checked(position[1], "y", None)?,
+                f64_to_f32_checked(position[2], "z", None)?,
+            ]),
+            CoordinatePlacement::EcefRelative {
+                vertex_transformer,
+                origin,
+            } => {
+                let ecef = transform_to_ecef(position, vertex_transformer.as_ref())?;
+                Ok([
+                    f64_to_f32_checked(ecef[0] - origin[0], "ecef relative x", None)?,
+                    f64_to_f32_checked(ecef[1] - origin[1], "ecef relative y", None)?,
+                    f64_to_f32_checked(ecef[2] - origin[2], "ecef relative z", None)?,
+                ])
+            }
+            CoordinatePlacement::Enu {
+                vertex_transformer,
+                ecef_origin,
+                east,
+                north,
+                up,
+            } => {
+                let ecef = transform_to_ecef(position, vertex_transformer.as_ref())?;
+                let delta = [
+                    ecef[0] - ecef_origin[0],
+                    ecef[1] - ecef_origin[1],
+                    ecef[2] - ecef_origin[2],
+                ];
+                Ok([
+                    f64_to_f32_checked(dot(delta, *east), "enu east", None)?,
+                    f64_to_f32_checked(dot(delta, *north), "enu north", None)?,
+                    f64_to_f32_checked(dot(delta, *up), "enu up", None)?,
+                ])
+            }
+        }
     }
-}
-
-fn source_crs_from_model(model: &CityModel) -> Option<String> {
-    model.metadata().and_then(|metadata| {
-        metadata
-            .reference_system()
-            .map(std::string::ToString::to_string)
-    })
 }
 
 fn canonical_epsg_crs(value: &str) -> Result<String> {
@@ -592,55 +603,27 @@ fn canonical_epsg_crs(value: &str) -> Result<String> {
     Ok(format!("EPSG:{parsed}"))
 }
 
-fn compute_storage_origin(
-    model: &CityModel,
-    vertex_transformer: Option<&Proj>,
-) -> Result<[f64; 3]> {
-    let Some(extent) = model
-        .calculate_geographical_extent()
-        .context("failed to calculate CityModel geographical extent")?
-    else {
-        return Ok([0.0; 3]);
-    };
-
-    let mut bounds_min = [f64::INFINITY; 3];
-    let mut bounds_max = [f64::NEG_INFINITY; 3];
-    let mut has_vertices = false;
-
-    for x in [extent.min_x(), extent.max_x()] {
-        for y in [extent.min_y(), extent.max_y()] {
-            for z in [extent.min_z(), extent.max_z()] {
-                let position = transform_origin_point([x, y, z], vertex_transformer)
-                    .context("failed to project CityModel extent corner to ECEF")?;
-                for axis in 0..3 {
-                    bounds_min[axis] = bounds_min[axis].min(position[axis]);
-                    bounds_max[axis] = bounds_max[axis].max(position[axis]);
-                }
-                has_vertices = true;
-            }
-        }
-    }
-
-    if !has_vertices {
-        return Ok([0.0; 3]);
-    }
-
-    Ok([
-        f64::midpoint(bounds_min[0], bounds_max[0]),
-        f64::midpoint(bounds_min[1], bounds_max[1]),
-        f64::midpoint(bounds_min[2], bounds_max[2]),
-    ])
+fn source_to_ecef_transformer(source_crs: &str) -> Result<Option<Proj>> {
+    (source_crs != "EPSG:4978")
+        .then(|| Proj::new_known_crs(source_crs, "EPSG:4978", None))
+        .transpose()
+        .context("failed to create source CRS to ECEF transform")
 }
 
-fn transform_origin_point(point: [f64; 3], vertex_transformer: Option<&Proj>) -> Result<[f64; 3]> {
+fn transform_to_ecef(point: [f64; 3], vertex_transformer: Option<&Proj>) -> Result<[f64; 3]> {
     let [x, y, z] = point;
-    let position = if let Some(transformer) = vertex_transformer {
-        let transformed = transformer.convert((x, y, z))?;
-        [transformed.0, transformed.1, transformed.2]
+    if let Some(transformer) = vertex_transformer {
+        let transformed = transformer
+            .convert((x, y, z))
+            .context("failed to project position to ECEF")?;
+        Ok([transformed.0, transformed.1, transformed.2])
     } else {
-        [x, y, z]
-    };
-    Ok(position)
+        Ok(point)
+    }
+}
+
+fn dot(lhs: [f64; 3], rhs: [f64; 3]) -> f64 {
+    lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1589,35 +1572,27 @@ impl QuantizedScene {
 
 impl ProcessedPrimitiveMesh {
     fn quantize(&self, position_scale: f32) -> Result<QuantizedPrimitiveMesh> {
-        let bounds = Bounds::from_vertices(&self.vertices)
+        Bounds::from_vertices(&self.vertices)
             .ok_or_else(|| anyhow::anyhow!("primitive bounds missing for non-empty mesh"))?;
-        let normalized_bounds = Bounds {
-            min: [
-                (bounds.min[0] / position_scale).clamp(-1.0, 1.0),
-                (bounds.min[1] / position_scale).clamp(-1.0, 1.0),
-                (bounds.min[2] / position_scale).clamp(-1.0, 1.0),
-            ],
-            max: [
-                (bounds.max[0] / position_scale).clamp(-1.0, 1.0),
-                (bounds.max[1] / position_scale).clamp(-1.0, 1.0),
-                (bounds.max[2] / position_scale).clamp(-1.0, 1.0),
-            ],
-        };
+
+        let positions = self
+            .vertices
+            .iter()
+            .map(|vertex| QuantizedPosition {
+                position: [
+                    quantize_position_component(vertex.position[0], position_scale),
+                    quantize_position_component(vertex.position[1], position_scale),
+                    quantize_position_component(vertex.position[2], position_scale),
+                    0,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let position_bounds = quantized_position_bounds(&positions)
+            .ok_or_else(|| anyhow::anyhow!("quantized primitive has no positions"))?;
 
         Ok(QuantizedPrimitiveMesh {
             feature_type: self.feature_type.clone(),
-            positions: self
-                .vertices
-                .iter()
-                .map(|vertex| QuantizedPosition {
-                    position: [
-                        quantize_position_component(vertex.position[0], position_scale),
-                        quantize_position_component(vertex.position[1], position_scale),
-                        quantize_position_component(vertex.position[2], position_scale),
-                        0,
-                    ],
-                })
-                .collect(),
+            positions,
             normals: self
                 .vertices
                 .iter()
@@ -1636,9 +1611,24 @@ impl ProcessedPrimitiveMesh {
                 .map(|vertex| vertex.feature_id)
                 .collect(),
             indices: self.select_index_buffer()?,
-            normalized_bounds,
+            position_bounds,
         })
     }
+}
+
+fn quantized_position_bounds(positions: &[QuantizedPosition]) -> Option<QuantizedBounds> {
+    let first = positions.first()?;
+    let mut min = [first.position[0], first.position[1], first.position[2]];
+    let mut max = min;
+
+    for position in &positions[1..] {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position.position[axis]);
+            max[axis] = max[axis].max(position.position[axis]);
+        }
+    }
+
+    Some(QuantizedBounds { min, max })
 }
 
 fn build_encoded_glb(
@@ -1697,9 +1687,11 @@ fn build_encoded_glb(
         extensions_used.push(MESHOPT_EXTENSION.to_string());
         extensions_required.push(MESHOPT_EXTENSION.to_string());
     }
+    if !primitive_feature_counts.is_empty() {
+        extensions_used.push(MESH_FEATURES_EXTENSION.to_string());
+    }
     if structural_metadata.is_some() {
         extensions_used.push(STRUCTURAL_METADATA_EXTENSION.to_string());
-        extensions_used.push(MESH_FEATURES_EXTENSION.to_string());
     }
 
     let mut buffers = vec![json::Buffer {
@@ -1853,7 +1845,7 @@ impl QuantizedScene {
                 &primitive.positions,
                 &primitive.normals,
                 &primitive.feature_ids,
-                &primitive.normalized_bounds,
+                &primitive.position_bounds,
                 meshopt_compression,
             )?;
             let index_accessor = buffer_builder.push_indices(
@@ -2159,7 +2151,7 @@ impl BufferBuilder {
         positions: &[QuantizedPosition],
         normals: &[QuantizedNormal],
         feature_ids: &[u32],
-        bounds: &Bounds,
+        bounds: &QuantizedBounds,
         meshopt_compression: bool,
     ) -> Result<VertexAccessors> {
         let position_view = if meshopt_compression {
@@ -2621,7 +2613,11 @@ impl EncodedGlb {
             inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
         }
         if !self.primitive_feature_counts.is_empty() {
-            inject_mesh_feature_extensions(&mut root_json, &self.primitive_feature_counts)?;
+            inject_mesh_feature_extensions(
+                &mut root_json,
+                &self.primitive_feature_counts,
+                self.structural_metadata.is_some(),
+            )?;
         }
         if let Some(structural_metadata) = &self.structural_metadata {
             inject_structural_metadata_extension(&mut root_json, structural_metadata)?;
@@ -2676,6 +2672,7 @@ impl EncodedGlb {
 fn inject_mesh_feature_extensions(
     root: &mut JsonValue,
     primitive_feature_counts: &[usize],
+    has_structural_metadata: bool,
 ) -> Result<()> {
     let root_object = root
         .as_object_mut()
@@ -2702,15 +2699,22 @@ fn inject_mesh_feature_extensions(
     }
 
     for (primitive, feature_count) in primitives.iter_mut().zip(primitive_feature_counts.iter()) {
+        let mut feature_id = json_value!({
+            "featureCount": feature_count,
+            "attribute": 0,
+        });
+        if has_structural_metadata {
+            feature_id
+                .as_object_mut()
+                .expect("feature ID JSON should be an object")
+                .insert("propertyTable".to_string(), json_value!(0));
+        }
+
         insert_extension(
             primitive,
             MESH_FEATURES_EXTENSION,
             json_value!({
-                "featureIds": [{
-                    "featureCount": feature_count,
-                    "attribute": 0,
-                    "propertyTable": 0
-                }]
+                "featureIds": [feature_id]
             }),
         )?;
     }
