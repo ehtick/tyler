@@ -70,7 +70,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::formats::cesium3dtiles::{Tile, TileId};
-use cityjson_lib::cityjson::prelude::GeometryHandle;
+use cityjson_lib::cityjson::prelude::{CityObjectHandle, GeometryHandle};
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
@@ -415,6 +415,39 @@ fn prepare_feature_model(
     cleanup_and_update_extents(model).map(Some)
 }
 
+fn filter_cityjsonfeature_preserving_root<F>(
+    model: &cityjson_lib::CityModel,
+    predicate: F,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>>
+where
+    F: FnMut(cityjson_lib::ops::FilterContext<'_>) -> bool,
+{
+    let had_feature_root = model.id().is_some();
+    let mut filtered = cityjson_lib::ops::filter(model, predicate)?;
+
+    if !had_feature_root || filtered.id().is_some() || filtered.cityobjects().is_empty() {
+        return Ok(filtered);
+    }
+
+    let replacement_root = parentless_cityobject_handle(&filtered).ok_or(
+        "filtered CityJSONFeature kept CityObjects but has no parentless replacement root",
+    )?;
+    filtered.set_id(Some(replacement_root));
+
+    Ok(filtered)
+}
+
+fn parentless_cityobject_handle(model: &cityjson_lib::CityModel) -> Option<CityObjectHandle> {
+    model.cityobjects().iter().find_map(|(handle, cityobject)| {
+        let has_surviving_parent = cityobject.parents().is_some_and(|parents| {
+            parents
+                .iter()
+                .any(|parent| model.cityobjects().get(*parent).is_some())
+        });
+        (!has_surviving_parent).then_some(handle)
+    })
+}
+
 fn filter_cityobject_types(
     model: cityjson_lib::CityModel,
     cityobject_types: Option<&Vec<parser::CityObjectType>>,
@@ -426,9 +459,9 @@ fn filter_cityobject_types(
         .iter()
         .map(std::string::ToString::to_string)
         .collect::<HashSet<_>>();
-    Ok(cityjson_lib::ops::filter(&model, |ctx| {
+    filter_cityjsonfeature_preserving_root(&model, |ctx| {
         selected.contains(&ctx.cityobject().type_cityobject().to_string())
-    })?)
+    })
 }
 
 fn prune_lod_geometries(
@@ -492,11 +525,11 @@ fn geometry_matches_lod(
 fn remove_empty_geometry_cityobjects(
     model: &cityjson_lib::CityModel,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
-    Ok(cityjson_lib::ops::filter(model, |ctx| {
+    filter_cityjsonfeature_preserving_root(model, |ctx| {
         ctx.cityobject()
             .geometry()
             .is_some_and(|geometries| !geometries.is_empty())
-    })?)
+    })
 }
 
 fn cleanup_and_update_extents(
@@ -999,6 +1032,81 @@ mod tests {
 
     fn build_quadtree(world: &parser::World) -> spatial_structs::QuadTree {
         spatial_structs::QuadTree::from_world(world, spatial_structs::QuadTreeCapacity::Objects(1))
+    }
+
+    fn feature_root_id(model: &cityjson_lib::CityModel) -> Option<String> {
+        model.id().and_then(|handle| {
+            model
+                .cityobjects()
+                .get(handle)
+                .map(|cityobject| cityobject.id().to_owned())
+        })
+    }
+
+    fn feature_root_repair_fixture() -> cityjson_lib::CityModel {
+        cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"root-building",
+                "CityObjects":{
+                    "root-building":{"type":"Building","children":["building-part-1"]},
+                    "building-part-1":{"type":"BuildingPart","parents":["root-building"]},
+                    "other-building":{"type":"Building"}
+                },
+                "vertices":[]
+            }"#,
+        )
+        .expect("feature root repair fixture should parse")
+    }
+
+    #[test]
+    fn feature_root_hotfix_keeps_surviving_root() {
+        let model = feature_root_repair_fixture();
+
+        let filtered =
+            filter_cityjsonfeature_preserving_root(&model, |ctx| ctx.id() == "root-building")
+                .expect("root-preserving filter should succeed");
+
+        assert_eq!(
+            feature_root_id(&filtered),
+            Some("root-building".to_string())
+        );
+    }
+
+    #[test]
+    fn feature_root_hotfix_reroots_to_parentless_survivor() {
+        let model = feature_root_repair_fixture();
+
+        let filtered =
+            filter_cityjsonfeature_preserving_root(&model, |ctx| ctx.id() == "other-building")
+                .expect("root-repairing filter should succeed");
+
+        assert_eq!(
+            feature_root_id(&filtered),
+            Some("other-building".to_string())
+        );
+
+        let mut feature_output = Vec::new();
+        cityjson_lib::json::to_feature_writer(&mut feature_output, &filtered)
+            .expect("repaired feature should serialize");
+        let feature: Value =
+            serde_json::from_slice(&feature_output).expect("serialized feature should parse");
+
+        assert_eq!(
+            feature.get("id").and_then(Value::as_str),
+            Some("other-building")
+        );
+    }
+
+    #[test]
+    fn feature_root_hotfix_allows_empty_filtered_feature() {
+        let model = feature_root_repair_fixture();
+
+        let filtered = filter_cityjsonfeature_preserving_root(&model, |_| false)
+            .expect("empty feature filter should not fail");
+
+        assert!(filtered.cityobjects().is_empty());
+        assert_eq!(feature_root_id(&filtered), None);
     }
 
     #[test]
