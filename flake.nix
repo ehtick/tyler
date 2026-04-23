@@ -20,6 +20,23 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          projData = pkgs.runCommand "tyler-proj-data" { } ''
+            mkdir -p "$out/share/proj"
+            cp -a ${pkgs.proj}/share/proj/. "$out/share/proj/"
+            chmod -R u+w "$out/share/proj"
+            if [ ! -e "$out/share/proj/nl_nsgi_nlgeo2018.tif" ]; then
+              cp ${pkgs.fetchurl {
+                url = "https://cdn.proj.org/nl_nsgi_nlgeo2018.tif";
+                hash = "sha256-+OMsVr+JQPw/77wOQT60VGYz7VmLZpxjhWzd+DKJksA=";
+              }} "$out/share/proj/nl_nsgi_nlgeo2018.tif"
+            fi
+            if [ ! -e "$out/share/proj/nl_nsgi_rdtrans2018.tif" ]; then
+              cp ${pkgs.fetchurl {
+                url = "https://cdn.proj.org/nl_nsgi_rdtrans2018.tif";
+                hash = "sha256-dlODEZG0JOcVqQZGiWL8YAcc+3GjGGsqWPCYuri/Qd4=";
+              }} "$out/share/proj/nl_nsgi_rdtrans2018.tif"
+            fi
+          '';
           nativeBuildInputs = [
             pkgs.cmake
             pkgs.llvmPackages.clang
@@ -45,13 +62,13 @@
             inherit nativeBuildInputs buildInputs;
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            PROJ_DATA = "${pkgs.proj}/share/proj";
+            PROJ_DATA = "${projData}/share/proj";
 
             doCheck = false;
 
             postInstall = ''
               wrapProgram "$out/bin/tyler" \
-                --set-default PROJ_DATA "${pkgs.proj}/share/proj"
+                --set-default PROJ_DATA "${projData}/share/proj"
             '';
           };
         }
@@ -61,6 +78,23 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          projData = pkgs.runCommand "tyler-proj-data" { } ''
+            mkdir -p "$out/share/proj"
+            cp -a ${pkgs.proj}/share/proj/. "$out/share/proj/"
+            chmod -R u+w "$out/share/proj"
+            if [ ! -e "$out/share/proj/nl_nsgi_nlgeo2018.tif" ]; then
+              cp ${pkgs.fetchurl {
+                url = "https://cdn.proj.org/nl_nsgi_nlgeo2018.tif";
+                hash = "sha256-+OMsVr+JQPw/77wOQT60VGYz7VmLZpxjhWzd+DKJksA=";
+              }} "$out/share/proj/nl_nsgi_nlgeo2018.tif"
+            fi
+            if [ ! -e "$out/share/proj/nl_nsgi_rdtrans2018.tif" ]; then
+              cp ${pkgs.fetchurl {
+                url = "https://cdn.proj.org/nl_nsgi_rdtrans2018.tif";
+                hash = "sha256-dlODEZG0JOcVqQZGiWL8YAcc+3GjGGsqWPCYuri/Qd4=";
+              }} "$out/share/proj/nl_nsgi_rdtrans2018.tif"
+            fi
+          '';
         in
         {
           default = pkgs.mkShell {
@@ -81,7 +115,7 @@
             ];
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            PROJ_DATA = "${pkgs.proj}/share/proj";
+            PROJ_DATA = "${projData}/share/proj";
           };
         }
       );
