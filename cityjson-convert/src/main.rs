@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         feature_type_colors: BTreeMap::default(),
         source_crs: None,
         ecef_origin: None,
+        clip_bbox: None,
         reproject_to_ecef: true,
         smooth_normals: cli.smooth_normals,
         quantize_geometry: !cli.no_quantization,

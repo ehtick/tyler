@@ -30,6 +30,73 @@ fn read_glb_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(&bytes[20..20 + json_length]).expect("GLB JSON chunk should parse")
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn read_glb_bin(bytes: &[u8]) -> &[u8] {
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let bin_header_offset = 20 + json_length;
+    let bin_length = u32::from_le_bytes(
+        bytes[bin_header_offset..bin_header_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert_eq!(
+        &bytes[bin_header_offset + 4..bin_header_offset + 8],
+        b"BIN\0"
+    );
+    &bytes[bin_header_offset + 8..bin_header_offset + 8 + bin_length]
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn read_f32_vec3_accessor(root: &Value, bin: &[u8], accessor_index: usize) -> Vec<[f32; 3]> {
+    let accessor = &root["accessors"][accessor_index];
+    assert_eq!(accessor["componentType"].as_u64().unwrap(), 5126);
+    assert_eq!(accessor["type"].as_str().unwrap(), "VEC3");
+    let buffer_view_index = accessor["bufferView"].as_u64().unwrap() as usize;
+    let buffer_view = &root["bufferViews"][buffer_view_index];
+    let count = accessor["count"].as_u64().unwrap() as usize;
+    let view_offset = buffer_view
+        .get("byteOffset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let accessor_offset = accessor
+        .get("byteOffset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let stride = buffer_view
+        .get("byteStride")
+        .and_then(Value::as_u64)
+        .unwrap_or(12) as usize;
+    let start = view_offset + accessor_offset;
+
+    (0..count)
+        .map(|index| {
+            let offset = start + index * stride;
+            [
+                f32::from_le_bytes(bin[offset..offset + 4].try_into().unwrap()),
+                f32::from_le_bytes(bin[offset + 4..offset + 8].try_into().unwrap()),
+                f32::from_le_bytes(bin[offset + 8..offset + 12].try_into().unwrap()),
+            ]
+        })
+        .collect()
+}
+
+fn normalize(vector: [f32; 3]) -> [f32; 3] {
+    let length = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+    [vector[0] / length, vector[1] / length, vector[2] / length]
+}
+
+#[allow(clippy::uninlined_format_args)]
+fn assert_vec3_approx_eq(actual: [f32; 3], expected: [f32; 3]) {
+    for axis in 0..3 {
+        assert!(
+            (actual[axis] - expected[axis]).abs() < 1.0e-5,
+            "expected {:?}, got {:?}",
+            expected,
+            actual
+        );
+    }
+}
+
 fn has_extension(root: &Value, name: &str) -> bool {
     root["extensionsUsed"]
         .as_array()
@@ -391,6 +458,87 @@ fn convert_to_glb_can_generate_smooth_normals() {
         smooth_index_count, hard_index_count,
         "smoothing should preserve triangle topology"
     );
+}
+
+#[test]
+fn convert_to_glb_can_clip_to_bbox_with_preclip_smooth_normals() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building-1":{
+                    "type":"Building",
+                    "geometry":[
+                        {
+                            "type":"MultiSurface",
+                            "lod":"2.2",
+                            "boundaries":[
+                                [[0,1,2]],
+                                [[1,3,2]]
+                            ]
+                        }
+                    ]
+                }
+            },
+            "vertices":[
+                [0.0,0.0,0.0],
+                [1.0,0.0,0.0],
+                [0.0,1.0,0.0],
+                [1.0,1.0,1.0]
+            ]
+        }"#,
+    )
+    .expect("inline CityJSON fixture should parse");
+    let output_path = stable_output_path("clipped-preclip-smooth-normals");
+    let options = ExportOptions {
+        clip_bbox: Some([-1.0, -1.0, -1.0, 0.5, 2.0, 2.0]),
+        reproject_to_ecef: false,
+        smooth_normals: true,
+        quantize_geometry: false,
+        meshopt_compression: false,
+        ..ExportOptions::default()
+    };
+
+    convert_to_glb(&model, &output_path, &options)
+        .expect("clipped smooth-normal GLB conversion should succeed");
+
+    let glb_bytes = fs::read(&output_path).expect("clipped test GLB should exist");
+    let root = read_glb_json(&glb_bytes);
+    let bin = read_glb_bin(&glb_bytes);
+    let positions = read_f32_vec3_accessor(&root, bin, 0);
+    let normals = read_f32_vec3_accessor(&root, bin, 1);
+
+    assert_eq!(
+        positions.len(),
+        5,
+        "clipped mesh should emit five unique vertices"
+    );
+    assert_eq!(positions.len(), normals.len());
+
+    let clipped_boundary_index = positions
+        .iter()
+        .position(|position| {
+            (position[0] - 0.25).abs() < 1.0e-6
+                && (position[1] + 0.5).abs() < 1.0e-6
+                && (position[2] + 0.25).abs() < 1.0e-6
+        })
+        .expect("clipped boundary vertex should be present");
+
+    let first_face_normal = [0.0, 0.0, 1.0];
+    let second_face_normal = normalize([-1.0, -1.0, 1.0]);
+    let shared_normal = normalize([
+        first_face_normal[0] + second_face_normal[0],
+        first_face_normal[1] + second_face_normal[1],
+        first_face_normal[2] + second_face_normal[2],
+    ]);
+    let expected_boundary_normal = normalize([
+        0.5 * first_face_normal[0] + 0.5 * shared_normal[0],
+        0.5 * first_face_normal[1] + 0.5 * shared_normal[1],
+        0.5 * first_face_normal[2] + 0.5 * shared_normal[2],
+    ]);
+
+    assert_vec3_approx_eq(normals[clipped_boundary_index], expected_boundary_normal);
 }
 
 #[test]
