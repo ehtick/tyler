@@ -69,25 +69,61 @@ fn read_glb_json(bytes: &[u8]) -> Value {
 #[test]
 fn debug_replay_writes_epsg4979_regions_and_local_enu_glbs() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dataset = unique_test_dir("coordinate-frame-dataset");
+    fs::copy(
+        repo.join("resources/data/3dbag_x00.city.json"),
+        dataset.join("metadata.city.json"),
+    )
+    .expect("copy metadata");
+    fs::copy(
+        repo.join("resources/data/3dbag_feature_x71.city.jsonl"),
+        dataset.join("feature.city.jsonl"),
+    )
+    .expect("copy feature");
+
+    let seeded_output = unique_test_dir("coordinate-frame-seeded");
     let output = unique_test_dir("coordinate-frame");
-    let debug_data = unique_test_dir("coordinate-frame-debug");
-    fs::copy(
-        repo.join("tests/output/debug/world.bincode"),
-        debug_data.join("world.bincode"),
-    )
-    .expect("copy debug world");
-    fs::copy(
-        repo.join("tests/output/debug/quadtree.bincode"),
-        debug_data.join("quadtree.bincode"),
-    )
-    .expect("copy debug quadtree");
+
+    let seed_status = Command::new(env!("CARGO_BIN_EXE_tyler"))
+        .env("RUST_LOG", "debug")
+        .arg(&dataset)
+        .arg("--output")
+        .arg(&seeded_output)
+        .arg("--3dtiles-implicit")
+        .arg("--3dtiles-metadata-class")
+        .arg("building")
+        .status()
+        .expect("tyler should seed debug data");
+    assert!(
+        seed_status.success(),
+        "tyler debug seeding failed: {seed_status}"
+    );
+
+    let debug_data = seeded_output.join("debug");
+    assert!(
+        debug_data.is_dir(),
+        "seed run should create debug bincode data"
+    );
 
     let status = Command::new(env!("CARGO_BIN_EXE_tyler"))
-        .arg(repo.join("resources/data"))
+        .arg(&dataset)
         .arg("--output")
         .arg(&output)
         .arg("--debug-load-data")
-        .arg(&debug_data)
+        .arg({
+            let replay_data = unique_test_dir("coordinate-frame-replay");
+            fs::copy(
+                debug_data.join("world.bincode"),
+                replay_data.join("world.bincode"),
+            )
+            .expect("copy replay world");
+            fs::copy(
+                debug_data.join("quadtree.bincode"),
+                replay_data.join("quadtree.bincode"),
+            )
+            .expect("copy replay quadtree");
+            replay_data
+        })
         .arg("--3dtiles-implicit")
         .arg("--3dtiles-metadata-class")
         .arg("building")
