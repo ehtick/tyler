@@ -246,6 +246,14 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         .as_array()
         .expect("positions accessor should have max");
     for axis in 0..3 {
+        assert!(
+            min[axis].as_i64().is_some(),
+            "quantized POSITION min values must be raw integer components"
+        );
+        assert!(
+            max[axis].as_i64().is_some(),
+            "quantized POSITION max values must be raw integer components"
+        );
         assert!(min[axis].as_f64().unwrap() < 0.0);
         assert!(max[axis].as_f64().unwrap() > 0.0);
     }
@@ -282,6 +290,55 @@ fn convert_to_glb_writes_expected_geometry_layout() {
         root["extensions"]["EXT_structural_metadata"]["propertyTables"]
             .as_array()
             .is_some_and(|tables| !tables.is_empty())
+    );
+}
+
+#[test]
+fn convert_to_glb_omits_metadata_table_when_features_have_no_attributes() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building-1":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"2.2",
+                        "boundaries":[[[0,1,2]]]
+                    }]
+                }
+            },
+            "vertices":[
+                [0.0,0.0,0.0],
+                [1.0,0.0,0.0],
+                [0.0,1.0,0.0]
+            ]
+        }"#,
+    )
+    .expect("inline CityJSON fixture should parse");
+    let output_path = stable_output_path("no-attribute-metadata");
+
+    convert_to_glb(&model, &output_path, &ExportOptions::default())
+        .expect("GLB conversion should succeed without feature attributes");
+
+    let glb_bytes = fs::read(&output_path).expect("test GLB should be written");
+    let root = read_glb_json(&glb_bytes);
+
+    assert!(has_extension(&root, "EXT_mesh_features"));
+    assert!(!has_extension(&root, "EXT_structural_metadata"));
+    assert!(
+        root.get("extensions").is_none(),
+        "no attribute columns should mean no top-level structural metadata"
+    );
+
+    let feature_id =
+        &root["meshes"][0]["primitives"][0]["extensions"]["EXT_mesh_features"]["featureIds"][0];
+    assert_eq!(feature_id["attribute"].as_u64().unwrap(), 0);
+    assert_eq!(feature_id["featureCount"].as_u64().unwrap(), 1);
+    assert!(
+        feature_id.get("propertyTable").is_none(),
+        "mesh feature IDs must not reference a missing metadata property table"
     );
 }
 

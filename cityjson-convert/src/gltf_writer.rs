@@ -484,7 +484,13 @@ struct QuantizedPrimitiveMesh {
     normals: Vec<QuantizedNormal>,
     feature_ids: Vec<u32>,
     indices: IndexBuffer,
-    normalized_bounds: Bounds,
+    position_bounds: QuantizedBounds,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuantizedBounds {
+    min: [i16; 3],
+    max: [i16; 3],
 }
 
 struct QuantizedScene {
@@ -1566,35 +1572,27 @@ impl QuantizedScene {
 
 impl ProcessedPrimitiveMesh {
     fn quantize(&self, position_scale: f32) -> Result<QuantizedPrimitiveMesh> {
-        let bounds = Bounds::from_vertices(&self.vertices)
+        Bounds::from_vertices(&self.vertices)
             .ok_or_else(|| anyhow::anyhow!("primitive bounds missing for non-empty mesh"))?;
-        let normalized_bounds = Bounds {
-            min: [
-                (bounds.min[0] / position_scale).clamp(-1.0, 1.0),
-                (bounds.min[1] / position_scale).clamp(-1.0, 1.0),
-                (bounds.min[2] / position_scale).clamp(-1.0, 1.0),
-            ],
-            max: [
-                (bounds.max[0] / position_scale).clamp(-1.0, 1.0),
-                (bounds.max[1] / position_scale).clamp(-1.0, 1.0),
-                (bounds.max[2] / position_scale).clamp(-1.0, 1.0),
-            ],
-        };
+
+        let positions = self
+            .vertices
+            .iter()
+            .map(|vertex| QuantizedPosition {
+                position: [
+                    quantize_position_component(vertex.position[0], position_scale),
+                    quantize_position_component(vertex.position[1], position_scale),
+                    quantize_position_component(vertex.position[2], position_scale),
+                    0,
+                ],
+            })
+            .collect::<Vec<_>>();
+        let position_bounds = quantized_position_bounds(&positions)
+            .ok_or_else(|| anyhow::anyhow!("quantized primitive has no positions"))?;
 
         Ok(QuantizedPrimitiveMesh {
             feature_type: self.feature_type.clone(),
-            positions: self
-                .vertices
-                .iter()
-                .map(|vertex| QuantizedPosition {
-                    position: [
-                        quantize_position_component(vertex.position[0], position_scale),
-                        quantize_position_component(vertex.position[1], position_scale),
-                        quantize_position_component(vertex.position[2], position_scale),
-                        0,
-                    ],
-                })
-                .collect(),
+            positions,
             normals: self
                 .vertices
                 .iter()
@@ -1613,9 +1611,24 @@ impl ProcessedPrimitiveMesh {
                 .map(|vertex| vertex.feature_id)
                 .collect(),
             indices: self.select_index_buffer()?,
-            normalized_bounds,
+            position_bounds,
         })
     }
+}
+
+fn quantized_position_bounds(positions: &[QuantizedPosition]) -> Option<QuantizedBounds> {
+    let first = positions.first()?;
+    let mut min = [first.position[0], first.position[1], first.position[2]];
+    let mut max = min;
+
+    for position in &positions[1..] {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position.position[axis]);
+            max[axis] = max[axis].max(position.position[axis]);
+        }
+    }
+
+    Some(QuantizedBounds { min, max })
 }
 
 fn build_encoded_glb(
@@ -1674,9 +1687,11 @@ fn build_encoded_glb(
         extensions_used.push(MESHOPT_EXTENSION.to_string());
         extensions_required.push(MESHOPT_EXTENSION.to_string());
     }
+    if !primitive_feature_counts.is_empty() {
+        extensions_used.push(MESH_FEATURES_EXTENSION.to_string());
+    }
     if structural_metadata.is_some() {
         extensions_used.push(STRUCTURAL_METADATA_EXTENSION.to_string());
-        extensions_used.push(MESH_FEATURES_EXTENSION.to_string());
     }
 
     let mut buffers = vec![json::Buffer {
@@ -1830,7 +1845,7 @@ impl QuantizedScene {
                 &primitive.positions,
                 &primitive.normals,
                 &primitive.feature_ids,
-                &primitive.normalized_bounds,
+                &primitive.position_bounds,
                 meshopt_compression,
             )?;
             let index_accessor = buffer_builder.push_indices(
@@ -2136,7 +2151,7 @@ impl BufferBuilder {
         positions: &[QuantizedPosition],
         normals: &[QuantizedNormal],
         feature_ids: &[u32],
-        bounds: &Bounds,
+        bounds: &QuantizedBounds,
         meshopt_compression: bool,
     ) -> Result<VertexAccessors> {
         let position_view = if meshopt_compression {
@@ -2598,7 +2613,11 @@ impl EncodedGlb {
             inject_meshopt_extensions(&mut root_json, &self.meshopt_views)?;
         }
         if !self.primitive_feature_counts.is_empty() {
-            inject_mesh_feature_extensions(&mut root_json, &self.primitive_feature_counts)?;
+            inject_mesh_feature_extensions(
+                &mut root_json,
+                &self.primitive_feature_counts,
+                self.structural_metadata.is_some(),
+            )?;
         }
         if let Some(structural_metadata) = &self.structural_metadata {
             inject_structural_metadata_extension(&mut root_json, structural_metadata)?;
@@ -2653,6 +2672,7 @@ impl EncodedGlb {
 fn inject_mesh_feature_extensions(
     root: &mut JsonValue,
     primitive_feature_counts: &[usize],
+    has_structural_metadata: bool,
 ) -> Result<()> {
     let root_object = root
         .as_object_mut()
@@ -2679,15 +2699,22 @@ fn inject_mesh_feature_extensions(
     }
 
     for (primitive, feature_count) in primitives.iter_mut().zip(primitive_feature_counts.iter()) {
+        let mut feature_id = json_value!({
+            "featureCount": feature_count,
+            "attribute": 0,
+        });
+        if has_structural_metadata {
+            feature_id
+                .as_object_mut()
+                .expect("feature ID JSON should be an object")
+                .insert("propertyTable".to_string(), json_value!(0));
+        }
+
         insert_extension(
             primitive,
             MESH_FEATURES_EXTENSION,
             json_value!({
-                "featureIds": [{
-                    "featureCount": feature_count,
-                    "attribute": 0,
-                    "propertyTable": 0
-                }]
+                "featureIds": [feature_id]
             }),
         )?;
     }

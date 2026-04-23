@@ -33,6 +33,23 @@ coordinates and then apply a glTF root node matrix intended for local Z-up
 source data. That makes the placement contract hard to reason about and can
 place GLB content away from its intended 3D Tiles location.
 
+During implementation, the viewer failure was also traced to invalid GLB
+content metadata, not only to coordinate placement. The generated tileset could
+be traversed, but `3d-tiles-validator` reported content validation errors for
+every GLB:
+
+- quantized `POSITION` accessors used `SHORT` components with `normalized:
+  true`, but wrote normalized floating-point `min` and `max` values instead of
+  raw integer component bounds
+- primitives used `EXT_mesh_features` without consistently declaring it in
+  top-level `extensionsUsed`
+- primitives could reference `propertyTable: 0` even when no
+  `EXT_structural_metadata` property table was present
+
+Strict 3D Tiles viewers may reject invalid GLB content before placement is even
+evaluated. A geometrically correct coordinate frame therefore has to be paired
+with spec-valid glTF content.
+
 ## Decision
 
 Tyler will use EPSG:4979 `region` bounding volumes and local ENU metric glTF
@@ -58,6 +75,11 @@ Concretely:
    source mesh data in Z-up ENU coordinates inside the GLB buffers, the GLB
    root node must contain the standard Z-up-to-Y-up matrix so that the 3D Tiles
    runtime Y-up-to-Z-up transform cancels it.
+9. Generated GLBs must remain valid glTF 2.0 assets after quantization,
+   compression, and metadata injection. In particular, accessor `min` and `max`
+   values must match the accessor component type, every used extension must be
+   declared in `extensionsUsed`, and mesh feature IDs must only reference a
+   metadata property table when that table exists.
 
 The initial implementation target is root ENU for both explicit and implicit
 tilesets. This gives one coherent placement model:
@@ -98,6 +120,13 @@ Trade-offs:
   explicit tilesets if needed.
 - glTF Y-up handling remains subtle and must be tested. The transform pair must
   cancel in 3D Tiles runtimes.
+- GLB validity is part of the placement contract. If a viewer rejects tile
+  content due to invalid accessor bounds or extension metadata, the symptom can
+  look like misplaced or missing geometry even when the tileset transform and
+  bounding volumes are correct.
+- The output should be checked with `3d-tiles-validator` when debugging viewer
+  placement issues. `just ci` covers the writer regressions, but external
+  validation catches integration problems in the generated tileset package.
 
 ## Rejected Alternatives
 
