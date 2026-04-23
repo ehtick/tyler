@@ -368,11 +368,14 @@ fn build_tile_debug_cityjsonseq(
     feature_type_lods: &BTreeMap<String, String>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let models = prepare_tile_feature_models(world, feature_ids, feature_type_lods)?;
+    let base_root = cityjson_lib::json::from_slice(&world.feature_base_document)?;
     let mut feature_output = Vec::new();
-    for model in models {
-        cityjson_lib::json::to_feature_writer(&mut feature_output, &model)?;
-        feature_output.write_all(b"\n")?;
-    }
+    cityjson_lib::json::write_cityjsonseq_auto_transform(
+        &mut feature_output,
+        &base_root,
+        models,
+        [0.001, 0.001, 0.001],
+    )?;
     Ok(feature_output)
 }
 
@@ -1200,8 +1203,16 @@ mod tests {
         .expect("debug cityjsonseq utf8");
 
         assert!(!model.cityobjects().is_empty());
-        assert!(ndjson.contains("\"type\":\"CityJSONFeature\""));
-        assert_eq!(ndjson.lines().count(), 1);
+        let mut lines = ndjson.lines();
+        let header: Value =
+            serde_json::from_str(lines.next().expect("CityJSONSeq header should exist"))
+                .expect("CityJSONSeq header should parse");
+        let feature: Value =
+            serde_json::from_str(lines.next().expect("CityJSONSeq feature should exist"))
+                .expect("CityJSONSeq feature should parse");
+        assert_eq!(header["type"], "CityJSON");
+        assert_eq!(feature["type"], "CityJSONFeature");
+        assert_eq!(lines.count(), 0);
     }
 
     #[test]
