@@ -248,6 +248,15 @@ For example:
 
 `tyler … --object-attribute bouwjaar:int --object-attribute objectid:int --object-attribute bagpandid:string --object-attribute bgt_type:string`
 
+Some datasets, such as 3DBAG or roofer exports, store the attributes on a parent `Building`
+while the geometry lives on the child `BuildingPart`. In that case, enable
+`--include-parent-attributes` so Tyler copies inherited parent attributes onto the
+geometry-bearing child before GLB conversion.
+
+For example:
+
+`tyler … --object-type Building --object-type BuildingPart --include-parent-attributes`
+
 #### Colors
 
 Colors on the glTF features are set with the `--color-<cityobject type>` arguments.
