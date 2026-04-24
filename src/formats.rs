@@ -19,6 +19,7 @@ pub mod cesium3dtiles {
     //! Supported version: 1.1.
     //! Not supported: `extras`.
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::collections::VecDeque;
     use std::fmt::{Display, Formatter};
     use std::fs::File;
@@ -398,6 +399,7 @@ pub mod cesium3dtiles {
         /// Convert to implicit tiling.
         /// It modifies the tileset and deletes the explicit tiles.
         /// Expects that explicit tiling is already created.
+        #[allow(dead_code)]
         pub fn make_implicit(
             &mut self,
             grid: &SquareGrid,
@@ -745,8 +747,182 @@ pub mod cesium3dtiles {
                 bounding_volume: None,
                 uri: "t/{level}/{x}/{y}.glb".to_string(),
             });
+            self.root.refine = Some(Refinement::Add);
             self.root.children = None;
             (flat_tiles_with_content, subtrees_vec)
+        }
+
+        /// Convert the root tile to an implicit tileset using content tile IDs
+        /// that already follow the implicit subdivision coordinate system.
+        pub fn make_implicit_from_content_tile_ids(
+            &mut self,
+            content_tile_ids: &[TileId],
+            subtrees_dir: Option<&str>,
+        ) -> Vec<(TileId, Vec<u8>)> {
+            let available_levels = self.available_levels();
+            let subtree_levels = available_levels;
+            let subtrees = match subtrees_dir {
+                None => Subtrees::default(),
+                Some(dirname) => Subtrees::new(dirname),
+            };
+            self.root.implicit_tiling = Some(ImplicitTiling {
+                subdivision_scheme: SubdivisionScheme::Quadtree,
+                subtree_levels,
+                available_levels,
+                subtrees,
+            });
+            self.root.content = Some(Content {
+                bounding_volume: None,
+                uri: "t/{level}/{x}/{y}.glb".to_string(),
+            });
+            self.root.refine = Some(Refinement::Add);
+            self.root.children = None;
+
+            vec![Self::implicit_root_subtree_from_content_tile_ids(
+                available_levels,
+                content_tile_ids,
+            )]
+        }
+
+        fn implicit_root_subtree_from_content_tile_ids(
+            available_levels: u16,
+            content_tile_ids: &[TileId],
+        ) -> (TileId, Vec<u8>) {
+            let mut available_tiles = HashSet::new();
+            let mut content_tiles = HashSet::new();
+
+            for tile_id in content_tile_ids {
+                if tile_id.level >= available_levels {
+                    warn!(
+                        "Skipping implicit content tile {} because availableLevels is {}",
+                        tile_id, available_levels
+                    );
+                    continue;
+                }
+
+                content_tiles.insert(tile_id.clone());
+                for ancestor_level in 0..=tile_id.level {
+                    let shift = tile_id.level - ancestor_level;
+                    available_tiles.insert(TileId::new(
+                        tile_id.x >> shift,
+                        tile_id.y >> shift,
+                        ancestor_level,
+                    ));
+                }
+            }
+
+            let nr_tiles_total_subtree = (4_usize.pow(available_levels as u32) - 1) / 3;
+            let mut tile_availability_bitstream: bv::BitVec<u8, bv::Lsb0> = bv::BitVec::new();
+            tile_availability_bitstream.resize(nr_tiles_total_subtree, false);
+            let mut content_availability_bitstream: bv::BitVec<u8, bv::Lsb0> = bv::BitVec::new();
+            content_availability_bitstream.resize(nr_tiles_total_subtree, false);
+
+            for tile_id in available_tiles {
+                let index = Self::implicit_tile_bit_index(&tile_id);
+                if index < nr_tiles_total_subtree {
+                    tile_availability_bitstream.set(index, true);
+                }
+            }
+            for tile_id in content_tiles {
+                let index = Self::implicit_tile_bit_index(&tile_id);
+                if index < nr_tiles_total_subtree {
+                    content_availability_bitstream.set(index, true);
+                }
+            }
+
+            let nr_tiles_child_level = 4_usize.pow(available_levels as u32);
+            let mut child_subtree_availability_bitstream: bv::BitVec<u8, bv::Lsb0> =
+                bv::BitVec::new();
+            child_subtree_availability_bitstream.resize(nr_tiles_child_level, false);
+
+            let subtree_id = TileId::new(0, 0, 0);
+            (
+                subtree_id,
+                Self::subtree_bytes_from_availability(
+                    &tile_availability_bitstream,
+                    &content_availability_bitstream,
+                    &child_subtree_availability_bitstream,
+                ),
+            )
+        }
+
+        fn implicit_tile_bit_index(tile_id: &TileId) -> usize {
+            let level_offset = (4_usize.pow(tile_id.level as u32) - 1) / 3;
+            let morton_index = morton_encode([tile_id.y as u64, tile_id.x as u64]) as usize;
+            level_offset + morton_index
+        }
+
+        fn subtree_bytes_from_availability(
+            tile_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+            content_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+            child_subtree_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+        ) -> Vec<u8> {
+            let mut buffer_vec: Vec<u8> = Vec::new();
+            let mut bufferviews: Vec<BufferView> = Vec::with_capacity(3);
+            let mut bufferview_idx: usize = 0;
+
+            let mut tile_availability_bits = tile_availability_bitstream.clone();
+            let tile_availability =
+                Self::create_availability(bufferview_idx, &mut tile_availability_bits);
+            if tile_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(&mut buffer_vec, &mut bufferviews, tile_availability_bits);
+                bufferview_idx += 1;
+            }
+
+            let mut content_availability_bits = content_availability_bitstream.clone();
+            let content_availability =
+                Self::create_availability(bufferview_idx, &mut content_availability_bits);
+            if content_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(&mut buffer_vec, &mut bufferviews, content_availability_bits);
+                bufferview_idx += 1;
+            }
+
+            let mut child_subtree_availability_bits = child_subtree_availability_bitstream.clone();
+            let child_subtree_availability =
+                Self::create_availability(bufferview_idx, &mut child_subtree_availability_bits);
+            if child_subtree_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(
+                    &mut buffer_vec,
+                    &mut bufferviews,
+                    child_subtree_availability_bits,
+                );
+            }
+
+            Self::add_padding(&mut buffer_vec, 8);
+
+            let buffer = Buffer {
+                name: None,
+                byte_length: buffer_vec.len(),
+            };
+            let subtree = Subtree {
+                buffers: Some(vec![buffer]),
+                buffer_views: Some(bufferviews),
+                tile_availability,
+                content_availability: Some(vec![content_availability]),
+                child_subtree_availability,
+            };
+            let mut subtree_json =
+                serde_json::to_string(&subtree).expect("failed to serialize the subtree to json");
+            let remainder = subtree_json.as_bytes().len() % 8;
+            if remainder > 0 {
+                let padding = 8 - remainder;
+                for _i in 0..padding {
+                    subtree_json += " ";
+                }
+            }
+            let subtree_json_bytes = subtree_json.as_bytes();
+
+            let mut subtree_bytes: Vec<u8> = Vec::new();
+            subtree_bytes.extend(0x74627573u32.to_le_bytes());
+            subtree_bytes.extend(1_u32.to_le_bytes());
+            subtree_bytes.extend((subtree_json_bytes.len() as u64).to_le_bytes());
+            subtree_bytes.extend((buffer_vec.len() as u64).to_le_bytes());
+            subtree_bytes.extend(subtree_json_bytes);
+            subtree_bytes.extend(buffer_vec);
+            subtree_bytes
         }
 
         fn add_padding(buffer_vec: &mut Vec<u8>, align_by: usize) {
@@ -797,6 +973,7 @@ pub mod cesium3dtiles {
             }
         }
 
+        #[allow(dead_code)]
         fn tile_corner_coordinate(grid: &SquareGrid, qtree: &QuadTree, tile: &Tile) -> String {
             let tileid = &tile.id;
             let qtree_nodeid: QuadTreeNodeId = tileid.into();
@@ -808,6 +985,7 @@ pub mod cesium3dtiles {
         /// Build a map of grid-cell-corner-coorinates and cell ID-s.
         /// It is used for matching the "theoretical grid" to the quadtree nodes, based
         /// on the coordinates.
+        #[allow(dead_code)]
         fn grid_coordinate_map(
             level_current: u32,
             extent_width: f64,
@@ -1163,7 +1341,9 @@ pub mod cesium3dtiles {
         }
     }
 
-    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    #[derive(
+        Serialize, Deserialize, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+    )]
     pub struct TileId {
         pub(crate) x: usize,
         pub(crate) y: usize,

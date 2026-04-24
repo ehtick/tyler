@@ -64,7 +64,7 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -72,10 +72,12 @@ use std::path::{Path, PathBuf};
 
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
+use crate::proj::Proj;
 use cityjson_lib::cityjson::prelude::{CityObjectHandle, GeometryHandle};
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, clap::ValueEnum, Eq, PartialEq)]
 #[clap(rename_all = "lower")]
@@ -105,6 +107,22 @@ struct PreparedInput {
     source: parser::InputSource,
     metadata_path: PathBuf,
     feature_base_document: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TileExportJob {
+    source_tile: Option<Tile>,
+    source_tile_id: Option<TileId>,
+    content_tile_id: TileId,
+    feature_ids: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GeographicBounds {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
 }
 
 fn build_glb_export_options(
@@ -297,6 +315,219 @@ fn collect_tile_feature_ids(
         }
     }
     feature_ids
+}
+
+fn explicit_tile_export_jobs(
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+    tileset: &formats::cesium3dtiles::Tileset,
+) -> Vec<TileExportJob> {
+    tileset
+        .collect_leaves()
+        .into_iter()
+        .filter_map(|tile_ref| {
+            let tile = tile_ref.clone();
+            let qtree_nodeid: spatial_structs::QuadTreeNodeId = (&tile.id).into();
+            let qtree_node = quadtree.node(&qtree_nodeid)?;
+            let feature_ids = collect_tile_feature_ids(world, qtree_node);
+            Some(TileExportJob {
+                source_tile: Some(tile.clone()),
+                source_tile_id: Some(tile.id.clone()),
+                content_tile_id: tile.id,
+                feature_ids,
+            })
+        })
+        .collect()
+}
+
+fn geographic_implicit_tile_export_jobs(
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+    tileset: &formats::cesium3dtiles::Tileset,
+    root_region: GeographicBounds,
+    transformer: &Proj,
+) -> Result<Vec<TileExportJob>, Box<dyn std::error::Error>> {
+    let mut content_tile_features: HashMap<TileId, HashSet<usize>> = HashMap::new();
+    let mut feature_geographic_bounds: HashMap<usize, GeographicBounds> = HashMap::new();
+    let unique_assignment = geographic_implicit_unique_assignment(world);
+    let mut feature_tile_assignments = 0usize;
+
+    for tile_ref in tileset.collect_leaves() {
+        let source_tile_id = tile_ref.id.clone();
+        let qtree_nodeid: spatial_structs::QuadTreeNodeId = (&source_tile_id).into();
+        let Some(qtree_node) = quadtree.node(&qtree_nodeid) else {
+            continue;
+        };
+        if qtree_node.nr_items == 0 {
+            continue;
+        }
+
+        for feature_id in collect_tile_feature_ids(world, qtree_node) {
+            let content_level = source_tile_id.level;
+            let content_tile_ids = if unique_assignment {
+                vec![geographic_tile_id_for_feature_centroid(
+                    root_region,
+                    &world.features[feature_id],
+                    content_level,
+                    transformer,
+                )?]
+            } else {
+                let feature_bounds =
+                    if let Some(bounds) = feature_geographic_bounds.get(&feature_id) {
+                        *bounds
+                    } else {
+                        let bounds = geographic_bounds_from_source_bbox(
+                            &world.features[feature_id].bbox,
+                            transformer,
+                        )?;
+                        feature_geographic_bounds.insert(feature_id, bounds);
+                        bounds
+                    };
+                geographic_tile_ids_for_bounds(root_region, feature_bounds, content_level)
+            };
+            for content_tile_id in content_tile_ids {
+                feature_tile_assignments += 1;
+                content_tile_features
+                    .entry(content_tile_id)
+                    .or_default()
+                    .insert(feature_id);
+            }
+        }
+    }
+
+    let mut jobs: Vec<TileExportJob> = content_tile_features
+        .into_iter()
+        .map(|(content_tile_id, feature_ids)| {
+            let mut feature_ids: Vec<usize> = feature_ids.into_iter().collect();
+            feature_ids.sort_unstable();
+            TileExportJob {
+                source_tile: None,
+                source_tile_id: None,
+                content_tile_id,
+                feature_ids,
+            }
+        })
+        .collect();
+    jobs.sort_by(|lhs, rhs| lhs.content_tile_id.cmp(&rhs.content_tile_id));
+    info!(
+        "Geographic implicit tiling assigned {} source features to {} content tiles ({} feature-tile assignments)",
+        world.features.len(),
+        jobs.len(),
+        feature_tile_assignments
+    );
+    Ok(jobs)
+}
+
+fn geographic_implicit_unique_assignment(world: &parser::World) -> bool {
+    world.cityobject_types.as_ref().is_some_and(|types| {
+        types.iter().any(|object_type| {
+            matches!(
+                object_type,
+                parser::CityObjectType::Building | parser::CityObjectType::BuildingPart
+            )
+        })
+    })
+}
+
+fn geographic_tile_id_for_feature_centroid(
+    root: GeographicBounds,
+    feature: &parser::Feature,
+    level: u16,
+    transformer: &Proj,
+) -> Result<TileId, Box<dyn std::error::Error>> {
+    let z = f64::midpoint(feature.bbox[2], feature.bbox[5]);
+    let (lon, lat, _height) =
+        transformer.convert((feature.centroid()[0], feature.centroid()[1], z))?;
+    let tiles_per_axis = 1_usize << level;
+    let tile_width = (root.east - root.west) / tiles_per_axis as f64;
+    let tile_height = (root.north - root.south) / tiles_per_axis as f64;
+
+    Ok(TileId::new(
+        geographic_tile_index(lon, root.west, tile_width, tiles_per_axis),
+        geographic_tile_index(lat, root.south, tile_height, tiles_per_axis),
+        level,
+    ))
+}
+
+fn geographic_bounds_from_source_bbox(
+    bbox: &spatial_structs::Bbox,
+    transformer: &Proj,
+) -> Result<GeographicBounds, Box<dyn std::error::Error>> {
+    let mut west = f64::INFINITY;
+    let mut south = f64::INFINITY;
+    let mut east = f64::NEG_INFINITY;
+    let mut north = f64::NEG_INFINITY;
+
+    for [x, y, z] in bbox_corners(bbox) {
+        let (lon, lat, _height) = transformer.convert((x, y, z))?;
+        west = west.min(lon);
+        south = south.min(lat);
+        east = east.max(lon);
+        north = north.max(lat);
+    }
+
+    Ok(GeographicBounds {
+        west,
+        south,
+        east,
+        north,
+    })
+}
+
+fn geographic_tile_ids_for_bounds(
+    root: GeographicBounds,
+    bounds: GeographicBounds,
+    level: u16,
+) -> Vec<TileId> {
+    let tiles_per_axis = 1_usize << level;
+    let tile_width = (root.east - root.west) / tiles_per_axis as f64;
+    let tile_height = (root.north - root.south) / tiles_per_axis as f64;
+
+    if tile_width <= 0.0 || tile_height <= 0.0 {
+        return Vec::new();
+    }
+
+    let x_min = geographic_tile_index(bounds.west, root.west, tile_width, tiles_per_axis);
+    let x_max = geographic_tile_index(bounds.east, root.west, tile_width, tiles_per_axis);
+    let y_min = geographic_tile_index(bounds.south, root.south, tile_height, tiles_per_axis);
+    let y_max = geographic_tile_index(bounds.north, root.south, tile_height, tiles_per_axis);
+
+    let mut tile_ids = Vec::new();
+    for y in y_min..=y_max {
+        for x in x_min..=x_max {
+            tile_ids.push(TileId::new(x, y, level));
+        }
+    }
+    tile_ids
+}
+
+fn geographic_tile_index(value: f64, origin: f64, tile_size: f64, tiles_per_axis: usize) -> usize {
+    let max_index = tiles_per_axis.saturating_sub(1) as isize;
+    (((value - origin) / tile_size).floor() as isize).clamp(0, max_index) as usize
+}
+
+fn bbox_corners(bbox: &spatial_structs::Bbox) -> [[f64; 3]; 8] {
+    [
+        [bbox[0], bbox[1], bbox[2]],
+        [bbox[0], bbox[1], bbox[5]],
+        [bbox[0], bbox[4], bbox[2]],
+        [bbox[0], bbox[4], bbox[5]],
+        [bbox[3], bbox[1], bbox[2]],
+        [bbox[3], bbox[1], bbox[5]],
+        [bbox[3], bbox[4], bbox[2]],
+        [bbox[3], bbox[4], bbox[5]],
+    ]
+}
+
+fn tiles_results_successful_content_tile_ids(
+    all_content_tile_ids: &[TileId],
+    failed_content_tile_ids: &HashSet<TileId>,
+) -> Vec<TileId> {
+    all_content_tile_ids
+        .iter()
+        .filter(|tile_id| !failed_content_tile_ids.contains(*tile_id))
+        .cloned()
+        .collect()
 }
 
 fn read_tile_feature_models(
@@ -883,26 +1114,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tileset.export(Some(&debug_data_output_path))?;
     }
 
-    let (tiles, _subtrees) = match cli.cesium3dtiles_implicit {
+    let source_crs = format!("EPSG:{}", world.crs.to_epsg()?);
+    let source_to_geographic = Proj::new_known_crs(&source_crs, "EPSG:4979", None)?;
+    let root_geographic_bounds =
+        geographic_bounds_from_source_bbox(&quadtree.bbox(&world.grid), &source_to_geographic)?;
+
+    let export_jobs = match cli.cesium3dtiles_implicit {
         true => {
+            if cli.cesium3dtiles_content_clip_to_tile_bounds {
+                warn!("--3dtiles-content-clip-to-tile-bounds is not applied for geographic implicit tiling yet");
+            }
+            let export_jobs = geographic_implicit_tile_export_jobs(
+                &world,
+                &quadtree,
+                &tileset,
+                root_geographic_bounds,
+                &source_to_geographic,
+            )?;
+            let content_tile_ids: Vec<TileId> = export_jobs
+                .iter()
+                .map(|job| job.content_tile_id.clone())
+                .collect();
             let mut tileset_implicit = tileset.clone();
-            // FIXME: here we have a Vec<(Tile, TileId)> in 'tiles' instead of Vec<&Tile>, because of the
-            //  mess with the implicit/explicit tile id-s.
-            info!("Converting to implicit tiling");
-            // Tileset.make_implicit() outputs the tiles that have content. If only the leaves have
-            //  content, then only the leaves are outputted.
+            info!("Converting to geographic implicit tiling");
             let components: Vec<_> = subtrees_path_unpruned
                 .components()
                 .map(|comp| comp.as_os_str())
                 .collect();
             let subtrees_dir_option = components.last().cloned().unwrap().to_str();
-            let tiles_subtrees = tileset_implicit.make_implicit(
-                &world.grid,
-                &quadtree,
-                cli.grid_export,
-                subtrees_dir_option,
-                Some(&debug_data_output_path),
-            );
+            let subtrees = tileset_implicit
+                .make_implicit_from_content_tile_ids(&content_tile_ids, subtrees_dir_option);
 
             if cli.cesium3dtiles_tileset_only || log_enabled!(Level::Debug) {
                 info!("Writing unpruned 3D Tiles tileset");
@@ -910,7 +1151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 info!("Writing unpruned subtrees for implicit tiling");
                 fs::create_dir_all(&subtrees_path_unpruned)?;
-                for (subtree_id, subtree_bytes) in &tiles_subtrees.1 {
+                for (subtree_id, subtree_bytes) in &subtrees {
                     fs::create_dir_all(
                         subtrees_path_unpruned
                             .join(format!("{}/{}", subtree_id.level, subtree_id.x)),
@@ -927,21 +1168,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            tiles_subtrees
+            export_jobs
         }
         false => {
-            let just_tiles = tileset.collect_leaves();
-            // FIXME: here we need Vec<(Tile, TileId)> instead of Vec<&Tile>, for the same reason
-            //  as above
-            let tiles: Vec<(Tile, TileId)> = just_tiles
-                .into_iter()
-                .map(|tile_ref| (tile_ref.clone(), tile_ref.id.clone()))
-                .collect();
+            let export_jobs = explicit_tile_export_jobs(&world, &quadtree, &tileset);
 
             info!("Writing unpruned 3D Tiles tileset");
             tileset.to_file(&tileset_path_unpruned)?;
 
-            (tiles, vec![])
+            export_jobs
         }
     };
 
@@ -958,7 +1193,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Created output directory {:#?}", &path_features_input_dir);
         }
 
-        let source_crs = format!("EPSG:{}", world.crs.to_epsg()?);
         let geometry_placement = cityjson_convert::GeometryPlacement::Enu {
             source_crs,
             ecef_origin: root_enu_frame.ecef_origin,
@@ -968,26 +1202,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let export_options = build_glb_export_options(&cli, geometry_placement, None);
         let feature_type_lods = build_feature_type_lods(&cli);
-        let tiles_len = tiles.len();
-        let tiles_failed_iter = tiles.into_par_iter().map(|(tile, tileid)| {
-            let tileid_grid = &tile.id;
-            let qtree_nodeid: spatial_structs::QuadTreeNodeId = tileid_grid.into();
-            let qtree_node = quadtree
-                .node(&qtree_nodeid)
-                .unwrap_or_else(|| panic!("did not find tile {} in quadtree", tileid_grid));
-            if qtree_node.nr_items == 0 {
+        let tiles_len = export_jobs.len();
+        let all_content_tile_ids: Vec<TileId> = export_jobs
+            .iter()
+            .map(|job| job.content_tile_id.clone())
+            .collect();
+        let tiles_failed_iter = export_jobs.into_par_iter().map(|job| {
+            if job.feature_ids.is_empty() {
                 // The Tileset.prune() method removes the empty tiles from the tileset,
                 //  so skipping the tile conversion without failure is ok if it's empty.
-                debug!("Tile is empty ({}), skipping conversion", tileid_grid);
+                debug!(
+                    "Tile is empty ({}), skipping conversion",
+                    job.content_tile_id
+                );
                 return None;
             }
-            let tileid_string = tileid.to_string();
+            let tileid_string = job.content_tile_id.to_string();
             let file_name = tileid_string;
             let output_file = path_output_tiles.join(&file_name).with_extension("glb");
-            let feature_ids = collect_tile_feature_ids(&world, qtree_node);
             let model = match build_tile_model_from_feature_ids(
                 &world,
-                &feature_ids,
+                &job.feature_ids,
                 &feature_type_lods,
                 cli.include_parent_attributes,
             ) {
@@ -995,15 +1230,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => {
                     warn!(
                         "Failed to build CityJSON model for tile {}: {}",
-                        tileid_grid, error
+                        job.content_tile_id, error
                     );
-                    return Some(tile);
+                    return Some(job);
                 }
             };
             if cli.debug_tile_inputs {
                 let cityjsonseq_bytes = match build_tile_debug_cityjsonseq(
                     &world,
-                    &feature_ids,
+                    &job.feature_ids,
                     &feature_type_lods,
                     cli.include_parent_attributes,
                 ) {
@@ -1011,9 +1246,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(error) => {
                         warn!(
                             "Failed to build debug CityJSONFeature stream for tile {}: {}",
-                            tileid_grid, error
+                            job.content_tile_id, error
                         );
-                        return Some(tile);
+                        return Some(job);
                     }
                 };
                 if let Err(error) = write_debug_tile_input(
@@ -1023,34 +1258,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ) {
                     warn!(
                         "Failed to write debug CityJSONFeature stream for tile {}: {}",
-                        tileid_grid, error
+                        job.content_tile_id, error
                     );
-                    return Some(tile);
+                    return Some(job);
                 }
             }
             let mut tile_export_options = export_options.clone();
-            if cli.cesium3dtiles_content_clip_to_tile_bounds {
-                tile_export_options.clip_bbox = Some(qtree_node.bbox(&world.grid));
+            if cli.cesium3dtiles_content_clip_to_tile_bounds && !cli.cesium3dtiles_implicit {
+                if let Some(source_tile_id) = &job.source_tile_id {
+                    let qtree_nodeid: spatial_structs::QuadTreeNodeId = source_tile_id.into();
+                    let qtree_node = quadtree.node(&qtree_nodeid).unwrap_or_else(|| {
+                        panic!("did not find tile {} in quadtree", source_tile_id)
+                    });
+                    tile_export_options.clip_bbox = Some(qtree_node.bbox(&world.grid));
+                }
             }
             if let Err(error) =
                 cityjson_convert::convert_to_glb(&model, &output_file, &tile_export_options)
             {
-                warn!("Tile {} conversion failed: {}", tileid_grid, error);
-                return Some(tile);
+                warn!("Tile {} conversion failed: {}", job.content_tile_id, error);
+                return Some(job);
             }
             if !output_file.exists() {
                 warn!(
                     "Tile {} conversion failed: {} was not created",
-                    tileid_grid,
+                    job.content_tile_id,
                     output_file.display()
                 );
-                return Some(tile);
+                return Some(job);
             }
 
             None
         });
 
-        let mut tiles_results: Vec<Option<Tile>> = Vec::with_capacity(tiles_len + 2);
+        let mut tiles_results: Vec<Option<TileExportJob>> = Vec::with_capacity(tiles_len + 2);
         if let Some(tiles_results_path) = debug_data.tiles_results {
             info!("Loading tiles_results from {tiles_results_path:?}");
             let tiles_results_file = File::open(tiles_results_path)?;
@@ -1068,32 +1309,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bincode::serialize_into(tiles_results_file, &tiles_results)?;
             }
         }
-        let tiles_failed: Vec<Tile> = tiles_results.into_iter().flatten().collect();
+        let tiles_failed: Vec<TileExportJob> = tiles_results.into_iter().flatten().collect();
         info!("Done");
 
         info!("Pruning tileset of {} failed tiles", tiles_failed.len());
         for (i, failed) in tiles_failed.iter().enumerate() {
-            debug!("{}, removing failed from the tileset: {}", i, failed.id);
+            debug!(
+                "{}, removing failed from the tileset: {}",
+                i, failed.content_tile_id
+            );
         }
-        // Remove tiles that failed the gltf conversion
-        tileset.prune(&tiles_failed, &quadtree);
         if cli.cesium3dtiles_implicit {
-            // FIXME: here we re-create the implicit tileset from the pruned tileset,
-            //  because it is simpler than flipping the bits of the unavailable tiles,
-            //  because of the mixed up explicit/implicit tile IDs. But ideally, we
-            //  flip the bits, so we won't need to duplicate the tileset here.
+            let failed_content_tile_ids: HashSet<TileId> = tiles_failed
+                .iter()
+                .map(|failed| failed.content_tile_id.clone())
+                .collect();
+            let content_tile_ids: Vec<TileId> = tiles_results_successful_content_tile_ids(
+                &all_content_tile_ids,
+                &failed_content_tile_ids,
+            );
             let components: Vec<_> = subtrees_path
                 .components()
                 .map(|comp| comp.as_os_str())
                 .collect();
             let subtrees_dir_option = components.last().cloned().unwrap().to_str();
-            let (_, subtrees) = tileset.make_implicit(
-                &world.grid,
-                &quadtree,
-                cli.grid_export,
-                subtrees_dir_option,
-                Some(&debug_data_output_path),
-            );
+            let subtrees =
+                tileset.make_implicit_from_content_tile_ids(&content_tile_ids, subtrees_dir_option);
             info!("Writing subtrees for implicit tiling");
             fs::create_dir_all(&subtrees_path)?;
             for (subtree_id, subtree_bytes) in subtrees {
@@ -1111,6 +1352,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
+            let failed_tiles: Vec<Tile> = tiles_failed
+                .into_iter()
+                .filter_map(|failed| failed.source_tile)
+                .collect();
+            // Remove tiles that failed the gltf conversion
+            tileset.prune(&failed_tiles, &quadtree);
             let available_levels = tileset.available_levels();
             // A five level deep tree is still managable in size.
             if available_levels > 5 {
@@ -1706,5 +1953,33 @@ mod tests {
 
         assert!(!model.cityobjects().is_empty());
         assert!(!model.vertices().is_empty());
+    }
+
+    #[test]
+    fn geographic_bounds_map_to_lon_lat_implicit_tile_ids() {
+        let root = GeographicBounds {
+            west: 0.0,
+            south: 50.0,
+            east: 4.0,
+            north: 54.0,
+        };
+        let bounds = GeographicBounds {
+            west: 2.1,
+            south: 51.1,
+            east: 3.9,
+            north: 52.9,
+        };
+
+        let tile_ids = geographic_tile_ids_for_bounds(root, bounds, 2);
+
+        assert_eq!(
+            tile_ids,
+            vec![
+                TileId::new(2, 1, 2),
+                TileId::new(3, 1, 2),
+                TileId::new(2, 2, 2),
+                TileId::new(3, 2, 2),
+            ]
+        );
     }
 }
