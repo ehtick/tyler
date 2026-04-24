@@ -6,7 +6,8 @@ Accepted
 
 ## Related Commits
 
-- none yet
+- 7ba9bef04805753d2e8ee3bb762c891d2431cf12
+- ad853afd987089c6907e70d82055593440bf4b6c
 
 ## Context
 
@@ -82,6 +83,7 @@ Concretely:
 4. Implicit tiles use additive refinement.
    - Content is assigned at the corresponding source leaf level.
    - Parent and child content may both be available in the implicit hierarchy.
+   - The implicit root tile template is serialized with `refine: "ADD"`.
    - `refine: "ADD"` prevents parent content from disappearing when child
      content is selected.
 
