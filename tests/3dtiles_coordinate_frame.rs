@@ -146,6 +146,11 @@ fn debug_replay_writes_epsg4979_regions_and_local_enu_glbs() {
 
     assert_tile_bounding_volumes_are_regions(root);
     assert_eq!(
+        root["refine"].as_str(),
+        Some("ADD"),
+        "implicit root should use additive refinement so parent content remains visible"
+    );
+    assert_eq!(
         root["content"]["uri"].as_str(),
         Some("t/{level}/{x}/{y}.glb")
     );

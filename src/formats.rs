@@ -775,6 +775,7 @@ pub mod cesium3dtiles {
                 bounding_volume: None,
                 uri: "t/{level}/{x}/{y}.glb".to_string(),
             });
+            self.root.refine = Some(Refinement::Add);
             self.root.children = None;
 
             vec![Self::implicit_root_subtree_from_content_tile_ids(
