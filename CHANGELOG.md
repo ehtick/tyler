@@ -6,6 +6,7 @@
 
 - Native GLB generation in Rust through `cityjson-convert`.
 - Optional intermediary tile materialization in CityJSONSeq format for debugging.
+- Opt-in `--include-parent-attributes` handling for 3DBAG/roofer-style parent-child datasets, copying inherited parent attributes onto geometry-bearing CityObjects before GLB export.
 - Support for regular CityJSON documents, CityJSONSeq documents, and the legacy CityJSONFeature-files as input, via the `cityjson-index` crate.
 - A `just ci-check` recipe and a GitHub Actions workflow that runs it.
 - ADRs and supporting documentation for the new `cityjson-index`/CityJSONSeq input model and grid traversal changes.

@@ -103,6 +103,10 @@ pub struct Cli {
     /// Write the per-tile CityJSONFeature streams used for GLB conversion to output/inputs/.
     #[arg(long)]
     pub debug_tile_inputs: bool,
+    /// Copy inherited parent attributes onto geometry-bearing CityObjects before GLB conversion.
+    /// This is useful for 3DBAG/roofer-style parent-child models where attributes live on the parent.
+    #[arg(long)]
+    pub include_parent_attributes: bool,
     /// Maximum error that is allowed in mesh simplification to reduce the number of vertices. Value should be a float that represents that maximum allowed error in meters. Ignored for building object types.
     #[arg(long, default_value = "1.0")]
     pub simplification_max_error: Option<f64>,
@@ -361,6 +365,15 @@ mod tests {
         let otypes = &cli.object_type.unwrap();
         assert!(otypes.contains(&crate::parser::CityObjectType::Building));
         assert!(otypes.contains(&crate::parser::CityObjectType::PlantCover));
+    }
+
+    #[test]
+    fn verify_include_parent_attributes_flag() {
+        let dataset_dir = legacy_dataset_dir();
+        let mut args = required_args(&dataset_dir);
+        args.push("--include-parent-attributes".to_string());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.include_parent_attributes);
     }
 
     #[test]
