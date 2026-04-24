@@ -599,15 +599,29 @@ impl SquareGrid {
     /// Return the Cells that intersect the Bounding Box.
     pub fn intersect_bbox(&self, bbox: &Bbox) -> Vec<CellId> {
         let mut cellids: Vec<CellId> = Vec::new();
-        let [minx, miny, _, maxx, maxy, _] = *bbox;
-        let min_cellid = self.locate_point(&[minx, miny]);
-        let max_cellid = self.locate_point(&[maxx, maxy]);
-        for column in min_cellid.column..=max_cellid.column {
-            for row in min_cellid.row..=max_cellid.row {
+        let (columns, rows) = self.intersect_bbox_ranges(bbox);
+        for column in columns {
+            for row in rows.clone() {
                 cellids.push(CellId { row, column });
             }
         }
         cellids
+    }
+
+    pub fn intersect_bbox_ranges(
+        &self,
+        bbox: &Bbox,
+    ) -> (
+        std::ops::RangeInclusive<usize>,
+        std::ops::RangeInclusive<usize>,
+    ) {
+        let [minx, miny, _, maxx, maxy, _] = *bbox;
+        let min_cellid = self.locate_point(&[minx, miny]);
+        let max_cellid = self.locate_point(&[maxx, maxy]);
+        (
+            min_cellid.column..=max_cellid.column,
+            min_cellid.row..=max_cellid.row,
+        )
     }
 
     /// Exports the grid and the feature centroids into TSV files into the working directory.
@@ -910,6 +924,21 @@ mod tests {
         let res = grid.intersect_bbox(&bbox);
         assert_eq!(expected.len(), res.len());
         assert!(res.iter().all(|res_cellid| expected.contains(res_cellid)))
+    }
+
+    #[test]
+    fn test_intersect_bbox_ranges_matches_intersect_bbox() {
+        let grid = SquareGrid::new(&[0.0, 0.0, 0.0, 4.0, 4.0, 0.0], 1, 7415);
+        let bbox: Bbox = [1.2, 1.2, 0.0, 2.8, 2.8, 0.0];
+        let (columns, rows) = grid.intersect_bbox_ranges(&bbox);
+        let mut from_ranges = Vec::new();
+        for column in columns {
+            for row in rows.clone() {
+                from_ranges.push(CellId { row, column });
+            }
+        }
+
+        assert_eq!(grid.intersect_bbox(&bbox), from_ranges);
     }
 
     #[test]

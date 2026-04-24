@@ -546,10 +546,18 @@ fn filter_cityjsonfeature_preserving_root<F>(
     predicate: F,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>>
 where
-    F: FnMut(cityjson_lib::ops::FilterContext<'_>) -> bool,
+    F: FnMut(cityjson_lib::ops::CityObjectSelectionContext<'_>) -> bool,
 {
     let had_feature_root = model.id().is_some();
-    let mut filtered = cityjson_lib::ops::filter(model, predicate)?;
+    let selection = cityjson_lib::ops::select_cityobjects(model, predicate)?;
+    let mut filtered = if selection.is_empty() {
+        let mut empty = model.clone();
+        empty.clear_cityobjects();
+        empty.set_id(None);
+        empty
+    } else {
+        cityjson_lib::ops::extract(model, &selection)?
+    };
 
     if !had_feature_root || filtered.id().is_some() || filtered.cityobjects().is_empty() {
         return Ok(filtered);
