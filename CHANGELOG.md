@@ -16,6 +16,8 @@
 - `cityjson-index` backed runs now persist row-ordered feature references from
   grid indexing and reuse them during tile conversion, avoiding repeated
   feature-id lookups.
+- Grid indexing for `cityjson-index` inputs now consumes decoded scan pages
+  directly instead of paging references and issuing per-feature reads.
 - Tile conversion now uses thread-local `CityIndex` handles for cjindex reads
   and defers normal per-feature cleanup until after tile model merging.
 - Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.

@@ -406,19 +406,6 @@ impl World {
         ]
     }
 
-    pub(crate) fn read_cjindex_feature_thread_local(
-        input_source: &InputSource,
-        feature: &cityjson_index::IndexedFeatureRef,
-    ) -> cityjson_lib::Result<cityjson_lib::CityModel> {
-        Self::read_cjindex_features_thread_local(input_source, std::slice::from_ref(feature)).map(
-            |mut models| {
-                models
-                    .pop()
-                    .expect("single-feature batch should return one model")
-            },
-        )
-    }
-
     pub(crate) fn read_cjindex_features_thread_local(
         input_source: &InputSource,
         features: &[cityjson_index::IndexedFeatureRef],
@@ -623,20 +610,18 @@ impl World {
                 }
             }
             InputSource::CjIndexDataset { .. } => {
-                let input_source = self.input_source.clone();
                 let city_index = self.input_source.open_index()?;
-                for page_result in city_index.iter_all_feature_ref_pages(CJINDEX_PAGE_SIZE)? {
+                for page_result in city_index.scan_feature_pages(CJINDEX_PAGE_SIZE)? {
                     let page = page_result?;
                     let feature_in_cells = page
                         .into_par_iter()
-                        .map(|feature| -> Result<Option<FeatureInGridCells>, String> {
-                            let model =
-                                Self::read_cjindex_feature_thread_local(&input_source, &feature)
-                                    .map_err(|error| error.to_string())?;
-                            Ok(self
-                                .index_feature_model(FeatureReference::CjIndexRef(feature), &model))
+                        .map(|feature| -> Option<FeatureInGridCells> {
+                            self.index_feature_model(
+                                FeatureReference::CjIndexRef(feature.reference),
+                                &feature.model,
+                            )
                         })
-                        .collect::<Result<Vec<_>, String>>()?;
+                        .collect::<Vec<_>>();
                     for feature_in_cells in feature_in_cells.into_iter().flatten() {
                         self.integrate_feature_in_cells(feature_in_cells);
                     }
