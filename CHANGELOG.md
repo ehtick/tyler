@@ -15,6 +15,8 @@
 
 - Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.
 - Tyler no longer depends on an external `geoflow-bundle` installation for GLB export.
+- For implicit 3DTiles, tiling is now performed in geographic coordinates
+- 3DTiles now use bounding volume region instead of box
 - README, Dockerfiles, Nix flake files, and bundled resources were updated for the new pipeline.
 
 ## tyler 0.3.14 (2025-10-22)
