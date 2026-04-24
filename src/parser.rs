@@ -406,10 +406,23 @@ impl World {
         ]
     }
 
-    fn read_cjindex_feature_thread_local(
+    pub(crate) fn read_cjindex_feature_thread_local(
         input_source: &InputSource,
         feature: &cityjson_index::IndexedFeatureRef,
     ) -> cityjson_lib::Result<cityjson_lib::CityModel> {
+        Self::read_cjindex_features_thread_local(input_source, std::slice::from_ref(feature)).map(
+            |mut models| {
+                models
+                    .pop()
+                    .expect("single-feature batch should return one model")
+            },
+        )
+    }
+
+    pub(crate) fn read_cjindex_features_thread_local(
+        input_source: &InputSource,
+        features: &[cityjson_index::IndexedFeatureRef],
+    ) -> cityjson_lib::Result<Vec<cityjson_lib::CityModel>> {
         let InputSource::CjIndexDataset { index_path, .. } = input_source else {
             return Err(cityjson_lib::Error::Io(std::io::Error::other(
                 "cjindex feature reads require a cjindex dataset",
@@ -438,7 +451,7 @@ impl World {
                     "cjindex thread-local index cache was not initialized",
                 )));
             };
-            city_index.read_feature(feature)
+            city_index.read_features(features)
         })
     }
 
@@ -620,10 +633,8 @@ impl World {
                             let model =
                                 Self::read_cjindex_feature_thread_local(&input_source, &feature)
                                     .map_err(|error| error.to_string())?;
-                            Ok(self.index_feature_model(
-                                FeatureReference::CjIndexId(feature.feature_id.clone()),
-                                &model,
-                            ))
+                            Ok(self
+                                .index_feature_model(FeatureReference::CjIndexRef(feature), &model))
                         })
                         .collect::<Result<Vec<_>, String>>()?;
                     for feature_in_cells in feature_in_cells.into_iter().flatten() {
@@ -814,6 +825,7 @@ impl Feature {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeatureReference {
     LegacyPath(PathBuf),
+    CjIndexRef(cityjson_index::IndexedFeatureRef),
     CjIndexId(String),
 }
 

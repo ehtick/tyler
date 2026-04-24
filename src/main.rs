@@ -320,20 +320,41 @@ fn read_tile_feature_models(
             }
         }
         parser::InputSource::CjIndexDataset { .. } => {
-            let city_index = world.input_source.open_index()?;
+            let mut cjindex_refs = Vec::with_capacity(feature_ids.len());
             for fid in feature_ids {
-                let parser::FeatureReference::CjIndexId(feature_id) =
-                    &world.features[*fid].reference
-                else {
-                    return Err(
-                        "cjindex input unexpectedly referenced a legacy feature path".into(),
-                    );
-                };
-                let model = city_index.get(feature_id)?.ok_or_else(|| {
-                    format!("feature {feature_id} could not be resolved from cjindex")
-                })?;
-                models.push(model);
+                match &world.features[*fid].reference {
+                    parser::FeatureReference::CjIndexRef(feature) => {
+                        cjindex_refs.push(feature.clone());
+                    }
+                    parser::FeatureReference::CjIndexId(_) => {
+                        let city_index = world.input_source.open_index()?;
+                        for fid in feature_ids {
+                            let parser::FeatureReference::CjIndexId(feature_id) =
+                                &world.features[*fid].reference
+                            else {
+                                return Err(
+                                    "cjindex input mixed row references with legacy feature ids"
+                                        .into(),
+                                );
+                            };
+                            let model = city_index.get(feature_id)?.ok_or_else(|| {
+                                format!("feature {feature_id} could not be resolved from cjindex")
+                            })?;
+                            models.push(model);
+                        }
+                        return Ok(models);
+                    }
+                    parser::FeatureReference::LegacyPath(_) => {
+                        return Err(
+                            "cjindex input unexpectedly referenced a legacy feature path".into(),
+                        );
+                    }
+                }
             }
+            models = parser::World::read_cjindex_features_thread_local(
+                &world.input_source,
+                &cjindex_refs,
+            )?;
         }
     }
 
@@ -351,6 +372,7 @@ fn build_tile_model_from_feature_ids(
         feature_ids,
         feature_type_lods,
         include_parent_attributes,
+        false,
     )?;
     if models.is_empty() {
         return Err("tile model preparation removed all CityObjects".into());
@@ -379,6 +401,7 @@ fn build_tile_debug_cityjsonseq(
         feature_ids,
         feature_type_lods,
         include_parent_attributes,
+        true,
     )?;
     let base_root = cityjson_lib::json::from_slice(&world.feature_base_document)?;
     let mut feature_output = Vec::new();
@@ -396,12 +419,18 @@ fn prepare_tile_feature_models(
     feature_ids: &[usize],
     feature_type_lods: &BTreeMap<String, String>,
     include_parent_attributes: bool,
+    cleanup_features: bool,
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     read_tile_feature_models(world, feature_ids)?
         .into_iter()
         .filter_map(|model| {
-            match prepare_feature_model(model, world, feature_type_lods, include_parent_attributes)
-            {
+            match prepare_feature_model(
+                model,
+                world,
+                feature_type_lods,
+                include_parent_attributes,
+                cleanup_features,
+            ) {
                 Ok(Some(model)) => Some(Ok(model)),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
@@ -415,6 +444,7 @@ fn prepare_feature_model(
     world: &parser::World,
     feature_type_lods: &BTreeMap<String, String>,
     include_parent_attributes: bool,
+    cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut model = filter_cityobject_types(model, world.cityobject_types.as_ref())?;
     prune_lod_geometries(&mut model, feature_type_lods)?;
@@ -425,7 +455,11 @@ fn prepare_feature_model(
     if model.cityobjects().is_empty() {
         return Ok(None);
     }
-    cleanup_and_update_extents(model).map(Some)
+    if cleanup_feature {
+        cleanup_and_update_extents(model).map(Some)
+    } else {
+        Ok(Some(model))
+    }
 }
 
 fn inherit_parent_attributes(
@@ -1620,6 +1654,10 @@ mod tests {
             assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
         }
         world.index_with_grid().expect("index cjindex ndjson world");
+        assert!(world
+            .features
+            .iter()
+            .all(|feature| matches!(feature.reference, parser::FeatureReference::CjIndexRef(_))));
         let quadtree = build_quadtree(&world);
         let model = build_tile_model(&world, &quadtree).expect("build tile model");
 

@@ -13,6 +13,11 @@
 
 ### Changed
 
+- `cityjson-index` backed runs now persist row-ordered feature references from
+  grid indexing and reuse them during tile conversion, avoiding repeated
+  feature-id lookups.
+- Tile conversion now uses thread-local `CityIndex` handles for cjindex reads
+  and defers normal per-feature cleanup until after tile model merging.
 - Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.
 - Tyler no longer depends on an external `geoflow-bundle` installation for GLB export.
 - README, Dockerfiles, Nix flake files, and bundled resources were updated for the new pipeline.
