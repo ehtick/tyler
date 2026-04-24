@@ -261,7 +261,18 @@ For example:
 
 #### Bounding volumes
 
-*tyler* represents the tile's bounding volume as a [Box](https://docs.ogc.org/cs/22-025r4/22-025r4.html#core-box).
+*tyler* represents 3D Tiles tile bounding volumes as
+[`region`](https://docs.ogc.org/cs/22-025r4/22-025r4.html#core-region)
+values in EPSG:4979.
+
+For explicit tilesets, tiles are still generated from the source CRS grid and
+each tile writes its own transformed geographic region.
+
+For implicit tilesets, content tile IDs follow the implicit geographic
+subdivision of the root region: `x` subdivides longitude and `y` subdivides
+latitude. Implicit tilesets use additive refinement so parent and child content
+can coexist when source-leaf content appears at mixed implicit levels. The GLB
+content remains encoded in the shared root ENU frame.
 
 For explicit tilesets, it is possible to add a tightly-fitted bounding volume to the [tile's content](https://docs.ogc.org/cs/22-025r4/22-025r4.html#core-content-bounding-volume).
 You can enable this with the `--3dtiles-content-add-bv` option.
