@@ -28,8 +28,11 @@ test:
     cargo test --workspace --all-targets --all-features
 
 # Clean the workspace by removing all build artifacts and test artifacts.
-clean:
+clean: clean-output
     cargo clean
+
+# Clean the test output directories.
+clean-output:
     rm -rf tests/output
     rm -rf cityjson-convert/tests/output
 
