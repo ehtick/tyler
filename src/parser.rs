@@ -14,7 +14,6 @@
 // limitations under the License.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -30,7 +29,7 @@ use walkdir::WalkDir;
 
 use crate::spatial_structs::{Bbox, Cell, CellId};
 
-const CJINDEX_PAGE_SIZE: usize = 4096;
+const CJINDEX_PAGE_SIZE: usize = 65_536;
 
 thread_local! {
     static CJINDEX_THREAD_LOCAL: RefCell<Option<(PathBuf, CityIndex)>> = const { RefCell::new(None) };
@@ -345,23 +344,15 @@ impl World {
     fn extent_from_cjindex_bbox_pages(
         city_index: &CityIndex,
     ) -> Result<(Option<Bbox>, usize, usize, Vec<CityObjectType>), Box<dyn std::error::Error>> {
-        let mut extent: Option<Bbox> = None;
-        let mut nr_features = 0usize;
-
-        for page_result in city_index.iter_all_bbox_pages(CJINDEX_PAGE_SIZE)? {
-            let page = page_result?;
-            for feature in page {
-                if let Some(current) = extent.as_mut() {
-                    let feature_bbox = Self::cjindex_bounds_to_world_bbox(&feature.bounds);
-                    merge_bbox(current, &feature_bbox);
-                } else {
-                    extent = Some(Self::cjindex_bounds_to_world_bbox(&feature.bounds));
-                }
-                nr_features += 1;
-            }
-        }
-
-        Ok((extent, nr_features, 0, Vec::new()))
+        let Some(summary) = city_index.feature_bounds_summary()? else {
+            return Ok((None, 0, 0, Vec::new()));
+        };
+        Ok((
+            Some(Self::cjindex_bounds_to_world_bbox(&summary.bounds)),
+            summary.feature_count,
+            0,
+            Vec::new(),
+        ))
     }
 
     fn extent_from_cjindex_features(
@@ -415,10 +406,10 @@ impl World {
         ]
     }
 
-    fn read_cjindex_feature_thread_local(
+    pub(crate) fn read_cjindex_features_thread_local(
         input_source: &InputSource,
-        feature: &cityjson_index::IndexedFeatureRef,
-    ) -> cityjson_lib::Result<cityjson_lib::CityModel> {
+        features: &[cityjson_index::IndexedFeatureRef],
+    ) -> cityjson_lib::Result<Vec<cityjson_lib::CityModel>> {
         let InputSource::CjIndexDataset { index_path, .. } = input_source else {
             return Err(cityjson_lib::Error::Io(std::io::Error::other(
                 "cjindex feature reads require a cjindex dataset",
@@ -447,7 +438,7 @@ impl World {
                     "cjindex thread-local index cache was not initialized",
                 )));
             };
-            city_index.read_feature(feature)
+            city_index.read_features(features)
         })
     }
 
@@ -619,22 +610,18 @@ impl World {
                 }
             }
             InputSource::CjIndexDataset { .. } => {
-                let input_source = self.input_source.clone();
                 let city_index = self.input_source.open_index()?;
-                for page_result in city_index.iter_all_feature_ref_pages(CJINDEX_PAGE_SIZE)? {
+                for page_result in city_index.scan_feature_pages(CJINDEX_PAGE_SIZE)? {
                     let page = page_result?;
                     let feature_in_cells = page
                         .into_par_iter()
-                        .map(|feature| -> Result<Option<FeatureInGridCells>, String> {
-                            let model =
-                                Self::read_cjindex_feature_thread_local(&input_source, &feature)
-                                    .map_err(|error| error.to_string())?;
-                            Ok(self.index_feature_model(
-                                FeatureReference::CjIndexId(feature.feature_id.clone()),
-                                &model,
-                            ))
+                        .map(|feature| -> Option<FeatureInGridCells> {
+                            self.index_feature_model(
+                                FeatureReference::CjIndexRef(feature.reference),
+                                &feature.model,
+                            )
                         })
-                        .collect::<Result<Vec<_>, String>>()?;
+                        .collect::<Vec<_>>();
                     for feature_in_cells in feature_in_cells.into_iter().flatten() {
                         self.integrate_feature_in_cells(feature_in_cells);
                     }
@@ -705,7 +692,7 @@ impl World {
 
     fn feature_to_cells(
         feature: Feature,
-        cell_vtx_cnt: HashMap<CellId, usize>,
+        cell_vtx_cnt: CellCounts,
         selected_object_types: &[CityObjectType],
     ) -> Option<FeatureInGridCells> {
         let unique_assignment = selected_object_types.iter().any(|cotype| {
@@ -717,7 +704,10 @@ impl World {
         let mut cells: Vec<(CellId, Cell)> = Vec::with_capacity(cell_vtx_cnt.len());
 
         if unique_assignment {
-            let (cellid, nr_vertices) = cell_vtx_cnt.iter().max_by(|a, b| a.1.cmp(b.1)).unwrap();
+            let (cellid, nr_vertices) = cell_vtx_cnt
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1))
+                .expect("non-empty cell counts should have a maximum");
             cells.push((
                 *cellid,
                 Cell {
@@ -820,6 +810,7 @@ impl Feature {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeatureReference {
     LegacyPath(PathBuf),
+    CjIndexRef(cityjson_index::IndexedFeatureRef),
     CjIndexId(String),
 }
 
@@ -964,25 +955,94 @@ fn count_vertices_in_grid(
     selected_vertices: &[GeometryVertexIndex<u32>],
     grid: &crate::spatial_structs::SquareGrid,
     bbox: &Bbox,
-) -> HashMap<CellId, usize> {
-    let mut cell_vtx_cnt: HashMap<CellId, usize> = HashMap::new();
+) -> CellCounts {
+    if selected_vertices.is_empty() {
+        return CellCounts::default();
+    }
 
+    let mut vertex_cells = Vec::with_capacity(selected_vertices.len());
     for vertex_ref in selected_vertices {
         let Some(vertex) = model.vertices().get(*vertex_ref) else {
             continue;
         };
         let point = [vertex.x(), vertex.y()];
-        let cellid = grid.locate_point(&point);
-        *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+        vertex_cells.push(grid.locate_point(&point));
     }
 
-    if !selected_vertices.is_empty() {
-        for cellid in grid.intersect_bbox(bbox) {
-            *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+    if vertex_cells.is_empty() {
+        return CellCounts::default();
+    }
+
+    vertex_cells.sort_unstable();
+
+    let mut vertex_counts: Vec<(CellId, usize)> = Vec::with_capacity(vertex_cells.len());
+    for cellid in vertex_cells {
+        if let Some((last_cellid, count)) = vertex_counts.last_mut() {
+            if *last_cellid == cellid {
+                *count += 1;
+                continue;
+            }
         }
+        vertex_counts.push((cellid, 2));
     }
 
-    cell_vtx_cnt
+    CellCounts::merge_vertex_counts_with_bbox(vertex_counts, grid, bbox)
+}
+
+#[derive(Default)]
+struct CellCounts {
+    entries: Vec<(CellId, usize)>,
+}
+
+impl CellCounts {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&CellId, &usize)> {
+        self.entries.iter().map(|(cellid, count)| (cellid, count))
+    }
+
+    fn merge_vertex_counts_with_bbox(
+        vertex_counts: Vec<(CellId, usize)>,
+        grid: &crate::spatial_structs::SquareGrid,
+        bbox: &Bbox,
+    ) -> Self {
+        let (columns, rows) = grid.intersect_bbox_ranges(bbox);
+        let min_column = *columns.start();
+        let max_column = *columns.end();
+        let min_row = *rows.start();
+        let max_row = *rows.end();
+        let bbox_len = (max_column - min_column + 1) * (max_row - min_row + 1);
+        let mut entries = Vec::with_capacity(vertex_counts.len().max(bbox_len));
+        let mut vertex_counts = vertex_counts.into_iter().peekable();
+
+        for row in min_row..=max_row {
+            for column in min_column..=max_column {
+                let bbox_cellid = CellId { row, column };
+                while let Some((cellid, count)) =
+                    vertex_counts.next_if(|(cellid, _)| *cellid < bbox_cellid)
+                {
+                    entries.push((cellid, count));
+                }
+
+                if let Some((_, count)) =
+                    vertex_counts.next_if(|(cellid, _)| *cellid == bbox_cellid)
+                {
+                    entries.push((bbox_cellid, count + 1));
+                } else {
+                    entries.push((bbox_cellid, 2));
+                }
+            }
+        }
+
+        entries.extend(vertex_counts);
+        Self { entries }
+    }
 }
 
 fn is_selected_type(filter: Option<&Vec<CityObjectType>>, object_type: CityObjectType) -> bool {
@@ -1199,9 +1259,101 @@ mod tests {
         let building_cell = grid.locate_point(&[0.0, 0.0]);
         let road_cell = grid.locate_point(&[100.0, 100.0]);
 
-        assert!(counts.contains_key(&building_cell));
-        assert!(!counts.contains_key(&road_cell));
+        assert!(counts.iter().any(|(cellid, _)| *cellid == building_cell));
+        assert!(!counts.iter().any(|(cellid, _)| *cellid == road_cell));
 
         let _ = std::fs::remove_file(feature_path);
+    }
+
+    #[test]
+    fn count_vertices_in_grid_matches_reference_hashmap_counts() {
+        let base = serde_json::to_vec(&serde_json::json!({
+            "type": "CityJSON",
+            "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
+            "transform": {
+                "scale": [1.0, 1.0, 1.0],
+                "translate": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let feature = serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [250, 250, 0]
+            ]
+        });
+        let feature_path = std::env::temp_dir().join(format!(
+            "tyler-parser-grid-counts-{}.city.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
+
+        let model = from_feature_file_with_base(&feature_path, &base).unwrap();
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        let bbox = stats.bbox.unwrap();
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+
+        let optimized = count_vertices_in_grid(&model, &stats.selected_vertices, &grid, &bbox);
+        let reference =
+            reference_count_vertices_in_grid(&model, &stats.selected_vertices, &grid, &bbox);
+
+        assert_eq!(
+            optimized
+                .iter()
+                .map(|(cellid, count)| (*cellid, *count))
+                .collect::<Vec<_>>(),
+            reference
+        );
+
+        let _ = std::fs::remove_file(feature_path);
+    }
+
+    fn reference_count_vertices_in_grid(
+        model: &cityjson::v2_0::OwnedCityModel,
+        selected_vertices: &[GeometryVertexIndex<u32>],
+        grid: &crate::spatial_structs::SquareGrid,
+        bbox: &Bbox,
+    ) -> Vec<(CellId, usize)> {
+        let mut cell_vtx_cnt = std::collections::BTreeMap::new();
+
+        for vertex_ref in selected_vertices {
+            let Some(vertex) = model.vertices().get(*vertex_ref) else {
+                continue;
+            };
+            let point = [vertex.x(), vertex.y()];
+            let cellid = grid.locate_point(&point);
+            *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+        }
+
+        if !selected_vertices.is_empty() {
+            for cellid in grid.intersect_bbox(bbox) {
+                *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+            }
+        }
+
+        cell_vtx_cnt.into_iter().collect()
     }
 }
