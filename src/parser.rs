@@ -14,6 +14,7 @@
 // limitations under the License.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ use walkdir::WalkDir;
 use crate::spatial_structs::{Bbox, Cell, CellId};
 
 const CJINDEX_PAGE_SIZE: usize = 65_536;
+const LARGE_FEATURE_VERTEX_COUNT_THRESHOLD: usize = 50_000;
 
 thread_local! {
     static CJINDEX_THREAD_LOCAL: RefCell<Option<(PathBuf, CityIndex)>> = const { RefCell::new(None) };
@@ -960,33 +962,72 @@ fn count_vertices_in_grid(
         return CellCounts::default();
     }
 
-    let mut vertex_cells = Vec::with_capacity(selected_vertices.len());
-    for vertex_ref in selected_vertices {
-        let Some(vertex) = model.vertices().get(*vertex_ref) else {
-            continue;
-        };
-        let point = [vertex.x(), vertex.y()];
-        vertex_cells.push(grid.locate_point(&point));
-    }
+    let vertex_counts = if selected_vertices.len() >= LARGE_FEATURE_VERTEX_COUNT_THRESHOLD {
+        count_vertex_cells_parallel(model, selected_vertices, grid)
+    } else {
+        count_vertex_cells(model, selected_vertices, grid)
+    };
 
-    if vertex_cells.is_empty() {
+    if vertex_counts.is_empty() {
         return CellCounts::default();
     }
 
-    vertex_cells.sort_unstable();
+    CellCounts::merge_vertex_counts_with_bbox(vertex_counts.into_iter().collect(), grid, bbox)
+}
 
-    let mut vertex_counts: Vec<(CellId, usize)> = Vec::with_capacity(vertex_cells.len());
-    for cellid in vertex_cells {
-        if let Some((last_cellid, count)) = vertex_counts.last_mut() {
-            if *last_cellid == cellid {
-                *count += 1;
-                continue;
+fn count_vertex_cells(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &crate::spatial_structs::SquareGrid,
+) -> BTreeMap<CellId, usize> {
+    let vertices = model.vertices();
+    let mut vertex_counts = BTreeMap::new();
+    for vertex_ref in selected_vertices {
+        let Some(vertex) = vertices.get(*vertex_ref) else {
+            continue;
+        };
+        let point = [vertex.x(), vertex.y()];
+        increment_vertex_count(&mut vertex_counts, grid.locate_point(&point));
+    }
+    vertex_counts
+}
+
+fn count_vertex_cells_parallel(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &crate::spatial_structs::SquareGrid,
+) -> BTreeMap<CellId, usize> {
+    let vertices = model.vertices();
+    selected_vertices
+        .par_iter()
+        .fold(BTreeMap::new, |mut vertex_counts, vertex_ref| {
+            let Some(vertex) = vertices.get(*vertex_ref) else {
+                return vertex_counts;
+            };
+            let point = [vertex.x(), vertex.y()];
+            increment_vertex_count(&mut vertex_counts, grid.locate_point(&point));
+            vertex_counts
+        })
+        .reduce(BTreeMap::new, merge_vertex_count_maps)
+}
+
+fn increment_vertex_count(vertex_counts: &mut BTreeMap<CellId, usize>, cellid: CellId) {
+    *vertex_counts.entry(cellid).or_insert(1) += 1;
+}
+
+fn merge_vertex_count_maps(
+    mut left: BTreeMap<CellId, usize>,
+    right: BTreeMap<CellId, usize>,
+) -> BTreeMap<CellId, usize> {
+    for (cellid, count) in right {
+        match left.get_mut(&cellid) {
+            Some(left_count) => *left_count += count - 1,
+            None => {
+                left.insert(cellid, count);
             }
         }
-        vertex_counts.push((cellid, 2));
     }
-
-    CellCounts::merge_vertex_counts_with_bbox(vertex_counts, grid, bbox)
+    left
 }
 
 #[derive(Default)]
@@ -1319,6 +1360,82 @@ mod tests {
         let optimized = count_vertices_in_grid(&model, &stats.selected_vertices, &grid, &bbox);
         let reference =
             reference_count_vertices_in_grid(&model, &stats.selected_vertices, &grid, &bbox);
+
+        assert_eq!(
+            optimized
+                .iter()
+                .map(|(cellid, count)| (*cellid, *count))
+                .collect::<Vec<_>>(),
+            reference
+        );
+
+        let optimized = optimized
+            .iter()
+            .map(|(cellid, count)| (*cellid, *count))
+            .collect::<BTreeMap<_, _>>();
+        let same_cell = grid.locate_point(&[0.0, 0.0]);
+        let bbox_only_cell = grid.locate_point(&[200.0, 0.0]);
+        assert_eq!(optimized.get(&same_cell), Some(&5));
+        assert_eq!(optimized.get(&bbox_only_cell), Some(&2));
+
+        let _ = std::fs::remove_file(feature_path);
+    }
+
+    #[test]
+    fn count_vertices_in_grid_large_feature_path_matches_reference_hashmap_counts() {
+        let base = serde_json::to_vec(&serde_json::json!({
+            "type": "CityJSON",
+            "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
+            "transform": {
+                "scale": [1.0, 1.0, 1.0],
+                "translate": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let feature = serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building"
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [250, 250, 0]
+            ]
+        });
+        let feature_path = std::env::temp_dir().join(format!(
+            "tyler-parser-large-grid-counts-{}.city.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
+
+        let model = from_feature_file_with_base(&feature_path, &base).unwrap();
+        let bbox: Bbox = [0.0, 0.0, 0.0, 250.0, 250.0, 0.0];
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+        let selected_vertices = (0..LARGE_FEATURE_VERTEX_COUNT_THRESHOLD)
+            .map(|index| {
+                GeometryVertexIndex::new(match index % 4 {
+                    0 | 3 => 0,
+                    1 => 1,
+                    _ => 2,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let optimized = count_vertices_in_grid(&model, &selected_vertices, &grid, &bbox);
+        let reference = reference_count_vertices_in_grid(&model, &selected_vertices, &grid, &bbox);
 
         assert_eq!(
             optimized

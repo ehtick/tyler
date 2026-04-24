@@ -18,6 +18,9 @@
   feature-id lookups.
 - Grid indexing for `cityjson-index` inputs now consumes decoded scan pages
   directly instead of paging references and issuing per-feature reads.
+- Grid vertex counting now accumulates directly into per-cell counts, avoiding
+  per-feature vertex-cell sorting except for thresholded large-feature
+  parallelism.
 - Tile conversion now uses thread-local `CityIndex` handles for cjindex reads
   and defers normal per-feature cleanup until after tile model merging.
 - Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.
