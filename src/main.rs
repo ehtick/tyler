@@ -578,9 +578,7 @@ fn read_tile_feature_models(
                     let parser::FeatureReference::CjIndexId(feature_id) =
                         &world.features[*fid].reference
                     else {
-                        return Err(
-                            "cjindex input mixed row references with feature ids".into()
-                        );
+                        return Err("cjindex input mixed row references with feature ids".into());
                     };
                     let model = city_index.get(feature_id)?.ok_or_else(|| {
                         format!("feature {feature_id} could not be resolved from cjindex")
@@ -591,10 +589,7 @@ fn read_tile_feature_models(
             }
         }
     }
-    models = parser::World::read_cjindex_features_thread_local(
-        &world.input_source,
-        &cjindex_refs,
-    )?;
+    models = parser::World::read_cjindex_features_thread_local(&world.input_source, &cjindex_refs)?;
 
     Ok(models)
 }
@@ -2094,7 +2089,10 @@ mod tests {
         // reconstructs each feature against its own source metadata, so the
         // shifted translate must not break decoding.
         let mut document_b = metadata.clone();
-        if let Some(meta) = document_b.get_mut("metadata").and_then(Value::as_object_mut) {
+        if let Some(meta) = document_b
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+        {
             meta.insert("title".to_string(), Value::String("variant-b".to_string()));
         }
         if let Some(translate) = document_b
@@ -2159,6 +2157,11 @@ mod tests {
             "expected features from both source documents, got {}",
             world.features.len()
         );
+
+        let quadtree = build_quadtree(&world);
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
     }
 
     #[test]

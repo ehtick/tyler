@@ -13,6 +13,9 @@
 
 ### Changed
 
+- Tile-model building now relies on `cityjson_lib::ops::merge` to reconcile
+  mixed input transforms, so cjindex inputs with differing transforms no
+  longer need local normalization.
 - `cityjson-index` backed runs now persist row-ordered feature references from
   grid indexing and reuse them during tile conversion, avoiding repeated
   feature-id lookups.

@@ -1840,8 +1840,8 @@ pub mod cesium3dtiles {
         #[test]
         fn test_implicittiling() {
             let dataset_dir = unique_test_dir("implicittiling");
-            let metadata = fs::read_to_string(resource_path("3dbag_x00.city.json"))
-                .expect("read metadata");
+            let metadata =
+                fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
             let feature = fs::read_to_string(resource_path("3dbag_feature_x71.city.jsonl"))
                 .expect("read feature");
             let ndjson_source = dataset_dir.join("source.city.jsonl");
