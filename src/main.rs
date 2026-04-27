@@ -106,7 +106,7 @@ struct DebugData {
 struct PreparedInput {
     source: parser::InputSource,
     metadata_path: PathBuf,
-    feature_base_document: Option<Vec<u8>>,
+    feature_base_document: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -239,65 +239,43 @@ fn prepare_input(
     cli: &crate::cli::Cli,
     output_dir: &Path,
 ) -> Result<PreparedInput, Box<dyn std::error::Error>> {
-    match cityjson_index::resolve_dataset(&cli.input, None) {
-        Ok(resolved) => {
-            let inspection = resolved.inspect()?;
-            let mut city_index =
-                cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)?;
-            if !inspection.index.exists || inspection.index.fresh != Some(true) {
-                info!(
-                    "Rebuilding cjindex sidecar at {}",
-                    resolved.index_path.display()
-                );
-                city_index.reindex()?;
-            }
-            let feature_base_document = derive_base_document(&city_index)?;
-            let metadata_dir = output_dir.join("metadata");
-            fs::create_dir_all(&metadata_dir)?;
-            let metadata_path = metadata_dir.join("cjindex-metadata.city.json");
-            fs::write(&metadata_path, &feature_base_document)?;
-            Ok(PreparedInput {
-                source: parser::InputSource::from_cjindex_resolved(&resolved),
-                metadata_path,
-                feature_base_document: Some(feature_base_document),
-            })
-        }
-        Err(_error) => {
-            let metadata_path = cli.input.join("metadata.city.json");
-            if !metadata_path.is_file() {
-                return Err(format!(
-                    "{} is neither a cjindex dataset root nor a legacy dataset root containing metadata.city.json",
-                    cli.input.display()
-                )
-                .into());
-            }
-            Ok(PreparedInput {
-                source: parser::InputSource::LegacyFeatureFiles {
-                    features_root: cli.input.clone(),
-                },
-                metadata_path,
-                feature_base_document: None,
-            })
-        }
+    let resolved = cityjson_index::resolve_dataset(&cli.input, None)?;
+    let inspection = resolved.inspect()?;
+    let mut city_index =
+        cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)?;
+    if !inspection.index.exists || inspection.index.fresh != Some(true) {
+        info!(
+            "Rebuilding cjindex sidecar at {}",
+            resolved.index_path.display()
+        );
+        city_index.reindex()?;
     }
+    let feature_base_document = derive_base_document(&city_index)?;
+    let metadata_dir = output_dir.join("metadata");
+    fs::create_dir_all(&metadata_dir)?;
+    let metadata_path = metadata_dir.join("cjindex-metadata.city.json");
+    fs::write(&metadata_path, &feature_base_document)?;
+    Ok(PreparedInput {
+        source: parser::InputSource::from_cjindex_resolved(&resolved),
+        metadata_path,
+        feature_base_document,
+    })
 }
 
 fn derive_base_document(
     city_index: &cityjson_index::CityIndex,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Tyler treats this as a *representative* document, not a canonical one:
+    // it supplies the dataset-wide fields tyler needs (CRS, extensions, and
+    // the seed for `write_cityjsonseq_auto_transform`). Per-feature
+    // `transform` values are applied by cjindex during feature reads, so
+    // multi-document datasets (e.g. cityjson layout) decode correctly even
+    // when source metadata documents differ. CRS consistency across sources
+    // is a dataset-level invariant owned by cityjson-index.
     let metadata = city_index.metadata()?;
     let Some(base_document) = metadata.first() else {
         return Err("cjindex dataset does not contain any source metadata".into());
     };
-    if metadata
-        .iter()
-        .skip(1)
-        .any(|candidate| candidate.as_ref() != base_document.as_ref())
-    {
-        return Err(
-            "cjindex dataset contains multiple metadata documents; tyler requires one shared base document".into(),
-        );
-    }
     Ok(serde_json::to_vec(base_document.as_ref())?)
 }
 
@@ -588,59 +566,30 @@ fn read_tile_feature_models(
     feature_ids: &[usize],
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut models = Vec::with_capacity(feature_ids.len());
-    match &world.input_source {
-        parser::InputSource::LegacyFeatureFiles { features_root } => {
-            for fid in feature_ids {
-                let parser::FeatureReference::LegacyPath(relative_path) =
-                    &world.features[*fid].reference
-                else {
-                    return Err("legacy input unexpectedly referenced a cjindex feature".into());
-                };
-                let feature_path = features_root.join(relative_path);
-                models.push(cityjson_lib::json::staged::from_feature_file_with_base(
-                    &feature_path,
-                    &world.feature_base_document,
-                )?);
+    let mut cjindex_refs = Vec::with_capacity(feature_ids.len());
+    for fid in feature_ids {
+        match &world.features[*fid].reference {
+            parser::FeatureReference::CjIndexRef(feature) => {
+                cjindex_refs.push(feature.clone());
             }
-        }
-        parser::InputSource::CjIndexDataset { .. } => {
-            let mut cjindex_refs = Vec::with_capacity(feature_ids.len());
-            for fid in feature_ids {
-                match &world.features[*fid].reference {
-                    parser::FeatureReference::CjIndexRef(feature) => {
-                        cjindex_refs.push(feature.clone());
-                    }
-                    parser::FeatureReference::CjIndexId(_) => {
-                        let city_index = world.input_source.open_index()?;
-                        for fid in feature_ids {
-                            let parser::FeatureReference::CjIndexId(feature_id) =
-                                &world.features[*fid].reference
-                            else {
-                                return Err(
-                                    "cjindex input mixed row references with legacy feature ids"
-                                        .into(),
-                                );
-                            };
-                            let model = city_index.get(feature_id)?.ok_or_else(|| {
-                                format!("feature {feature_id} could not be resolved from cjindex")
-                            })?;
-                            models.push(model);
-                        }
-                        return Ok(models);
-                    }
-                    parser::FeatureReference::LegacyPath(_) => {
-                        return Err(
-                            "cjindex input unexpectedly referenced a legacy feature path".into(),
-                        );
-                    }
+            parser::FeatureReference::CjIndexId(_) => {
+                let city_index = world.input_source.open_index()?;
+                for fid in feature_ids {
+                    let parser::FeatureReference::CjIndexId(feature_id) =
+                        &world.features[*fid].reference
+                    else {
+                        return Err("cjindex input mixed row references with feature ids".into());
+                    };
+                    let model = city_index.get(feature_id)?.ok_or_else(|| {
+                        format!("feature {feature_id} could not be resolved from cjindex")
+                    })?;
+                    models.push(model);
                 }
+                return Ok(models);
             }
-            models = parser::World::read_cjindex_features_thread_local(
-                &world.input_source,
-                &cjindex_refs,
-            )?;
         }
     }
+    models = parser::World::read_cjindex_features_thread_local(&world.input_source, &cjindex_refs)?;
 
     Ok(models)
 }
@@ -1111,25 +1060,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let prepared_input = prepared_input
                 .as_ref()
                 .expect("prepared input must exist when world is built from source");
-            let mut world = match &prepared_input.feature_base_document {
-                Some(feature_base_document) => parser::World::from_cjindex(
-                    prepared_input.source.clone(),
-                    prepared_input.metadata_path.clone(),
-                    feature_base_document.clone(),
-                    grid_cellsize,
-                    cityobject_types,
-                    cli.grid_minz,
-                    cli.grid_maxz,
-                )?,
-                None => parser::World::new(
-                    &prepared_input.metadata_path,
-                    &cli.input,
-                    grid_cellsize,
-                    cityobject_types,
-                    cli.grid_minz,
-                    cli.grid_maxz,
-                )?,
-            };
+            let mut world = parser::World::from_cjindex(
+                prepared_input.source.clone(),
+                prepared_input.metadata_path.clone(),
+                prepared_input.feature_base_document.clone(),
+                grid_cellsize,
+                cityobject_types,
+                cli.grid_minz,
+                cli.grid_maxz,
+            )?;
             world.index_with_grid()?; // todo input: in general, build a line index
             world
         }
@@ -1853,20 +1792,32 @@ mod tests {
     #[test]
     fn build_tile_model_remaps_parent_attributes_before_glb_conversion() {
         let dataset_dir = unique_test_dir("attribute-inheritance");
-        let features_dir = dataset_dir.join("features");
-        fs::create_dir_all(&features_dir).expect("create features dir");
-        let metadata_path = dataset_dir.join("metadata.city.json");
-        let feature_path = features_dir.join("sample.city.jsonl");
-        fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
-        fs::write(
-            &feature_path,
-            parent_attribute_remapping_fixture_bytes(serde_json::json!({})),
+        let metadata: Value = serde_json::from_slice(
+            &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
         )
-        .expect("write feature");
+        .expect("parse metadata");
+        let feature_bytes = parent_attribute_remapping_fixture_bytes(serde_json::json!({}));
+        let feature_str =
+            String::from_utf8(feature_bytes).expect("attribute fixture should be utf8");
+        let metadata_str = serde_json::to_string(&metadata).expect("serialize metadata");
+        let ndjson_source = dataset_dir.join("source.city.jsonl");
+        fs::write(&ndjson_source, format!("{metadata_str}\n{feature_str}\n"))
+            .expect("write ndjson source");
 
-        let mut world = parser::World::new(
-            &metadata_path,
-            &features_dir,
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve attribute-inheritance dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex");
+        let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
+        let metadata_path = dataset_dir.join("metadata.city.json");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
             200,
             Some(vec![
                 parser::CityObjectType::Building,
@@ -1875,8 +1826,8 @@ mod tests {
             None,
             None,
         )
-        .expect("build legacy world");
-        world.index_with_grid().expect("index legacy world");
+        .expect("build cjindex world");
+        world.index_with_grid().expect("index cjindex world");
         let quadtree = build_quadtree(&world);
         let feature_ids = collect_tile_feature_ids(&world, &quadtree);
 
@@ -1900,7 +1851,7 @@ mod tests {
         let dataset_dir = unique_test_dir("attribute-inheritance-child-only");
         let features_dir = dataset_dir.join("features");
         fs::create_dir_all(&features_dir).expect("create features dir");
-        let metadata_path = dataset_dir.join("metadata.city.json");
+        let metadata_path = dataset_dir.join("metadata.json");
         let feature_path = features_dir.join("sample.city.jsonl");
         fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
         fs::write(
@@ -1909,9 +1860,19 @@ mod tests {
         )
         .expect("write feature");
 
-        let mut world = parser::World::new(
-            &metadata_path,
-            &features_dir,
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve child-only attribute-inheritance dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex");
+        let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
             200,
             Some(vec![parser::CityObjectType::BuildingPart]),
             None,
@@ -1942,49 +1903,6 @@ mod tests {
             Some(1)
         );
         assert_eq!(feature_root_id(&model), Some("building-part".to_string()));
-    }
-
-    #[test]
-    fn build_tile_model_exports_legacy_features() {
-        let dataset_dir = unique_test_dir("legacy");
-        let features_dir = dataset_dir.join("features");
-        fs::create_dir_all(&features_dir).expect("create features dir");
-        let metadata_path = dataset_dir.join("metadata.city.json");
-        let feature_path = features_dir.join("sample.city.jsonl");
-        fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
-        fs::copy(resource_path("3dbag_feature_x71.city.jsonl"), &feature_path)
-            .expect("copy feature");
-
-        let mut world = parser::World::new(
-            &metadata_path,
-            &features_dir,
-            200,
-            Some(vec![parser::CityObjectType::Building]),
-            None,
-            None,
-        )
-        .expect("build legacy world");
-        world.index_with_grid().expect("index legacy world");
-        let quadtree = build_quadtree(&world);
-        let model = build_tile_model(&world, &quadtree).expect("build tile model");
-        let feature_ids = collect_tile_feature_ids(&world, &quadtree);
-        let ndjson = String::from_utf8(
-            build_tile_debug_cityjsonseq(&world, &feature_ids, &BTreeMap::new(), false)
-                .expect("build debug cityjsonseq"),
-        )
-        .expect("debug cityjsonseq utf8");
-
-        assert!(!model.cityobjects().is_empty());
-        let mut lines = ndjson.lines();
-        let header: Value =
-            serde_json::from_str(lines.next().expect("CityJSONSeq header should exist"))
-                .expect("CityJSONSeq header should parse");
-        let feature: Value =
-            serde_json::from_str(lines.next().expect("CityJSONSeq feature should exist"))
-                .expect("CityJSONSeq feature should parse");
-        assert_eq!(header["type"], "CityJSON");
-        assert_eq!(feature["type"], "CityJSONFeature");
-        assert_eq!(lines.count(), 0);
     }
 
     #[test]
@@ -2150,6 +2068,108 @@ mod tests {
         let quadtree = build_quadtree(&world);
         let model = build_tile_model(&world, &quadtree).expect("build tile model");
 
+        assert!(!model.cityobjects().is_empty());
+        assert!(!model.vertices().is_empty());
+    }
+
+    #[test]
+    fn build_tile_model_exports_cjindex_cityjson_multi_document() {
+        let dataset_dir = unique_test_dir("cjindex-cityjson-multi");
+        let metadata: Value = serde_json::from_slice(
+            &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
+        )
+        .expect("parse metadata");
+        let feature: Value = serde_json::from_slice(
+            &fs::read(resource_path("3dbag_feature_x71.city.jsonl")).expect("read feature"),
+        )
+        .expect("parse feature");
+
+        let mut document_a = metadata.clone();
+        document_a["CityObjects"] = feature["CityObjects"].clone();
+        document_a["vertices"] = feature["vertices"].clone();
+        let path_a = dataset_dir.join("source_a.city.json");
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&document_a).expect("serialize cityjson a"),
+        )
+        .expect("write cityjson a");
+
+        // Second document keeps the same CRS but differs from document_a in
+        // bytes (distinct title) and in transform.translate. cityjson-index
+        // reconstructs each feature against its own source metadata, so the
+        // shifted translate must not break decoding.
+        let mut document_b = metadata.clone();
+        if let Some(meta) = document_b
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+        {
+            meta.insert("title".to_string(), Value::String("variant-b".to_string()));
+        }
+        if let Some(translate) = document_b
+            .get_mut("transform")
+            .and_then(|t| t.get_mut("translate"))
+            .and_then(Value::as_array_mut)
+        {
+            for component in translate.iter_mut() {
+                if let Some(value) = component.as_f64() {
+                    *component = serde_json::json!(value + 1.0);
+                }
+            }
+        }
+        document_b["CityObjects"] = feature["CityObjects"].clone();
+        document_b["vertices"] = feature["vertices"].clone();
+        let path_b = dataset_dir.join("source_b.city.json");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&document_b).expect("serialize cityjson b"),
+        )
+        .expect("write cityjson b");
+
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve multi-document cityjson dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index
+            .reindex()
+            .expect("reindex multi-document cityjson dataset");
+
+        let stored_metadata = city_index.metadata().expect("load source metadata");
+        assert!(
+            stored_metadata.len() >= 2,
+            "expected at least two source metadata documents, got {}",
+            stored_metadata.len()
+        );
+
+        let feature_base_document =
+            derive_base_document(&city_index).expect("derive base doc from multi-document dataset");
+        let metadata_path = dataset_dir.join("metadata.city.json");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
+            200,
+            Some(vec![parser::CityObjectType::Building]),
+            None,
+            None,
+        )
+        .expect("build cjindex cityjson world");
+        world
+            .index_with_grid()
+            .expect("index cjindex cityjson world");
+
+        // Both source documents must contribute features. Per-source transforms
+        // are applied by cjindex during read, not by tyler.
+        assert!(
+            world.features.len() >= 2,
+            "expected features from both source documents, got {}",
+            world.features.len()
+        );
+
+        let quadtree = build_quadtree(&world);
+        let model = build_tile_model(&world, &quadtree).expect("build tile model");
         assert!(!model.cityobjects().is_empty());
         assert!(!model.vertices().is_empty());
     }

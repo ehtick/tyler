@@ -43,12 +43,9 @@ will use NDJSON as the only exchange format passed to `geoflow`.
 Concretely:
 
 1. Tyler's CLI will take one dataset-root input path.
-2. That input path may refer either to:
-   - a legacy dataset root that contains `metadata.city.json` and standalone
-     `.city.jsonl` feature files under that root
-   - a `cjindex` dataset root in `feature-files`, `ndjson`, or `cityjson`
-     layout
-3. Tyler will detect `cjindex` datasets with `cjindex::resolve_dataset()`.
+2. That input path must refer to a `cjindex` dataset root in
+   `feature-files`, `ndjson`, or `cityjson` layout.
+3. Tyler will resolve every input through `cjindex::resolve_dataset()`.
 4. For `cjindex` inputs, Tyler will ensure a usable sidecar index exists and
    will derive one shared base metadata document for internal processing.
 5. Tyler's world/grid/quadtree state will store backend-agnostic feature
@@ -70,17 +67,24 @@ Good:
 - tile export no longer depends on original source file layout
 - CityJSON input can be normalized into NDJSON without changing downstream
   tooling
-- legacy feature-file input keeps working
+- the previous in-tree legacy directory parser is retired in favor of
+  `cjindex`'s `feature-files` layout, removing a parallel implementation
 
 Trade-offs:
 
 - Tyler now owns tile-local NDJSON materialization
-- `cjindex` datasets must expose a consistent shared metadata document for
-  Tyler's current processing model
+- `cjindex` datasets may expose multiple source metadata documents (one per
+  source file in the `cityjson` and `feature-files` layouts). Tyler picks
+  one of them as a representative base document for dataset-wide fields
+  (CRS, extensions, debug CityJSONSeq seed); per-feature `transform`
+  values are applied by `cjindex` during feature reads, so multi-document
+  datasets decode correctly. CRS consistency across sources is a
+  dataset-level invariant owned by `cjindex`, not enforced by Tyler.
 - export now includes an extra write step even when the source is already
   NDJSON
-- internal indexing code is more abstract because it must support both path-
-  based and id-based feature references
+- datasets that used to work via tyler's legacy directory parser must now
+  be resolvable by `cjindex::resolve_dataset` (typically by ensuring a
+  cjindex sidecar config or by running `cjindex reindex` once)
 
 ## Rejected Alternatives
 
@@ -100,6 +104,13 @@ Trade-offs:
 - Keep storing only feature file paths in Tyler internals.
   That works only for the legacy layout and breaks as soon as features no
   longer correspond to standalone files on disk.
+
+- Maintain Tyler's parallel legacy directory parser alongside `cjindex`.
+  This duplicates discovery, indexing, and decoding for one storage shape
+  that `cjindex`'s `feature-files` layout already covers, and the parallel
+  path drifted in subtle ways (e.g. requiring a single shared
+  `metadata.city.json`). Removed in favor of going through `cjindex`
+  exclusively.
 
 ## Notes
 

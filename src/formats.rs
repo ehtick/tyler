@@ -1767,6 +1767,7 @@ pub mod cesium3dtiles {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use cityjson_index;
         use serde_json::to_string_pretty;
         use std::fs;
         use std::path::PathBuf;
@@ -1838,24 +1839,37 @@ pub mod cesium3dtiles {
 
         #[test]
         fn test_implicittiling() {
-            // 85162.9 447106.8 85562.9 447706.8
-            // let bbox: crate::spatial_structs::Bbox =
-            //     [85162.9, 447106.8, -10.7, 85962.9, 447906.8, 320.5];
-            // let grid = crate::spatial_structs::SquareGrid::new(&bbox, 200, 7415, Some(10.0));
             let dataset_dir = unique_test_dir("implicittiling");
-            let features_dir = dataset_dir.join("features");
-            fs::create_dir_all(&features_dir).expect("create features dir");
-            let metadata_path = dataset_dir.join("metadata.city.json");
-            fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
-            fs::copy(
-                resource_path("3dbag_feature_x71.city.jsonl"),
-                features_dir.join("sample.city.jsonl"),
-            )
-            .expect("copy feature");
+            let metadata =
+                fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
+            let feature = fs::read_to_string(resource_path("3dbag_feature_x71.city.jsonl"))
+                .expect("read feature");
+            let ndjson_source = dataset_dir.join("source.city.jsonl");
+            fs::write(&ndjson_source, format!("{metadata}\n{feature}\n"))
+                .expect("write ndjson source");
 
-            let mut world = crate::parser::World::new(
-                &metadata_path,
-                &features_dir,
+            let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+                .expect("resolve cjindex dataset");
+            let mut city_index =
+                cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                    .expect("open index");
+            city_index.reindex().expect("reindex");
+            let metadata_doc = city_index
+                .metadata()
+                .expect("load metadata")
+                .first()
+                .expect("metadata exists")
+                .as_ref()
+                .clone();
+            let feature_base_document =
+                serde_json::to_vec(&metadata_doc).expect("serialize metadata");
+            let metadata_path = dataset_dir.join("metadata.city.json");
+            fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+            let mut world = crate::parser::World::from_cjindex(
+                crate::parser::InputSource::from_cjindex_resolved(&resolved),
+                metadata_path,
+                feature_base_document,
                 200,
                 Some(vec![
                     crate::parser::CityObjectType::Building,
