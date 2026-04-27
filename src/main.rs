@@ -1851,7 +1851,7 @@ mod tests {
         let dataset_dir = unique_test_dir("attribute-inheritance-child-only");
         let features_dir = dataset_dir.join("features");
         fs::create_dir_all(&features_dir).expect("create features dir");
-        let metadata_path = dataset_dir.join("metadata.city.json");
+        let metadata_path = dataset_dir.join("metadata.json");
         let feature_path = features_dir.join("sample.city.jsonl");
         fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
         fs::write(
@@ -1860,9 +1860,19 @@ mod tests {
         )
         .expect("write feature");
 
-        let mut world = parser::World::new(
-            &metadata_path,
-            &features_dir,
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve child-only attribute-inheritance dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex");
+        let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
             200,
             Some(vec![parser::CityObjectType::BuildingPart]),
             None,
