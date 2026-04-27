@@ -70,16 +70,15 @@ fn read_glb_json(bytes: &[u8]) -> Value {
 fn debug_replay_writes_epsg4979_regions_and_local_enu_glbs() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dataset = unique_test_dir("coordinate-frame-dataset");
-    fs::copy(
-        repo.join("resources/data/3dbag_x00.city.json"),
-        dataset.join("metadata.city.json"),
+    let metadata = fs::read_to_string(repo.join("resources/data/3dbag_x00.city.json"))
+        .expect("read metadata");
+    let feature = fs::read_to_string(repo.join("resources/data/3dbag_feature_x71.city.jsonl"))
+        .expect("read feature");
+    fs::write(
+        dataset.join("source.city.jsonl"),
+        format!("{metadata}\n{feature}\n"),
     )
-    .expect("copy metadata");
-    fs::copy(
-        repo.join("resources/data/3dbag_feature_x71.city.jsonl"),
-        dataset.join("feature.city.jsonl"),
-    )
-    .expect("copy feature");
+    .expect("write ndjson source");
 
     let seeded_output = unique_test_dir("coordinate-frame-seeded");
     let output = unique_test_dir("coordinate-frame");

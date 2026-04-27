@@ -21,12 +21,10 @@ use std::path::{Path, PathBuf};
 
 use cityjson::v2_0::vertex::VertexIndex as GeometryVertexIndex;
 use cityjson_index::{CityIndex, StorageLayout};
-use cityjson_lib::json::staged::from_feature_file_with_base;
 use cityjson_lib::{cityjson, json};
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
 
 use crate::spatial_structs::{Bbox, Cell, CellId};
 
@@ -48,18 +46,6 @@ pub struct World {
     pub input_source: InputSource,
 }
 
-struct ExtentResult {
-    extent: Bbox,
-    nr_features: usize,
-    cityobject_types_ignored: Vec<CityObjectType>,
-    nr_features_ignored: usize,
-}
-
-struct FeatureDirsFiles {
-    feature_dirs: Vec<PathBuf>,
-    feature_files: Vec<PathBuf>,
-}
-
 struct FeatureInGridCells {
     feature: Feature,
     cells: Vec<(CellId, Cell)>,
@@ -75,15 +61,10 @@ struct SelectedGeometryStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum InputSource {
-    LegacyFeatureFiles {
-        features_root: PathBuf,
-    },
-    CjIndexDataset {
-        dataset_root: PathBuf,
-        index_path: PathBuf,
-        layout: CjIndexLayout,
-    },
+pub struct InputSource {
+    pub dataset_root: PathBuf,
+    pub index_path: PathBuf,
+    pub layout: CjIndexLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +99,7 @@ impl InputSource {
             cityjson_index::DatasetLayoutKind::CityJson => CjIndexLayout::CityJson,
             cityjson_index::DatasetLayoutKind::FeatureFiles => CjIndexLayout::FeatureFiles,
         };
-        Self::CjIndexDataset {
+        Self {
             dataset_root: resolved.dataset_root.clone(),
             index_path: resolved.index_path.clone(),
             layout,
@@ -126,152 +107,14 @@ impl InputSource {
     }
 
     pub fn open_index(&self) -> Result<CityIndex, Box<dyn std::error::Error>> {
-        match self {
-            Self::LegacyFeatureFiles { .. } => {
-                Err("legacy feature-file input does not use cjindex".into())
-            }
-            Self::CjIndexDataset {
-                dataset_root,
-                index_path,
-                layout,
-            } => Ok(CityIndex::open(
-                layout.storage_layout(dataset_root),
-                index_path,
-            )?),
-        }
+        Ok(CityIndex::open(
+            self.layout.storage_layout(&self.dataset_root),
+            &self.index_path,
+        )?)
     }
 }
 
 impl World {
-    pub fn new<P: AsRef<Path>>(
-        path_metadata: P,
-        path_features_root: P,
-        cellsize: u32,
-        cityobject_types: Option<Vec<CityObjectType>>,
-        arg_minz: Option<i32>,
-        arg_maxz: Option<i32>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let path_features_root = path_features_root.as_ref().to_path_buf();
-        let path_metadata = path_metadata.as_ref().to_path_buf();
-        let feature_base_document = std::fs::read(&path_metadata)?;
-        let metadata = json::from_slice(&feature_base_document)?;
-        let crs = Crs::from_model(&metadata)?;
-
-        info!(
-            "Computing extent from the features of type {:?}",
-            cityobject_types
-        );
-
-        let feature_dirs_files = Self::find_feature_dirs_and_files(&path_features_root);
-        debug!(
-            "Found {} subdirectories and {} CityJSONFeature files at the root directory",
-            feature_dirs_files.feature_dirs.len(),
-            feature_dirs_files.feature_files.len()
-        );
-
-        let extents: Vec<ExtentResult> = feature_dirs_files
-            .feature_dirs
-            .into_par_iter()
-            .filter_map(|dir| {
-                Self::extent(
-                    dir,
-                    cityobject_types.as_ref(),
-                    feature_base_document.as_slice(),
-                )
-            })
-            .collect();
-
-        let mut nr_features = 0;
-        let mut nr_features_ignored = 0;
-        let mut extent = Self::extent_init(
-            &path_features_root,
-            cityobject_types.as_ref(),
-            feature_base_document.as_slice(),
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "Did not find any CityJSONFeature of type {:?} in {}",
-                cityobject_types,
-                path_features_root.display()
-            )
-        });
-        let mut cityobject_types_ignored: Vec<CityObjectType> = Vec::new();
-
-        for (i, extent_result) in extents.iter().enumerate() {
-            nr_features += extent_result.nr_features;
-            nr_features_ignored += extent_result.nr_features_ignored;
-            if i == 0 {
-                extent = extent_result.extent;
-            } else {
-                merge_bbox(&mut extent, &extent_result.extent);
-            }
-            for cotype in &extent_result.cityobject_types_ignored {
-                if !cityobject_types_ignored.contains(cotype) {
-                    cityobject_types_ignored.push(*cotype);
-                }
-            }
-        }
-
-        for feature_path in &feature_dirs_files.feature_files {
-            Self::extent_file(
-                cityobject_types.as_ref(),
-                &mut extent,
-                &mut nr_features,
-                &mut nr_features_ignored,
-                &mut cityobject_types_ignored,
-                feature_path,
-                feature_base_document.as_slice(),
-            );
-        }
-
-        if nr_features == 0 {
-            panic!(
-                "Did not find any CityJSONFeatures of type {:?}",
-                cityobject_types
-            );
-        }
-
-        if let Some(minz) = arg_minz {
-            if extent[2] < minz as f64 {
-                extent[2] = minz as f64;
-            }
-        }
-        if let Some(maxz) = arg_maxz {
-            if extent[5] > maxz as f64 {
-                extent[5] = maxz as f64;
-            }
-        }
-
-        info!(
-            "Found {} features of type {:?}",
-            nr_features, &cityobject_types
-        );
-        info!(
-            "Ignored {} features of type {:?}",
-            nr_features_ignored, &cityobject_types_ignored
-        );
-        debug!("extent: {:?}", &extent);
-        info!(
-            "Computed extent from features: {}",
-            crate::spatial_structs::bbox_to_wkt(&extent)
-        );
-
-        let grid = crate::spatial_structs::SquareGrid::new(&extent, cellsize, crs.to_epsg()?);
-        debug!("{}", grid);
-
-        Ok(Self {
-            features: Vec::with_capacity(nr_features),
-            crs,
-            feature_base_document,
-            grid,
-            cityobject_types,
-            path_metadata,
-            input_source: InputSource::LegacyFeatureFiles {
-                features_root: path_features_root,
-            },
-        })
-    }
-
     pub fn from_cjindex(
         input_source: InputSource,
         path_metadata: PathBuf,
@@ -412,11 +255,7 @@ impl World {
         input_source: &InputSource,
         features: &[cityjson_index::IndexedFeatureRef],
     ) -> cityjson_lib::Result<Vec<cityjson_lib::CityModel>> {
-        let InputSource::CjIndexDataset { index_path, .. } = input_source else {
-            return Err(cityjson_lib::Error::Io(std::io::Error::other(
-                "cjindex feature reads require a cjindex dataset",
-            )));
-        };
+        let index_path = &input_source.index_path;
 
         CJINDEX_THREAD_LOCAL.with(|cell| {
             let needs_open = {
@@ -444,216 +283,28 @@ impl World {
         })
     }
 
-    fn find_feature_dirs_and_files(path_features_root: &PathBuf) -> FeatureDirsFiles {
-        let mut path_features_root_dirs: Vec<PathBuf> = Vec::new();
-        let mut path_features_root_files: Vec<PathBuf> = Vec::new();
-        for entry_res in WalkDir::new(path_features_root).min_depth(1).max_depth(1) {
-            if let Ok(entry) = entry_res {
-                if entry.file_type().is_dir() {
-                    path_features_root_dirs.push(entry.path().to_path_buf());
-                } else if entry.file_type().is_file() {
-                    if let Some(jsonl_path) = Self::direntry_to_jsonl(entry) {
-                        path_features_root_files.push(jsonl_path)
-                    }
-                }
-            } else {
-                error!(
-                    "Error in walking the directory {}, error: {}",
-                    &path_features_root.display(),
-                    entry_res.unwrap_err()
-                )
-            }
-        }
-        FeatureDirsFiles {
-            feature_dirs: path_features_root_dirs,
-            feature_files: path_features_root_files,
-        }
-    }
-
-    fn extent<P: AsRef<Path> + std::fmt::Debug>(
-        path_features: P,
-        cityobject_types: Option<&Vec<CityObjectType>>,
-        feature_base_document: &[u8],
-    ) -> Option<ExtentResult> {
-        let features_enum_iter = WalkDir::new(&path_features)
-            .into_iter()
-            .filter_map(Self::jsonl_path);
-
-        let mut extent: Option<Bbox> = None;
-        let mut nr_features = 0;
-        let mut nr_features_ignored = 0;
-        let mut cityobject_types_ignored: Vec<CityObjectType> = Vec::new();
-
-        for feature_path in features_enum_iter {
-            match from_feature_file_with_base(&feature_path, feature_base_document) {
-                Ok(feature) => {
-                    let stats = selected_geometry_stats(&feature, cityobject_types);
-                    if let Some(bbox) = stats.bbox {
-                        if let Some(accumulated) = extent.as_mut() {
-                            merge_bbox(accumulated, &bbox);
-                        } else {
-                            extent = Some(bbox);
-                        }
-                        nr_features += 1;
-                    } else {
-                        nr_features_ignored += 1;
-                        for cotype in stats.ignored_object_types {
-                            if !cityobject_types_ignored.contains(&cotype) {
-                                cityobject_types_ignored.push(cotype);
-                            }
-                        }
-                    }
-                }
-                Err(e) => warn!("Failed to parse {:?} with {:?}", &feature_path, e),
-            }
-        }
-
-        extent.map(|extent| ExtentResult {
-            extent,
-            nr_features,
-            cityobject_types_ignored,
-            nr_features_ignored,
-        })
-    }
-
-    fn extent_init<P: AsRef<Path> + std::fmt::Debug>(
-        path_features: P,
-        cityobject_types: Option<&Vec<CityObjectType>>,
-        feature_base_document: &[u8],
-    ) -> Option<Bbox> {
-        let features_enum_iter = WalkDir::new(&path_features)
-            .into_iter()
-            .filter_map(Self::jsonl_path);
-
-        for feature_path in features_enum_iter {
-            match from_feature_file_with_base(&feature_path, feature_base_document) {
-                Ok(feature) => {
-                    let stats = selected_geometry_stats(&feature, cityobject_types);
-                    if let Some(bbox) = stats.bbox {
-                        return Some(bbox);
-                    }
-                }
-                Err(e) => warn!("Failed to parse {:?} with {:?}", &feature_path, e),
-            }
-        }
-        None
-    }
-
-    fn extent_file(
-        cityobject_types: Option<&Vec<CityObjectType>>,
-        extent: &mut Bbox,
-        nr_features: &mut usize,
-        nr_features_ignored: &mut usize,
-        cityobject_types_ignored: &mut Vec<CityObjectType>,
-        feature_path: &PathBuf,
-        feature_base_document: &[u8],
-    ) {
-        if let Ok(feature) = from_feature_file_with_base(feature_path, feature_base_document) {
-            let stats = selected_geometry_stats(&feature, cityobject_types);
-            if let Some(bbox) = stats.bbox {
-                merge_bbox(extent, &bbox);
-                *nr_features += 1;
-            } else {
-                *nr_features_ignored += 1;
-                for cotype in stats.ignored_object_types {
-                    if !cityobject_types_ignored.contains(&cotype) {
-                        cityobject_types_ignored.push(cotype);
-                    }
-                }
-            }
-        } else {
-            error!("Failed to parse {:?}", &feature_path);
-        }
-    }
-
-    pub fn jsonl_path(walkdir_res: Result<walkdir::DirEntry, walkdir::Error>) -> Option<PathBuf> {
-        if let Ok(entry) = walkdir_res {
-            Self::direntry_to_jsonl(entry)
-        } else {
-            None
-        }
-    }
-
-    fn direntry_to_jsonl(entry: walkdir::DirEntry) -> Option<PathBuf> {
-        if let Some(ext) = entry.path().extension() {
-            if ext == "jsonl" {
-                Some(entry.path().to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
     pub fn index_with_grid(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Counting vertices in grid cells");
 
         self.features.clear();
-        let input_source = self.input_source.clone();
-        match input_source {
-            InputSource::LegacyFeatureFiles { features_root } => {
-                let feature_dirs_files = Self::find_feature_dirs_and_files(&features_root);
-                for dir in feature_dirs_files.feature_dirs {
-                    for feature_path in WalkDir::new(dir).into_iter().filter_map(Self::jsonl_path) {
-                        if let Some(feature_in_cells) =
-                            self.index_feature_path(&feature_path, &features_root)
-                        {
-                            self.integrate_feature_in_cells(feature_in_cells);
-                        }
-                    }
-                }
-                for feature_path in feature_dirs_files.feature_files {
-                    if let Some(feature_in_cells) =
-                        self.index_feature_path(&feature_path, &features_root)
-                    {
-                        self.integrate_feature_in_cells(feature_in_cells);
-                    }
-                }
-            }
-            InputSource::CjIndexDataset { .. } => {
-                let city_index = self.input_source.open_index()?;
-                for page_result in city_index.scan_feature_pages(CJINDEX_PAGE_SIZE)? {
-                    let page = page_result?;
-                    let feature_in_cells = page
-                        .into_par_iter()
-                        .map(|feature| -> Option<FeatureInGridCells> {
-                            self.index_feature_model(
-                                FeatureReference::CjIndexRef(feature.reference),
-                                &feature.model,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    for feature_in_cells in feature_in_cells.into_iter().flatten() {
-                        self.integrate_feature_in_cells(feature_in_cells);
-                    }
-                }
+        let city_index = self.input_source.open_index()?;
+        for page_result in city_index.scan_feature_pages(CJINDEX_PAGE_SIZE)? {
+            let page = page_result?;
+            let feature_in_cells = page
+                .into_par_iter()
+                .map(|feature| -> Option<FeatureInGridCells> {
+                    self.index_feature_model(
+                        FeatureReference::CjIndexRef(feature.reference),
+                        &feature.model,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for feature_in_cells in feature_in_cells.into_iter().flatten() {
+                self.integrate_feature_in_cells(feature_in_cells);
             }
         }
         debug!("indexed {} features", self.features.len());
         Ok(())
-    }
-
-    fn index_feature_path(
-        &self,
-        feature_path: &PathBuf,
-        features_root: &Path,
-    ) -> Option<FeatureInGridCells> {
-        let feature = from_feature_file_with_base(feature_path, &self.feature_base_document);
-        if let Ok(model) = feature {
-            self.index_feature_model(
-                FeatureReference::LegacyPath(
-                    feature_path
-                        .strip_prefix(features_root)
-                        .unwrap_or(feature_path)
-                        .to_path_buf(),
-                ),
-                &model,
-            )
-        } else {
-            error!("Failed to parse the feature {:?}", &feature_path);
-            None
-        }
     }
 
     fn index_feature_model(
@@ -819,14 +470,13 @@ impl Feature {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FeatureReference {
-    LegacyPath(PathBuf),
     CjIndexRef(cityjson_index::IndexedFeatureRef),
     CjIndexId(String),
 }
 
 impl Default for FeatureReference {
     fn default() -> Self {
-        Self::LegacyPath(PathBuf::new())
+        Self::CjIndexId(String::new())
     }
 }
 
@@ -1204,6 +854,7 @@ fn merge_bbox(target: &mut Bbox, other: &Bbox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cityjson_lib::json::staged::from_feature_file_with_base;
 
     fn resource_path(name: &str) -> PathBuf {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -18,9 +18,8 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
-    /// Input dataset root. This can be either:
-    /// - a legacy directory containing metadata.city.json plus CityJSONFeatures (.city.jsonl)
-    /// - a cjindex-compatible dataset root for NDJSON, CityJSON, or feature-files input
+    /// Input dataset root. Must be a cjindex-compatible dataset in NDJSON,
+    /// CityJSON, or feature-files layout.
     #[arg(value_parser = existing_canonical_path)]
     pub input: PathBuf,
     /// Directory for the output.
