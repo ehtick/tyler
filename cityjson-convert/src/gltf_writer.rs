@@ -13,7 +13,7 @@ use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, Ver
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
-use log::info;
+use log::debug;
 use meshopt::{
     encode_index_buffer, encode_vertex_buffer, generate_vertex_remap,
     optimize_overdraw_in_place_decoder, optimize_vertex_cache, optimize_vertex_fetch,
@@ -98,7 +98,7 @@ pub fn write_city_model_glb<P: AsRef<Path>>(
         MeshCollector::new(coordinate_transform, options.smooth_normals, clip_volume);
     collector.add_model(model)?;
     let processed = collector.finish()?;
-    info!(
+    debug!(
         "Processed {} vertices and {} indices for the output GLB",
         processed.vertex_count(),
         processed.index_count()
@@ -1579,7 +1579,7 @@ impl ProcessedScene {
             .iter()
             .all(|primitive| primitive.vertices.is_empty())
         {
-            info!(
+            debug!(
                 "No geometry to write, creating empty GLB file at {}",
                 output_path.as_ref().display()
             );
@@ -1595,7 +1595,7 @@ impl ProcessedScene {
             return Ok(());
         }
 
-        info!(
+        debug!(
             "Writing GLB file with {} vertices and {} indices to {}",
             self.vertex_count(),
             self.index_count(),
@@ -1608,10 +1608,10 @@ impl ProcessedScene {
             .ok_or_else(|| anyhow::anyhow!("geometry bounds missing for non-empty mesh"))?;
         encoded.write(output_path.as_ref())?;
 
-        info!("GLB Summary: {}", output_path.as_ref().display());
-        info!("  Vertices: {}", self.vertex_count());
-        info!("  Indices: {}", self.index_count());
-        info!(
+        debug!("GLB Summary: {}", output_path.as_ref().display());
+        debug!("  Vertices: {}", self.vertex_count());
+        debug!("  Indices: {}", self.index_count());
+        debug!(
             "  Local coordinate range: X [{:.2}, {:.2}], Y [{:.2}, {:.2}], Z [{:.2}, {:.2}]",
             bounds.min[0],
             bounds.max[0],
@@ -1620,7 +1620,7 @@ impl ProcessedScene {
             bounds.min[2],
             bounds.max[2]
         );
-        info!(
+        debug!(
             "  Node translation: [{:.2}, {:.2}, {:.2}]",
             self.node_translation_base[0] + self.center[0],
             self.node_translation_base[1] + self.center[1],
