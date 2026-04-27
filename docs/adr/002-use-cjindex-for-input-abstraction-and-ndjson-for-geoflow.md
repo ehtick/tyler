@@ -75,8 +75,13 @@ Good:
 Trade-offs:
 
 - Tyler now owns tile-local NDJSON materialization
-- `cjindex` datasets must expose a consistent shared metadata document for
-  Tyler's current processing model
+- `cjindex` datasets may expose multiple source metadata documents (one per
+  source file in the `cityjson` and `feature-files` layouts). Tyler picks
+  one of them as a representative base document for dataset-wide fields
+  (CRS, extensions, debug CityJSONSeq seed); per-feature `transform`
+  values are applied by `cjindex` during feature reads, so multi-document
+  datasets decode correctly. CRS consistency across sources is a
+  dataset-level invariant owned by `cjindex`, not enforced by Tyler.
 - export now includes an extra write step even when the source is already
   NDJSON
 - internal indexing code is more abstract because it must support both path-

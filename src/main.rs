@@ -285,19 +285,17 @@ fn prepare_input(
 fn derive_base_document(
     city_index: &cityjson_index::CityIndex,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // Tyler treats this as a *representative* document, not a canonical one:
+    // it supplies the dataset-wide fields tyler needs (CRS, extensions, and
+    // the seed for `write_cityjsonseq_auto_transform`). Per-feature
+    // `transform` values are applied by cjindex during feature reads, so
+    // multi-document datasets (e.g. cityjson layout) decode correctly even
+    // when source metadata documents differ. CRS consistency across sources
+    // is a dataset-level invariant owned by cityjson-index.
     let metadata = city_index.metadata()?;
     let Some(base_document) = metadata.first() else {
         return Err("cjindex dataset does not contain any source metadata".into());
     };
-    if metadata
-        .iter()
-        .skip(1)
-        .any(|candidate| candidate.as_ref() != base_document.as_ref())
-    {
-        return Err(
-            "cjindex dataset contains multiple metadata documents; tyler requires one shared base document".into(),
-        );
-    }
     Ok(serde_json::to_vec(base_document.as_ref())?)
 }
 
@@ -2152,6 +2150,100 @@ mod tests {
 
         assert!(!model.cityobjects().is_empty());
         assert!(!model.vertices().is_empty());
+    }
+
+    #[test]
+    fn build_tile_model_exports_cjindex_cityjson_multi_document() {
+        let dataset_dir = unique_test_dir("cjindex-cityjson-multi");
+        let metadata: Value = serde_json::from_slice(
+            &fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata"),
+        )
+        .expect("parse metadata");
+        let feature: Value = serde_json::from_slice(
+            &fs::read(resource_path("3dbag_feature_x71.city.jsonl")).expect("read feature"),
+        )
+        .expect("parse feature");
+
+        let mut document_a = metadata.clone();
+        document_a["CityObjects"] = feature["CityObjects"].clone();
+        document_a["vertices"] = feature["vertices"].clone();
+        let path_a = dataset_dir.join("source_a.city.json");
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&document_a).expect("serialize cityjson a"),
+        )
+        .expect("write cityjson a");
+
+        // Second document keeps the same CRS but differs from document_a in
+        // bytes (distinct title) and in transform.translate. cityjson-index
+        // reconstructs each feature against its own source metadata, so the
+        // shifted translate must not break decoding.
+        let mut document_b = metadata.clone();
+        if let Some(meta) = document_b.get_mut("metadata").and_then(Value::as_object_mut) {
+            meta.insert("title".to_string(), Value::String("variant-b".to_string()));
+        }
+        if let Some(translate) = document_b
+            .get_mut("transform")
+            .and_then(|t| t.get_mut("translate"))
+            .and_then(Value::as_array_mut)
+        {
+            for component in translate.iter_mut() {
+                if let Some(value) = component.as_f64() {
+                    *component = serde_json::json!(value + 1.0);
+                }
+            }
+        }
+        document_b["CityObjects"] = feature["CityObjects"].clone();
+        document_b["vertices"] = feature["vertices"].clone();
+        let path_b = dataset_dir.join("source_b.city.json");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&document_b).expect("serialize cityjson b"),
+        )
+        .expect("write cityjson b");
+
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve multi-document cityjson dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index
+            .reindex()
+            .expect("reindex multi-document cityjson dataset");
+
+        let stored_metadata = city_index.metadata().expect("load source metadata");
+        assert!(
+            stored_metadata.len() >= 2,
+            "expected at least two source metadata documents, got {}",
+            stored_metadata.len()
+        );
+
+        let feature_base_document =
+            derive_base_document(&city_index).expect("derive base doc from multi-document dataset");
+        let metadata_path = dataset_dir.join("metadata.city.json");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
+            200,
+            Some(vec![parser::CityObjectType::Building]),
+            None,
+            None,
+        )
+        .expect("build cjindex cityjson world");
+        world
+            .index_with_grid()
+            .expect("index cjindex cityjson world");
+
+        // Both source documents must contribute features. Per-source transforms
+        // are applied by cjindex during read, not by tyler.
+        assert!(
+            world.features.len() >= 2,
+            "expected features from both source documents, got {}",
+            world.features.len()
+        );
     }
 
     #[test]
