@@ -730,11 +730,12 @@ fn prepare_feature_model(
     include_parent_attributes: bool,
     cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
-    let mut model = filter_cityobject_types(model, world.cityobject_types.as_ref())?;
+    let mut model = model;
     prune_lod_geometries(&mut model, feature_type_lods)?;
     if include_parent_attributes {
         inherit_parent_attributes(&mut model)?;
     }
+    let model = filter_cityobject_types(model, world.cityobject_types.as_ref())?;
     let model = remove_empty_geometry_cityobjects(&model)?;
     if model.cityobjects().is_empty() {
         return Ok(None);
@@ -1626,18 +1627,16 @@ mod tests {
 
     fn prepare_attribute_inheritance_model(
         model: cityjson_lib::CityModel,
+        cityobject_types: Vec<parser::CityObjectType>,
         include_parent_attributes: bool,
     ) -> cityjson_lib::CityModel {
-        let cityobject_types = vec![
-            parser::CityObjectType::Building,
-            parser::CityObjectType::BuildingPart,
-        ];
-        let mut model = filter_cityobject_types(model, Some(&cityobject_types))
-            .expect("type filter should succeed");
+        let mut model = model;
         prune_lod_geometries(&mut model, &BTreeMap::new()).expect("LoD pruning should succeed");
         if include_parent_attributes {
             inherit_parent_attributes(&mut model).expect("attribute inheritance should succeed");
         }
+        let model = filter_cityobject_types(model, Some(&cityobject_types))
+            .expect("type filter should succeed");
         let model =
             remove_empty_geometry_cityobjects(&model).expect("empty object removal should succeed");
         cleanup_and_update_extents(model).expect("cleanup should succeed")
@@ -1756,8 +1755,13 @@ mod tests {
     #[test]
     fn prepare_model_copies_parent_attributes_when_enabled() {
         let model = parent_attribute_remapping_fixture(serde_json::json!({}));
+        let cityobject_types = vec![
+            parser::CityObjectType::Building,
+            parser::CityObjectType::BuildingPart,
+        ];
 
-        let disabled = prepare_attribute_inheritance_model(model.clone(), false);
+        let disabled =
+            prepare_attribute_inheritance_model(model.clone(), cityobject_types.clone(), false);
         let disabled_feature = feature_json(&disabled);
         assert_eq!(
             feature_attribute_string(&disabled_feature, "building-part", "parent_only"),
@@ -1768,7 +1772,7 @@ mod tests {
             None
         );
 
-        let enabled = prepare_attribute_inheritance_model(model, true);
+        let enabled = prepare_attribute_inheritance_model(model, cityobject_types, true);
         let enabled_feature = feature_json(&enabled);
         assert_eq!(
             feature_attribute_string(&enabled_feature, "building-part", "parent_only"),
@@ -1788,8 +1792,12 @@ mod tests {
             "levels": 3,
             "shared": "child"
         }));
+        let cityobject_types = vec![
+            parser::CityObjectType::Building,
+            parser::CityObjectType::BuildingPart,
+        ];
 
-        let prepared = prepare_attribute_inheritance_model(model, true);
+        let prepared = prepare_attribute_inheritance_model(model, cityobject_types, true);
         let prepared_feature = feature_json(&prepared);
 
         assert_eq!(
@@ -1807,6 +1815,38 @@ mod tests {
         assert_eq!(
             feature_attribute_string(&prepared_feature, "building-part", "shared"),
             Some("child".to_string())
+        );
+    }
+
+    #[test]
+    fn prepare_model_inherits_parent_attributes_when_parent_type_is_not_selected() {
+        let model = parent_attribute_remapping_fixture(serde_json::json!({}));
+
+        let prepared = prepare_attribute_inheritance_model(
+            model,
+            vec![parser::CityObjectType::BuildingPart],
+            true,
+        );
+        let prepared_feature = feature_json(&prepared);
+
+        assert_eq!(
+            feature_attribute_string(&prepared_feature, "building-part", "parent_only"),
+            Some("parent".to_string())
+        );
+        assert_eq!(
+            feature_attribute_string(&prepared_feature, "building-part", "shared"),
+            Some("parent".to_string())
+        );
+        assert_eq!(
+            prepared_feature
+                .get("CityObjects")
+                .and_then(Value::as_object)
+                .map(|objects| objects.len()),
+            Some(1)
+        );
+        assert_eq!(
+            feature_root_id(&prepared),
+            Some("building-part".to_string())
         );
     }
 
@@ -1851,6 +1891,55 @@ mod tests {
         assert_eq!(
             feature_attribute_string(&model_feature, "building-part", "shared"),
             Some("parent".to_string())
+        );
+        assert_eq!(feature_root_id(&model), Some("building-part".to_string()));
+    }
+
+    #[test]
+    fn build_tile_model_inherits_parent_attributes_when_only_child_type_is_selected() {
+        let dataset_dir = unique_test_dir("attribute-inheritance-child-only");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        let metadata_path = dataset_dir.join("metadata.city.json");
+        let feature_path = features_dir.join("sample.city.jsonl");
+        fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
+        fs::write(
+            &feature_path,
+            parent_attribute_remapping_fixture_bytes(serde_json::json!({})),
+        )
+        .expect("write feature");
+
+        let mut world = parser::World::new(
+            &metadata_path,
+            &features_dir,
+            200,
+            Some(vec![parser::CityObjectType::BuildingPart]),
+            None,
+            None,
+        )
+        .expect("build legacy world");
+        world.index_with_grid().expect("index legacy world");
+        let quadtree = build_quadtree(&world);
+        let feature_ids = collect_tile_feature_ids(&world, &quadtree);
+
+        let model = build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), true)
+            .expect("build tile model with inherited attributes");
+        let model_feature = feature_json(&model);
+
+        assert_eq!(
+            feature_attribute_string(&model_feature, "building-part", "parent_only"),
+            Some("parent".to_string())
+        );
+        assert_eq!(
+            feature_attribute_string(&model_feature, "building-part", "shared"),
+            Some("parent".to_string())
+        );
+        assert_eq!(
+            model_feature
+                .get("CityObjects")
+                .and_then(Value::as_object)
+                .map(|objects| objects.len()),
+            Some(1)
         );
         assert_eq!(feature_root_id(&model), Some("building-part".to_string()));
     }
