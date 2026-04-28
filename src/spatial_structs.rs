@@ -1011,6 +1011,7 @@ mod tests {
                         centroid: [0.0, 0.0],
                         reference: Default::default(),
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
@@ -1031,6 +1032,7 @@ mod tests {
                         centroid: [0.0, 0.0],
                         reference: Default::default(),
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
@@ -1055,6 +1057,7 @@ mod tests {
                         centroid: [0.0, 0.0],
                         reference: Default::default(),
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
