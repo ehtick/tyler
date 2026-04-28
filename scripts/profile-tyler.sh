@@ -4,6 +4,7 @@ set -euo pipefail
 readonly DEFAULT_OUTPUT_ROOT="docs/performance/runs"
 readonly DEFAULT_GEODEPOT_ENV_FILE=".env"
 readonly DEFAULT_RUNNER="all"
+readonly DEFAULT_RAW_OUTPUT_SUBDIR="raw"
 readonly PROFILE_CONFIG_BASENAME="profile-tyler.json"
 readonly PROFILE_CONFIG_TYPO_BASENAME="profile-tiler.json"
 readonly RUSTFLAGS_VALUE="-C debuginfo=2 -C force-frame-pointers=yes"
@@ -39,8 +40,9 @@ The script builds tyler in release mode with debuginfo and frame pointers,
 then captures perf stat and Valgrind Massif summaries into a new run directory.
 When --profile is provided, the script reads the geodepot-resolved
 profile-tyler.json data item for the matching tyler command-line arguments.
-Tyler's own output is written into a temporary staging area while profiling and
-is removed before the final run directory is published.
+Tyler's own output, together with the raw perf and Massif dumps, is written to
+an ignored sibling directory under the output root. The committed run
+directory keeps the JSON summaries and markdown note.
 
 Examples:
   just profile -- --profile bvz-dh-coast-5/bvz_dh
@@ -289,6 +291,8 @@ if [[ "$output_root" != /* ]]; then
 fi
 mkdir -p "$output_root"
 output_root="$(resolve_path "$output_root")"
+raw_output_root="$output_root/$DEFAULT_RAW_OUTPUT_SUBDIR"
+mkdir -p "$raw_output_root"
 
 [[ -d "$input_root" ]] || die "input dataset root does not exist: $input_root"
 
@@ -357,6 +361,8 @@ fi
 
 final_run_dir="$output_root/$run_id"
 [[ ! -e "$final_run_dir" ]] || die "run directory already exists: $final_run_dir"
+raw_run_dir="$raw_output_root/$run_id"
+[[ ! -e "$raw_run_dir" ]] || die "raw run directory already exists: $raw_run_dir"
 
 staging_dir="$(mktemp -d "$output_root/.tyler-profile-staging.XXXXXX")"
 finalized="false"
@@ -384,6 +390,7 @@ cleanup() {
         printf 'created_at=%s\n' "$created_at"
         printf 'runner=%s\n' "$runner_selector"
         printf 'exit_status=%s\n' "$exit_status"
+        printf 'raw_run_dir=%s\n' "$raw_run_dir"
     } > "$staging_dir/FAILED.txt"
 
     if mv "$staging_dir" "$target_dir"; then
@@ -397,7 +404,7 @@ trap cleanup EXIT
 
 binary_path="$repo_root/target/release/tyler"
 build_command=(cargo build --release --locked --bin tyler --manifest-path "$repo_root/Cargo.toml")
-tyler_output_base="$staging_dir/outputs"
+tyler_output_base="$raw_run_dir/outputs"
 mkdir -p "$tyler_output_base"
 
 printf 'Building profiling binary...\n'
@@ -434,8 +441,8 @@ tyler_perf_command=()
 perf_command=()
 
 if [[ "$run_perf" == "true" ]]; then
-    perf_raw_json="$staging_dir/perf-stat.raw.json"
-    perf_stderr="$staging_dir/perf-stat.stderr.log"
+    perf_raw_json="$raw_run_dir/perf-stat.raw.json"
+    perf_stderr="$raw_run_dir/perf-stat.stderr.log"
     tyler_perf_command=("$binary_path" "$input_root")
     tyler_perf_command+=( "${profile_tyler_args[@]}" )
     tyler_perf_command+=( --output "$perf_output_dir" )
@@ -513,9 +520,9 @@ tyler_massif_command=()
 massif_command=()
 
 if [[ "$run_massif" == "true" ]]; then
-    massif_raw="$staging_dir/massif.out"
-    massif_stdout="$staging_dir/massif.stdout.log"
-    massif_stderr="$staging_dir/massif.stderr.log"
+    massif_raw="$raw_run_dir/massif.out"
+    massif_stdout="$raw_run_dir/massif.stdout.log"
+    massif_stderr="$raw_run_dir/massif.stderr.log"
     tyler_massif_command=("$binary_path" "$input_root")
     tyler_massif_command+=( "${profile_tyler_args[@]}" )
     tyler_massif_command+=( --output "$massif_output_dir" )
@@ -677,6 +684,8 @@ jq -n \
     --arg rustflags "$RUSTFLAGS_VALUE" \
     --arg perf_elapsed_seconds "$perf_elapsed_seconds" \
     --arg massif_elapsed_seconds "$massif_elapsed_seconds" \
+    --arg raw_output_root "$raw_output_root" \
+    --arg raw_run_dir "$raw_run_dir" \
     --arg perf_raw_json "$perf_raw_json" \
     --arg massif_raw "$massif_raw" \
     --arg manifest_path "$repo_root/Cargo.toml" \
@@ -725,6 +734,8 @@ jq -n \
             repo_root: $repo_root,
             input_root: $input_root,
             output_root: $output_root,
+            raw_output_root: $raw_output_root,
+            raw_run_dir: $raw_run_dir,
             staging_dir: $staging_dir,
             run_dir: $run_dir,
             binary_path: $binary_path,
@@ -802,22 +813,14 @@ EOF
 
     cat <<EOF
 
-Committed artifacts are the JSON summaries and this markdown note. Raw perf and Massif dumps are staged only while the profiler runs.
+Committed artifacts are the JSON summaries and this markdown note. Raw perf and
+Massif dumps, together with Tyler's own outputs, are retained under
+$raw_run_dir.
 EOF
 } > "$staging_dir/summary.md"
-
-remove_paths() {
-    local path
-    for path in "$@"; do
-        [[ -n "$path" ]] || continue
-        rm -rf "$path"
-    done
-}
-
-remove_paths "$tyler_output_base" "$perf_raw_json" "$perf_stderr" "$massif_raw" "$massif_stdout" "$massif_stderr"
 
 mv "$staging_dir" "$final_run_dir"
 finalized="true"
 trap - EXIT
 
-printf 'Wrote profiling run to %s\n' "$final_run_dir"
+printf 'Wrote profiling run to %s\nRaw outputs retained in %s\n' "$final_run_dir" "$raw_run_dir"

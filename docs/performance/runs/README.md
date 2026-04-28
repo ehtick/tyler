@@ -35,10 +35,10 @@ Each run gets its own subdirectory containing:
 - `massif-summary.json` when `--runner massif` or `--runner all` is used
 - `summary.md`
 
-Raw `perf stat` and Valgrind Massif dumps are written to a temporary staging
-area and are not meant to be committed.
-Tyler's own output is also written to that staging area while the profiler is
-running and is deleted before the final run directory is moved into place.
+Raw `perf stat` and Valgrind Massif dumps are retained under the gitignored
+`raw/` sibling directory, for example `raw/<run-id>/perf-stat.raw.json`.
+Tyler's own output is also written there while the profiler is running so it
+can be reused for later analysis without polluting the committed summaries.
 If a profiling run fails, the staging directory is preserved as a
 `<run-id>.failed/` directory in this tree so you can inspect partial results
 without rerunning Massif.

@@ -118,6 +118,13 @@ For large input, like multiple millions of features you need have an SSD.
 Running on a HDD is not feasible for large areas.
 
 There are three resource intensive steps, 1) computing the extent of the input, 2) indexing the input with the grid, 3) converting the tiles.
+
+The profiling workflow is driven by `just profile`. It writes committed
+summaries under `docs/performance/runs/<run-id>/` and retains the raw profiler
+artifacts, plus Tyler's own run output, under the gitignored
+`docs/performance/runs/raw/<run-id>/` tree. Use `--profile` to resolve the
+input and Tyler arguments through Geodepot, or `--runner perf` /
+`--runner massif` to run only one profiler.
 Each of the three steps are executed concurrently, with the help of the [rayon library](https://crates.io/crates/rayon).
 
 You can control the level of parallelism by setting the `RAYON_NUM_THREADS` environment variables.

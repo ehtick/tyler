@@ -12,6 +12,7 @@
 - ADRs and supporting documentation for the new `cityjson-index`/CityJSONSeq input model and grid traversal changes.
 - A repo-local profiling workflow driven by `just profile`, `scripts/profile-tyler.sh`, and Geodepot-backed profile-by-name resolution.
 - Per-run profiling artifacts under `docs/performance/runs/`, including structured summaries for `perf stat` and Valgrind Massif.
+- Retention of raw profiling artifacts and Tyler output under the gitignored `docs/performance/runs/raw/` tree for later analysis.
 - Runner selection for profiling sessions so `perf` and Massif can be run independently or together, with failed runs preserved for later inspection.
 
 ### Changed
