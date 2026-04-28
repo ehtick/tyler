@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly DEFAULT_OUTPUT_ROOT="docs/performance/runs"
 readonly DEFAULT_GEODEPOT_ENV_FILE=".env"
+readonly DEFAULT_RUNNER="all"
 readonly PROFILE_CONFIG_BASENAME="profile-tyler.json"
 readonly PROFILE_CONFIG_TYPO_BASENAME="profile-tiler.json"
 readonly RUSTFLAGS_VALUE="-C debuginfo=2 -C force-frame-pointers=yes"
@@ -16,10 +17,11 @@ die() {
 
 usage() {
     cat <<'EOF'
-Usage: profile-tyler.sh [--profile CASESPEC] [--input PATH] [--label LABEL] [--output-root DIR]
+Usage: profile-tyler.sh [--profile CASESPEC] [--input PATH] [--label LABEL] [--output-root DIR] [--runner MODE]
 
 Defaults:
   --output-root docs/performance/runs
+  --runner      all
   .env          Provides GEODEPOT_BIN for profile resolution
 
 Parameters:
@@ -30,6 +32,8 @@ Parameters:
   --input PATH     Dataset root to profile. Must be an existing tyler input root.
   --label LABEL    Optional run label appended to the run directory name.
   --output-root DIR  Directory that receives the per-run profiling artifacts.
+  --runner MODE    Select which profiler(s) to run: perf, massif, all, or
+                   none. The default is all.
 
 The script builds tyler in release mode with debuginfo and frame pointers,
 then captures perf stat and Valgrind Massif summaries into a new run directory.
@@ -40,6 +44,9 @@ is removed before the final run directory is published.
 
 Examples:
   just profile -- --profile bvz-dh-coast-5/bvz_dh
+  just profile -- --profile bvz-dh-coast-5/bvz_dh --runner perf
+  just profile -- --profile bvz-dh-coast-5/bvz_dh --runner massif
+  just profile -- --profile bvz-dh-coast-5/bvz_dh --runner none
   just profile -- --profile bvz-dh-coast-5/bvz_dh --output-root docs/performance/runs
   just profile -- --input /data/cases/demo --label manual-smoke
 EOF
@@ -160,6 +167,7 @@ profile_spec=""
 profile_input_root=""
 run_label=""
 output_root="$DEFAULT_OUTPUT_ROOT"
+runner_selector="$DEFAULT_RUNNER"
 
 while (($#)); do
     case "$1" in
@@ -187,6 +195,11 @@ while (($#)); do
             output_root="$2"
             shift 2
             ;;
+        --runner)
+            [[ $# -ge 2 ]] || die "--runner requires a value"
+            runner_selector="$2"
+            shift 2
+            ;;
         --)
             shift
             continue
@@ -209,11 +222,35 @@ if [[ -n "$profile_spec" && -n "$run_label" ]]; then
     die "--profile cannot be combined with --label"
 fi
 
+run_perf="false"
+run_massif="false"
+case "$runner_selector" in
+    all)
+        run_perf="true"
+        run_massif="true"
+        ;;
+    perf)
+        run_perf="true"
+        ;;
+    massif)
+        run_massif="true"
+        ;;
+    none)
+        ;;
+    *)
+        die "invalid --runner value: $runner_selector (expected perf, massif, all, or none)"
+        ;;
+esac
+
 require_tool cargo
 require_tool git
 require_tool jq
-require_tool perf
-require_tool valgrind
+if [[ "$run_perf" == "true" ]]; then
+    require_tool perf
+fi
+if [[ "$run_massif" == "true" ]]; then
+    require_tool valgrind
+fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/.." && pwd -P)"
@@ -323,9 +360,37 @@ final_run_dir="$output_root/$run_id"
 
 staging_dir="$(mktemp -d "$output_root/.tyler-profile-staging.XXXXXX")"
 finalized="false"
+failed_run_dir=""
 cleanup() {
-    if [[ "$finalized" != "true" && -d "$staging_dir" ]]; then
+    local exit_status="$?"
+    local target_dir
+    if [[ "$finalized" == "true" || ! -d "$staging_dir" ]]; then
+        return 0
+    fi
+
+    if [[ "$exit_status" -eq 0 ]]; then
         rm -rf "$staging_dir"
+        return 0
+    fi
+
+    target_dir="$final_run_dir.failed"
+    if [[ -e "$target_dir" ]]; then
+        target_dir="${target_dir}.$(date -u +%Y-%m-%dT%H-%M-%S-%NZ)"
+    fi
+
+    failed_run_dir="$target_dir"
+    {
+        printf 'run_id=%s\n' "$run_id"
+        printf 'created_at=%s\n' "$created_at"
+        printf 'runner=%s\n' "$runner_selector"
+        printf 'exit_status=%s\n' "$exit_status"
+    } > "$staging_dir/FAILED.txt"
+
+    if mv "$staging_dir" "$target_dir"; then
+        printf 'Preserved failed profiling run in %s\n' "$target_dir" >&2
+    else
+        printf 'warning: failed profiling run could not be moved to %s; staging remains at %s\n' \
+            "$target_dir" "$staging_dir" >&2
     fi
 }
 trap cleanup EXIT
@@ -345,178 +410,235 @@ printf 'Building profiling binary...\n'
 
 perf_output_dir="$tyler_output_base/perf"
 massif_output_dir="$tyler_output_base/massif"
-mkdir -p "$perf_output_dir" "$massif_output_dir"
-
-perf_raw_json="$staging_dir/perf-stat.raw.json"
-perf_stderr="$staging_dir/perf-stat.stderr.log"
-tyler_perf_command=("$binary_path" "$input_root")
-tyler_perf_command+=( "${profile_tyler_args[@]}" )
-tyler_perf_command+=( --output "$perf_output_dir" )
-perf_command=(perf stat -j -e "$PERF_EVENTS" -o "$perf_raw_json" -- "${tyler_perf_command[@]}")
-
-printf 'Running perf stat...\n'
-printf 'Tyler command: ' >&2
-print_command "${tyler_perf_command[@]}" >&2
-perf_start_ns="$(date +%s%N)"
-set +e
-"${perf_command[@]}" > /dev/null 2> "$perf_stderr"
-perf_status="$?"
-set -e
-perf_end_ns="$(date +%s%N)"
-perf_elapsed_seconds="$(awk -v start="$perf_start_ns" -v end="$perf_end_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
-if [[ "$perf_status" -ne 0 ]]; then
-    die "perf run failed with exit status $perf_status; see $perf_stderr"
+if [[ "$run_perf" == "true" ]]; then
+    mkdir -p "$perf_output_dir"
+fi
+if [[ "$run_massif" == "true" ]]; then
+    mkdir -p "$massif_output_dir"
 fi
 
-perf_summary_json="$staging_dir/perf-stat.json"
-jq -s \
-    --arg wall_clock_seconds "$perf_elapsed_seconds" \
+perf_elapsed_seconds=""
+perf_cycles=""
+perf_instructions=""
+perf_cache_refs=""
+perf_cache_misses=""
+perf_page_faults=""
+perf_context_switches=""
+perf_cpu_migrations=""
+perf_branches=""
+perf_branch_misses=""
+perf_raw_json=""
+perf_stderr=""
+perf_summary_json=""
+tyler_perf_command=()
+perf_command=()
+
+if [[ "$run_perf" == "true" ]]; then
+    perf_raw_json="$staging_dir/perf-stat.raw.json"
+    perf_stderr="$staging_dir/perf-stat.stderr.log"
+    tyler_perf_command=("$binary_path" "$input_root")
+    tyler_perf_command+=( "${profile_tyler_args[@]}" )
+    tyler_perf_command+=( --output "$perf_output_dir" )
+    perf_command=(perf stat -j -e "$PERF_EVENTS" -o "$perf_raw_json" -- "${tyler_perf_command[@]}")
+
+    printf 'Running perf stat...\n'
+    printf 'Tyler command: ' >&2
+    print_command "${tyler_perf_command[@]}" >&2
+    perf_start_ns="$(date +%s%N)"
+    set +e
+    "${perf_command[@]}" > /dev/null 2> "$perf_stderr"
+    perf_status="$?"
+    set -e
+    perf_end_ns="$(date +%s%N)"
+    perf_elapsed_seconds="$(awk -v start="$perf_start_ns" -v end="$perf_end_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
+    if [[ "$perf_status" -ne 0 ]]; then
+        die "perf run failed with exit status $perf_status; see $perf_stderr"
+    fi
+
+    perf_summary_json="$staging_dir/perf-stat.json"
+    perf_summary_filter='
+        def event_value($name):
+            ([.[] | select(.event == $name)] | first)."counter-value" | tonumber;
+        def ratio($numerator; $denominator):
+            if $denominator == 0 then null else ($numerator / $denominator) end;
+        {
+            wall_clock_seconds: ($wall_clock_seconds | tonumber),
+            counters: {
+                cycles: event_value("cycles"),
+                instructions: event_value("instructions"),
+                instructions_per_cycle: ratio(event_value("instructions"); event_value("cycles")),
+                cache_references: event_value("cache-references"),
+                cache_misses: event_value("cache-misses"),
+                cache_miss_rate: ratio(event_value("cache-misses"); event_value("cache-references")),
+                page_faults: event_value("page-faults"),
+                context_switches: event_value("context-switches"),
+                cpu_migrations: event_value("cpu-migrations"),
+                branches: event_value("branches"),
+                branch_misses: event_value("branch-misses")
+            },
+            raw_events: .
+        }
     '
-    def event_value($name):
-        ([.[] | select(.event == $name)] | first)."counter-value" | tonumber;
-    def ratio($numerator; $denominator):
-        if $denominator == 0 then null else ($numerator / $denominator) end;
-    {
-        wall_clock_seconds: ($wall_clock_seconds | tonumber),
-        counters: {
-            cycles: event_value("cycles"),
-            instructions: event_value("instructions"),
-            instructions_per_cycle: ratio(event_value("instructions"); event_value("cycles")),
-            cache_references: event_value("cache-references"),
-            cache_misses: event_value("cache-misses"),
-            cache_miss_rate: ratio(event_value("cache-misses"); event_value("cache-references")),
-            page_faults: event_value("page-faults"),
-            context_switches: event_value("context-switches"),
-            cpu_migrations: event_value("cpu-migrations"),
-            branches: event_value("branches"),
-            branch_misses: event_value("branch-misses")
-        },
-        raw_events: .
-    }
-    ' "$perf_raw_json" > "$perf_summary_json"
+    jq -s \
+        --arg wall_clock_seconds "$perf_elapsed_seconds" \
+        "$perf_summary_filter" "$perf_raw_json" > "$perf_summary_json"
 
-perf_cycles="$(jq -r '.counters.cycles' "$perf_summary_json")"
-perf_instructions="$(jq -r '.counters.instructions' "$perf_summary_json")"
-perf_cache_refs="$(jq -r '.counters.cache_references' "$perf_summary_json")"
-perf_cache_misses="$(jq -r '.counters.cache_misses' "$perf_summary_json")"
-perf_page_faults="$(jq -r '.counters.page_faults' "$perf_summary_json")"
-perf_context_switches="$(jq -r '.counters.context_switches' "$perf_summary_json")"
-perf_cpu_migrations="$(jq -r '.counters.cpu_migrations' "$perf_summary_json")"
-perf_branches="$(jq -r '.counters.branches' "$perf_summary_json")"
-perf_branch_misses="$(jq -r '.counters.branch_misses' "$perf_summary_json")"
-
-massif_raw="$staging_dir/massif.out"
-massif_stdout="$staging_dir/massif.stdout.log"
-massif_stderr="$staging_dir/massif.stderr.log"
-tyler_massif_command=("$binary_path" "$input_root")
-tyler_massif_command+=( "${profile_tyler_args[@]}" )
-tyler_massif_command+=( --output "$massif_output_dir" )
-massif_command=(valgrind --tool=massif --time-unit="$MASSIF_TIME_UNIT" --massif-out-file="$massif_raw" -- "${tyler_massif_command[@]}")
-
-printf 'Running Massif...\n'
-printf 'Tyler command: ' >&2
-print_command "${tyler_massif_command[@]}" >&2
-massif_start_ns="$(date +%s%N)"
-set +e
-"${massif_command[@]}" > "$massif_stdout" 2> "$massif_stderr"
-massif_status="$?"
-set -e
-massif_end_ns="$(date +%s%N)"
-massif_elapsed_seconds="$(awk -v start="$massif_start_ns" -v end="$massif_end_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
-if [[ "$massif_status" -ne 0 ]]; then
-    die "Massif run failed with exit status $massif_status; see $massif_stderr"
+    perf_cycles="$(jq -r '.counters.cycles' "$perf_summary_json")"
+    perf_instructions="$(jq -r '.counters.instructions' "$perf_summary_json")"
+    perf_cache_refs="$(jq -r '.counters.cache_references' "$perf_summary_json")"
+    perf_cache_misses="$(jq -r '.counters.cache_misses' "$perf_summary_json")"
+    perf_page_faults="$(jq -r '.counters.page_faults' "$perf_summary_json")"
+    perf_context_switches="$(jq -r '.counters.context_switches' "$perf_summary_json")"
+    perf_cpu_migrations="$(jq -r '.counters.cpu_migrations' "$perf_summary_json")"
+    perf_branches="$(jq -r '.counters.branches' "$perf_summary_json")"
+    perf_branch_misses="$(jq -r '.counters.branch_misses' "$perf_summary_json")"
+else
+    printf 'Skipping perf stat (runner=%s)\n' "$runner_selector"
 fi
 
-read -r peak_heap_bytes peak_snapshot peak_time snapshot_count max_heap_growth_bytes max_heap_growth_from_snapshot max_heap_growth_to_snapshot max_heap_growth_time < <(
-    awk '
-        BEGIN {
-            snapshot = -1;
-            time = 0;
-            peak_heap = -1;
-            peak_snapshot = -1;
-            peak_time = 0;
-            snapshot_count = 0;
-            max_heap_growth = -1;
-            max_from = -1;
-            max_to = -1;
-            max_growth_time = 0;
-            prev_heap = -1;
-            prev_snapshot = -1;
-        }
-        /^snapshot=/ {
-            snapshot = substr($0, 10) + 0;
-            snapshot_count += 1;
-            next;
-        }
-        /^time=/ {
-            time = substr($0, 6) + 0;
-            next;
-        }
-        /^mem_heap_B=/ {
-            heap = substr($0, 12) + 0;
-            if (heap > peak_heap) {
-                peak_heap = heap;
-                peak_snapshot = snapshot;
-                peak_time = time;
-            }
-            if (prev_heap >= 0) {
-                growth = heap - prev_heap;
-                if (growth > max_heap_growth) {
-                    max_heap_growth = growth;
-                    max_from = prev_snapshot;
-                    max_to = snapshot;
-                    max_growth_time = time;
-                }
-            }
-            prev_heap = heap;
-            prev_snapshot = snapshot;
-            next;
-        }
-        END {
-            if (peak_heap < 0) {
-                peak_heap = 0;
-                peak_snapshot = 0;
+massif_elapsed_seconds=""
+peak_heap_bytes=""
+peak_snapshot=""
+peak_time=""
+snapshot_count=""
+max_heap_growth_bytes=""
+max_heap_growth_from_snapshot=""
+max_heap_growth_to_snapshot=""
+max_heap_growth_time=""
+massif_raw=""
+massif_stdout=""
+massif_stderr=""
+massif_summary_json=""
+tyler_massif_command=()
+massif_command=()
+
+if [[ "$run_massif" == "true" ]]; then
+    massif_raw="$staging_dir/massif.out"
+    massif_stdout="$staging_dir/massif.stdout.log"
+    massif_stderr="$staging_dir/massif.stderr.log"
+    tyler_massif_command=("$binary_path" "$input_root")
+    tyler_massif_command+=( "${profile_tyler_args[@]}" )
+    tyler_massif_command+=( --output "$massif_output_dir" )
+    massif_command=(valgrind --tool=massif --time-unit="$MASSIF_TIME_UNIT" --massif-out-file="$massif_raw" -- "${tyler_massif_command[@]}")
+
+    printf 'Running Massif...\n'
+    printf 'Tyler command: ' >&2
+    print_command "${tyler_massif_command[@]}" >&2
+    massif_start_ns="$(date +%s%N)"
+    set +e
+    "${massif_command[@]}" > "$massif_stdout" 2> "$massif_stderr"
+    massif_status="$?"
+    set -e
+    massif_end_ns="$(date +%s%N)"
+    massif_elapsed_seconds="$(awk -v start="$massif_start_ns" -v end="$massif_end_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
+    if [[ "$massif_status" -ne 0 ]]; then
+        die "Massif run failed with exit status $massif_status; see $massif_stderr"
+    fi
+
+    read -r peak_heap_bytes peak_snapshot peak_time snapshot_count max_heap_growth_bytes max_heap_growth_from_snapshot max_heap_growth_to_snapshot max_heap_growth_time < <(
+        awk '
+            BEGIN {
+                snapshot = -1;
+                time = 0;
+                peak_heap = -1;
+                peak_snapshot = -1;
                 peak_time = 0;
-            }
-            if (max_heap_growth < 0) {
-                max_heap_growth = 0;
-                max_from = 0;
-                max_to = 0;
+                snapshot_count = 0;
+                max_heap_growth = -1;
+                max_from = -1;
+                max_to = -1;
                 max_growth_time = 0;
+                prev_heap = -1;
+                prev_snapshot = -1;
             }
-            printf "%s %s %s %s %s %s %s %s\n", peak_heap, peak_snapshot, peak_time, snapshot_count, max_heap_growth, max_from, max_to, max_growth_time;
+            /^snapshot=/ {
+                snapshot = substr($0, 10) + 0;
+                snapshot_count += 1;
+                next;
+            }
+            /^time=/ {
+                time = substr($0, 6) + 0;
+                next;
+            }
+            /^mem_heap_B=/ {
+                heap = substr($0, 12) + 0;
+                if (heap > peak_heap) {
+                    peak_heap = heap;
+                    peak_snapshot = snapshot;
+                    peak_time = time;
+                }
+                if (prev_heap >= 0) {
+                    growth = heap - prev_heap;
+                    if (growth > max_heap_growth) {
+                        max_heap_growth = growth;
+                        max_from = prev_snapshot;
+                        max_to = snapshot;
+                        max_growth_time = time;
+                    }
+                }
+                prev_heap = heap;
+                prev_snapshot = snapshot;
+                next;
+            }
+            END {
+                if (peak_heap < 0) {
+                    peak_heap = 0;
+                    peak_snapshot = 0;
+                    peak_time = 0;
+                }
+                if (max_heap_growth < 0) {
+                    max_heap_growth = 0;
+                    max_from = 0;
+                    max_to = 0;
+                    max_growth_time = 0;
+                }
+                printf "%s %s %s %s %s %s %s %s\n", peak_heap, peak_snapshot, peak_time, snapshot_count, max_heap_growth, max_from, max_to, max_growth_time;
+            }
+        ' "$massif_raw"
+    )
+
+    massif_summary_json="$staging_dir/massif-summary.json"
+    massif_summary_filter='
+        {
+            time_unit: $time_unit,
+            peak_heap_bytes: $peak_heap_bytes,
+            peak_heap_mib: ($peak_heap_bytes / 1048576),
+            peak_snapshot: $peak_snapshot,
+            peak_time: $peak_time,
+            snapshot_count: $snapshot_count,
+            max_heap_growth_bytes: $max_heap_growth_bytes,
+            max_heap_growth_from_snapshot: $max_heap_growth_from_snapshot,
+            max_heap_growth_to_snapshot: $max_heap_growth_to_snapshot,
+            max_heap_growth_time: $max_heap_growth_time
         }
-    ' "$massif_raw"
-)
+    '
+    jq -n \
+        --arg time_unit "$MASSIF_TIME_UNIT" \
+        --argjson peak_heap_bytes "$peak_heap_bytes" \
+        --argjson peak_snapshot "$peak_snapshot" \
+        --argjson peak_time "$peak_time" \
+        --argjson snapshot_count "$snapshot_count" \
+        --argjson max_heap_growth_bytes "$max_heap_growth_bytes" \
+        --argjson max_heap_growth_from_snapshot "$max_heap_growth_from_snapshot" \
+        --argjson max_heap_growth_to_snapshot "$max_heap_growth_to_snapshot" \
+        --argjson max_heap_growth_time "$max_heap_growth_time" \
+        "$massif_summary_filter" > "$massif_summary_json"
+else
+    printf 'Skipping Massif (runner=%s)\n' "$runner_selector"
+fi
 
-massif_summary_json="$staging_dir/massif-summary.json"
-jq -n \
-    --arg time_unit "$MASSIF_TIME_UNIT" \
-    --argjson peak_heap_bytes "$peak_heap_bytes" \
-    --argjson peak_snapshot "$peak_snapshot" \
-    --argjson peak_time "$peak_time" \
-    --argjson snapshot_count "$snapshot_count" \
-    --argjson max_heap_growth_bytes "$max_heap_growth_bytes" \
-    --argjson max_heap_growth_from_snapshot "$max_heap_growth_from_snapshot" \
-    --argjson max_heap_growth_to_snapshot "$max_heap_growth_to_snapshot" \
-    --argjson max_heap_growth_time "$max_heap_growth_time" \
-    '{
-        time_unit: $time_unit,
-        peak_heap_bytes: $peak_heap_bytes,
-        peak_heap_mib: ($peak_heap_bytes / 1048576),
-        peak_snapshot: $peak_snapshot,
-        peak_time: $peak_time,
-        snapshot_count: $snapshot_count,
-        max_heap_growth_bytes: $max_heap_growth_bytes,
-        max_heap_growth_from_snapshot: $max_heap_growth_from_snapshot,
-        max_heap_growth_to_snapshot: $max_heap_growth_to_snapshot,
-        max_heap_growth_time: $max_heap_growth_time
-    }' > "$massif_summary_json"
-
-peak_heap_mib="$(format_mib "$peak_heap_bytes")"
-max_heap_growth_mib="$(format_mib "$max_heap_growth_bytes")"
-perf_cache_miss_rate_display="$(format_ratio "$perf_cache_misses" "$perf_cache_refs")"
-perf_ipc_display="$(format_ratio "$perf_instructions" "$perf_cycles")"
+peak_heap_mib="n/a"
+max_heap_growth_mib="n/a"
+perf_cache_miss_rate_display="n/a"
+perf_ipc_display="n/a"
+if [[ "$run_massif" == "true" ]]; then
+    peak_heap_mib="$(format_mib "$peak_heap_bytes")"
+    max_heap_growth_mib="$(format_mib "$max_heap_growth_bytes")"
+fi
+if [[ "$run_perf" == "true" ]]; then
+    perf_cache_miss_rate_display="$(format_ratio "$perf_cache_misses" "$perf_cache_refs")"
+    perf_ipc_display="$(format_ratio "$perf_instructions" "$perf_cycles")"
+fi
 
 manifest_json="$staging_dir/manifest.json"
 jq_profile_tyler_args="$(json_array_from_args "${profile_tyler_args[@]}")"
@@ -538,6 +660,7 @@ jq -n \
     --arg output_root "$output_root" \
     --arg staging_dir "$staging_dir" \
     --arg run_dir "$final_run_dir" \
+    --arg runner_selector "$runner_selector" \
     --arg binary_path "$binary_path" \
     --arg geodepot_bin "${geodepot_bin:-}" \
     --arg git_sha "$git_sha" \
@@ -557,6 +680,10 @@ jq -n \
     --arg perf_raw_json "$perf_raw_json" \
     --arg massif_raw "$massif_raw" \
     --arg manifest_path "$repo_root/Cargo.toml" \
+    --argjson run_perf "$(json_bool "$run_perf")" \
+    --argjson run_massif "$(json_bool "$run_massif")" \
+    --argjson jq_perf_command "$jq_perf_command" \
+    --argjson jq_massif_command "$jq_massif_command" \
     --argjson tyler_perf_command "$jq_tyler_perf_command" \
     --argjson tyler_massif_command "$jq_tyler_massif_command" \
     '
@@ -564,6 +691,11 @@ jq -n \
         run_id: $run_id,
         run_label: (if $run_label == "" then null else $run_label end),
         created_at: $created_at,
+        runner: {
+            selector: $runner_selector,
+            perf: $run_perf,
+            massif: $run_massif
+        },
         profile: {
             spec: (if $profile_spec == "" then null else $profile_spec end),
             resolved_input_root: (if $profile_input_root == "" then null else $profile_input_root end),
@@ -603,31 +735,39 @@ jq -n \
             rustflags: $rustflags
         },
         perf: {
-            command: $jq_perf_command,
-            tyler_command: $tyler_perf_command,
-            wall_clock_seconds: ($perf_elapsed_seconds | tonumber)
+            enabled: $run_perf,
+            command: (if $run_perf then $jq_perf_command else null end),
+            tyler_command: (if $run_perf then $tyler_perf_command else null end),
+            wall_clock_seconds: (if $run_perf then ($perf_elapsed_seconds | tonumber) else null end)
         },
         massif: {
-            command: $jq_massif_command,
-            tyler_command: $tyler_massif_command,
-            wall_clock_seconds: ($massif_elapsed_seconds | tonumber)
+            enabled: $run_massif,
+            command: (if $run_massif then $jq_massif_command else null end),
+            tyler_command: (if $run_massif then $tyler_massif_command else null end),
+            wall_clock_seconds: (if $run_massif then ($massif_elapsed_seconds | tonumber) else null end)
         }
     }
     ' > "$manifest_json"
 
-cat > "$staging_dir/summary.md" <<EOF
+{
+    cat <<EOF
 # Tyler profiling run
 
 - Run ID: $run_id
 - Git SHA: $git_sha
 - Branch: $git_branch
 - Created: $created_at
+- Runner: $runner_selector
 - Geodepot profile: ${profile_spec:-manual}
 - Geodepot input: ${profile_input_root:-n/a}
 - Profile config: ${profile_file:-n/a}
 - Input: $input_root
 - Output directory: $final_run_dir
 - Binary: $binary_path
+EOF
+
+    if [[ "$run_perf" == "true" ]]; then
+        cat <<EOF
 - Perf wall clock: ${perf_elapsed_seconds}s
 - Perf IPC: ${perf_ipc_display}
 - Perf cache references: $perf_cache_refs
@@ -638,17 +778,43 @@ cat > "$staging_dir/summary.md" <<EOF
 - Perf CPU migrations: $perf_cpu_migrations
 - Perf branches: $perf_branches
 - Perf branch misses: $perf_branch_misses
+EOF
+    else
+        cat <<EOF
+- Perf: skipped by --runner=$runner_selector
+EOF
+    fi
+
+    if [[ "$run_massif" == "true" ]]; then
+        cat <<EOF
 - Massif wall clock: ${massif_elapsed_seconds}s
 - Massif peak heap: ${peak_heap_mib} MiB (${peak_heap_bytes} bytes)
 - Massif peak snapshot: $peak_snapshot
 - Massif snapshots: $snapshot_count
 - Massif max heap growth: ${max_heap_growth_mib} MiB (${max_heap_growth_bytes} bytes)
 - Massif max heap growth snapshots: $max_heap_growth_from_snapshot -> $max_heap_growth_to_snapshot
+EOF
+    else
+        cat <<EOF
+- Massif: skipped by --runner=$runner_selector
+EOF
+    fi
+
+    cat <<EOF
 
 Committed artifacts are the JSON summaries and this markdown note. Raw perf and Massif dumps are staged only while the profiler runs.
 EOF
+} > "$staging_dir/summary.md"
 
-rm -rf "$tyler_output_base" "$perf_raw_json" "$perf_stderr" "$massif_raw" "$massif_stdout" "$massif_stderr"
+remove_paths() {
+    local path
+    for path in "$@"; do
+        [[ -n "$path" ]] || continue
+        rm -rf "$path"
+    done
+}
+
+remove_paths "$tyler_output_base" "$perf_raw_json" "$perf_stderr" "$massif_raw" "$massif_stdout" "$massif_stderr"
 
 mv "$staging_dir" "$final_run_dir"
 finalized="true"

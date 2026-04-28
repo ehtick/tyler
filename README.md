@@ -350,16 +350,24 @@ at the case root, for example `bvz-dh-coast-5/profile-tyler.json` for the
 `bvz-dh-coast-5/bvz_dh` case spec, with the matching command-line flags.
 When `--profile` is used, `--input` and `--label` are rejected because the case
 spec already determines both.
+Use `--runner perf`, `--runner massif`, or the default `--runner all` to choose
+which profiler(s) run. This is useful when Massif is too slow for a routine
+iteration.
 
-The profiler then captures `perf stat` and Valgrind Massif summaries into a
-new directory under `docs/performance/runs/`.
+The profiler then captures the selected `perf stat` and/or Valgrind Massif
+summaries into a new directory under `docs/performance/runs/`.
 Tyler's own output is stored only in a temporary staging area during the run
 and is removed before the final profiling directory is published.
+If the script exits with an error, the staging directory is retained as a
+`<run-id>.failed/` directory under `docs/performance/runs/` so you can inspect
+partial results without rerunning long profiles.
 
 Example invocations:
 
 ```bash
 just profile -- --profile bvz-dh-coast-5/bvz_dh
+just profile -- --profile bvz-dh-coast-5/bvz_dh --runner perf
+just profile -- --profile bvz-dh-coast-5/bvz_dh --runner massif
 just profile -- --profile bvz-dh-coast-5/bvz_dh --output-root docs/performance/runs
 just profile -- --input /data/cases/demo --label manual-smoke
 ```
