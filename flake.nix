@@ -57,7 +57,12 @@
             version = "0.4.1-alpha1";
 
             src = self;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = {
+                "cityjson-0.8.0" = "sha256-isq+Ud97hShMwum6vhHMaJE1/KTDOFWLu7vMsJee83E=";
+              };
+            };
 
             inherit nativeBuildInputs buildInputs;
 
