@@ -10,6 +10,9 @@
 - Support for regular CityJSON documents, CityJSONSeq documents, and the legacy CityJSONFeature-files as input, via the `cityjson-index` crate.
 - A `just ci-check` recipe and a GitHub Actions workflow that runs it.
 - ADRs and supporting documentation for the new `cityjson-index`/CityJSONSeq input model and grid traversal changes.
+- A repo-local profiling workflow driven by `just profile`, `scripts/profile-tyler.sh`, and Geodepot-backed profile-by-name resolution.
+- Per-run profiling artifacts under `docs/performance/runs/`, including structured summaries for `perf stat` and Valgrind Massif.
+- Runner selection for profiling sessions so `perf` and Massif can be run independently or together, with failed runs preserved for later inspection.
 
 ### Changed
 
@@ -26,6 +29,8 @@
   parallelism.
 - Tile conversion now uses thread-local `CityIndex` handles for cjindex reads
   and defers normal per-feature cleanup until after tile model merging.
+- The CityJSON-to-GLB pre-write path now skips redundant cleanup and filtering work where the GLB output would not change, and records extra timing information around the remaining hot spots.
+- The glTF writer and CLI logging were adjusted to make profiling runs easier to inspect.
 - 3D Tiles internal `geometricError` is now computed from tile width using
   `--geometric-error-factor`; full-detail leaf tiles use `0.0`.
 - Tyler now takes a single dataset root input instead of separate `--metadata` and `--features` arguments.
