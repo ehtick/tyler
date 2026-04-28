@@ -10,6 +10,7 @@
 
 # misc
 /tmp
+.env
 
 # Test data
 /tests/output*
@@ -20,4 +21,3 @@
 *.tsv
 *.bincode
 *.log
-
