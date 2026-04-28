@@ -374,10 +374,8 @@ just profile -- --input /data/cases/demo --label manual-smoke
 
 Profiling Dependencies:
 
-- [cargo](https://doc.rust-lang.org/cargo/)
-- [geodepot](https://github.com/3DGI/geodepot)
+- [geodepot](https://github.com/3DBAG/geodepot)
 - [jq](https://jqlang.github.io/jq/)
-- [git](https://git-scm.com/)
 - [massif](https://valgrind.org/docs/manual/ms-manual.html)
 - [perf](https://perfwiki.github.io/main/)
 
