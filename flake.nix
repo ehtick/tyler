@@ -106,6 +106,8 @@
               pkgs.pkg-config
               pkgs.rustc
               pkgs.rustfmt
+	      pkgs.perf
+	      pkgs.valgrind
             ];
 
             buildInputs = [
