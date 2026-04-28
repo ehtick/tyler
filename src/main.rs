@@ -69,6 +69,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
@@ -565,6 +566,7 @@ fn read_tile_feature_models(
     world: &parser::World,
     feature_ids: &[usize],
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
+    let started = Instant::now();
     let mut models = Vec::with_capacity(feature_ids.len());
     let mut cjindex_refs = Vec::with_capacity(feature_ids.len());
     for fid in feature_ids {
@@ -590,6 +592,11 @@ fn read_tile_feature_models(
         }
     }
     models = parser::World::read_cjindex_features_thread_local(&world.input_source, &cjindex_refs)?;
+    debug!(
+        "Read {} tile features from cjindex in {:?}",
+        models.len(),
+        started.elapsed()
+    );
 
     Ok(models)
 }
@@ -610,8 +617,14 @@ fn build_tile_model_from_feature_ids(
     if models.is_empty() {
         return Err("tile model preparation removed all CityObjects".into());
     }
+    let merge_started = Instant::now();
     let merged = cityjson_lib::ops::merge(models)?;
-    cleanup_and_update_extents(merged)
+    debug!(
+        "Merged tile model for {} selected features in {:?}",
+        feature_ids.len(),
+        merge_started.elapsed()
+    );
+    Ok(merged)
 }
 
 #[cfg(test)]
@@ -654,12 +667,19 @@ fn prepare_tile_feature_models(
     include_parent_attributes: bool,
     cleanup_features: bool,
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
-    read_tile_feature_models(world, feature_ids)?
+    let models = read_tile_feature_models(world, feature_ids)?;
+    models
         .into_iter()
-        .filter_map(|model| {
+        .zip(feature_ids.iter().copied())
+        .filter_map(|(model, feature_id)| {
             match prepare_feature_model(
                 model,
-                world,
+                feature_id,
+                world.cityobject_types.as_ref(),
+                world
+                    .cityobject_types
+                    .as_ref()
+                    .is_some_and(|_| world.features[feature_id].needs_type_filter),
                 feature_type_lods,
                 include_parent_attributes,
                 cleanup_features,
@@ -674,24 +694,61 @@ fn prepare_tile_feature_models(
 
 fn prepare_feature_model(
     model: cityjson_lib::CityModel,
-    world: &parser::World,
+    feature_id: usize,
+    cityobject_types: Option<&Vec<parser::CityObjectType>>,
+    needs_type_filter: bool,
     feature_type_lods: &BTreeMap<String, String>,
     include_parent_attributes: bool,
     cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut model = model;
+    let prepare_started = Instant::now();
+    let lods_pruned = !feature_type_lods.is_empty();
     prune_lod_geometries(&mut model, feature_type_lods)?;
     if include_parent_attributes {
         inherit_parent_attributes(&mut model)?;
     }
-    let model = filter_cityobject_types(model, world.cityobject_types.as_ref())?;
-    let model = remove_empty_geometry_cityobjects(&model)?;
+    let type_filter_started = Instant::now();
+    let model = if needs_type_filter {
+        filter_cityobject_types(model, cityobject_types)?
+    } else {
+        model
+    };
+    if needs_type_filter {
+        debug!(
+            "Filtered feature {} cityobject types in {:?}",
+            feature_id,
+            type_filter_started.elapsed()
+        );
+    }
+    let remove_empty_geometry =
+        cleanup_feature || lods_pruned || include_parent_attributes || needs_type_filter;
+    let model = if remove_empty_geometry {
+        remove_empty_geometry_cityobjects(&model)?
+    } else {
+        model
+    };
     if model.cityobjects().is_empty() {
         return Ok(None);
     }
     if cleanup_feature {
-        cleanup_and_update_extents(model).map(Some)
+        let cleanup_started = Instant::now();
+        let cleaned = cleanup_and_update_extents(model)?;
+        debug!(
+            "Cleaned debug tile feature {} in {:?} (total prepare {:?})",
+            feature_id,
+            cleanup_started.elapsed(),
+            prepare_started.elapsed()
+        );
+        Ok(Some(cleaned))
     } else {
+        debug!(
+            "Prepared tile feature {} in {:?} (type_filter={}, remove_empty={}, cleanup=false)",
+            feature_id,
+            prepare_started.elapsed(),
+            needs_type_filter,
+            remove_empty_geometry
+        );
         Ok(Some(model))
     }
 }
@@ -1298,6 +1355,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(job);
                 }
             }
+            debug!(
+                "Prepared merged CityJSON model for tile {} with {} CityObjects and {} vertices",
+                job.content_tile_id,
+                model.cityobjects().len(),
+                model.vertices().len()
+            );
             let mut tile_export_options = export_options.clone();
             if cli.cesium3dtiles_content_clip_to_tile_bounds {
                 if cli.cesium3dtiles_implicit {
@@ -1319,12 +1382,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tile_export_options.clip_bbox = Some(qtree_node.bbox(&world.grid));
                 }
             }
+            let convert_started = Instant::now();
             if let Err(error) =
                 cityjson_convert::convert_to_glb(&model, &output_file, &tile_export_options)
             {
                 warn!("Tile {} conversion failed: {}", job.content_tile_id, error);
                 return Some(job);
             }
+            debug!(
+                "Converted tile {} to GLB in {:?}",
+                job.content_tile_id,
+                convert_started.elapsed()
+            );
             if !output_file.exists() {
                 warn!(
                     "Tile {} conversion failed: {} was not created",
@@ -1550,6 +1619,25 @@ mod tests {
         serde_json::from_slice(&feature_output).expect("feature json should parse")
     }
 
+    fn geometry_relevant_signature(model: &cityjson_lib::CityModel) -> (usize, usize, Vec<String>) {
+        let mut cityobject_types = model
+            .cityobjects()
+            .iter()
+            .filter(|(_, cityobject)| {
+                cityobject
+                    .geometry()
+                    .is_some_and(|geometries| !geometries.is_empty())
+            })
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        cityobject_types.sort();
+        (
+            model.vertices().len(),
+            model.geometry_count(),
+            cityobject_types,
+        )
+    }
+
     fn feature_attribute_string(feature: &Value, object_id: &str, key: &str) -> Option<String> {
         feature
             .get("CityObjects")?
@@ -1579,6 +1667,82 @@ mod tests {
         let model =
             remove_empty_geometry_cityobjects(&model).expect("empty object removal should succeed");
         cleanup_and_update_extents(model).expect("cleanup should succeed")
+    }
+
+    #[test]
+    fn prepare_feature_model_skips_empty_geometry_removal_for_gltf_noop_path() {
+        let model = parent_attribute_remapping_fixture(serde_json::json!({}));
+        let original_signature = geometry_relevant_signature(&model);
+
+        let prepared = prepare_feature_model(
+            model.clone(),
+            0,
+            None,
+            false,
+            &BTreeMap::new(),
+            false,
+            false,
+        )
+        .expect("feature preparation should succeed")
+        .expect("feature should remain");
+
+        assert_eq!(geometry_relevant_signature(&prepared), original_signature);
+        assert_eq!(
+            prepared.cityobjects().len(),
+            model.cityobjects().len(),
+            "no-op glTF preparation should not rebuild the feature by removing empty parents"
+        );
+    }
+
+    #[test]
+    fn prepare_feature_model_type_filter_skip_matches_filtered_geometry() {
+        let model = cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"building-part",
+                "CityObjects":{
+                    "building-part":{
+                        "type":"BuildingPart",
+                        "geometry":[{
+                            "type":"MultiSurface",
+                            "lod":"1",
+                            "boundaries":[[[0,1,2]]]
+                        }]
+                    }
+                },
+                "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+            }"#,
+        )
+        .expect("building-part fixture should parse");
+        let selected_types = vec![parser::CityObjectType::BuildingPart];
+
+        let skipped = prepare_feature_model(
+            model.clone(),
+            0,
+            Some(&selected_types),
+            false,
+            &BTreeMap::new(),
+            false,
+            false,
+        )
+        .expect("skipped filter preparation should succeed")
+        .expect("skipped filter feature should remain");
+        let filtered = prepare_feature_model(
+            model,
+            0,
+            Some(&selected_types),
+            true,
+            &BTreeMap::new(),
+            false,
+            false,
+        )
+        .expect("filtered preparation should succeed")
+        .expect("filtered feature should remain");
+
+        assert_eq!(
+            geometry_relevant_signature(&skipped),
+            geometry_relevant_signature(&filtered)
+        );
     }
 
     #[test]

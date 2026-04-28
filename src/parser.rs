@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cityjson::v2_0::vertex::VertexIndex as GeometryVertexIndex;
 use cityjson_index::{CityIndex, StorageLayout};
@@ -288,8 +289,15 @@ impl World {
 
         self.features.clear();
         let city_index = self.input_source.open_index()?;
+        let mut page_count = 0usize;
+        let mut scanned_features = 0usize;
+        let mut indexed_features = 0usize;
+        let started = Instant::now();
         for page_result in city_index.scan_feature_pages(CJINDEX_PAGE_SIZE)? {
+            let page_started = Instant::now();
             let page = page_result?;
+            page_count += 1;
+            scanned_features += page.len();
             let feature_in_cells = page
                 .into_par_iter()
                 .map(|feature| -> Option<FeatureInGridCells> {
@@ -300,10 +308,23 @@ impl World {
                 })
                 .collect::<Vec<_>>();
             for feature_in_cells in feature_in_cells.into_iter().flatten() {
+                indexed_features += 1;
                 self.integrate_feature_in_cells(feature_in_cells);
             }
+            debug!(
+                "Indexed cjindex feature page {page_count} in {:?} ({} scanned, {} retained so far)",
+                page_started.elapsed(),
+                scanned_features,
+                indexed_features
+            );
         }
-        debug!("indexed {} features", self.features.len());
+        info!(
+            "Indexed {} of {} scanned features into grid cells across {} pages in {:?}",
+            self.features.len(),
+            scanned_features,
+            page_count,
+            started.elapsed()
+        );
         Ok(())
     }
 
@@ -312,23 +333,52 @@ impl World {
         feature_reference: FeatureReference,
         model: &cityjson_lib::CityModel,
     ) -> Option<FeatureInGridCells> {
+        let stats_started = Instant::now();
         let stats = selected_geometry_stats(model, self.cityobject_types.as_ref());
+        debug!(
+            "selected_geometry_stats collected {} vertices for {:?} in {:?}",
+            stats.selected_vertices.len(),
+            feature_reference,
+            stats_started.elapsed()
+        );
         let bbox = stats.bbox?;
         let centroid = stats.centroid?;
+
+        let uses_unique_assignment =
+            selected_types_use_unique_assignment(&stats.selected_object_types);
+        let feature = Feature {
+            centroid,
+            reference: feature_reference,
+            bbox,
+            needs_type_filter: !stats.ignored_object_types.is_empty(),
+        };
+
+        if uses_unique_assignment {
+            let count_started = Instant::now();
+            let (cellid, nr_vertices) =
+                count_unique_assignment_cell(model, &stats.selected_vertices, &self.grid, &bbox)?;
+            debug!(
+                "Selected unique assignment grid cell {:?} with {} vertices in {:?}",
+                cellid,
+                nr_vertices,
+                count_started.elapsed()
+            );
+            return Some(Self::feature_to_unique_cell(feature, cellid, nr_vertices));
+        }
+
+        let count_started = Instant::now();
         let cell_vtx_cnt =
             count_vertices_in_grid(model, &stats.selected_vertices, &self.grid, &bbox);
+        debug!(
+            "Counted {} grid cells for {:?} in {:?}",
+            cell_vtx_cnt.len(),
+            feature.reference,
+            count_started.elapsed()
+        );
         if cell_vtx_cnt.is_empty() {
             return None;
         }
-        Self::feature_to_cells(
-            Feature {
-                centroid,
-                reference: feature_reference,
-                bbox,
-            },
-            cell_vtx_cnt,
-            &stats.selected_object_types,
-        )
+        Self::feature_to_cells(feature, cell_vtx_cnt)
     }
 
     fn integrate_feature_in_cells(&mut self, feature_in_cells: FeatureInGridCells) {
@@ -343,32 +393,10 @@ impl World {
         }
     }
 
-    fn feature_to_cells(
-        feature: Feature,
-        cell_vtx_cnt: CellCounts,
-        selected_object_types: &[CityObjectType],
-    ) -> Option<FeatureInGridCells> {
-        let unique_assignment = selected_object_types.iter().any(|cotype| {
-            // In this case we have a 1-1 feature-to-cell assignment, we only retain the vertex
-            // count in the cell that gets the feature.
-            // The cell that receives the feature is the one with the highest vertex count
-            // of the feature.
-            // However, with this method it is not possible to combine cityobject types that
-            // require different cell-assignment methods into the same tileset.
-            // E.g. terrain features need to be duplicated across cells, buildings need to
-            // unique. The tileset for them must be generated separately.
-            matches!(
-                cotype,
-                CityObjectType::Building | CityObjectType::BuildingPart
-            )
-        });
+    fn feature_to_cells(feature: Feature, cell_vtx_cnt: CellCounts) -> Option<FeatureInGridCells> {
         let mut cells: Vec<(CellId, Cell)> = Vec::with_capacity(cell_vtx_cnt.len());
 
-        if unique_assignment {
-            let (cellid, nr_vertices) = cell_vtx_cnt
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1))
-                .expect("non-empty cell counts should have a maximum");
+        for (cellid, nr_vertices) in cell_vtx_cnt.iter() {
             cells.push((
                 *cellid,
                 Cell {
@@ -376,18 +404,25 @@ impl World {
                     nr_vertices: *nr_vertices,
                 },
             ));
-        } else {
-            for (cellid, nr_vertices) in cell_vtx_cnt.iter() {
-                cells.push((
-                    *cellid,
-                    Cell {
-                        feature_ids: Vec::new(),
-                        nr_vertices: *nr_vertices,
-                    },
-                ));
-            }
         }
         Some(FeatureInGridCells { feature, cells })
+    }
+
+    fn feature_to_unique_cell(
+        feature: Feature,
+        cellid: CellId,
+        nr_vertices: usize,
+    ) -> FeatureInGridCells {
+        FeatureInGridCells {
+            feature,
+            cells: vec![(
+                cellid,
+                Cell {
+                    feature_ids: Vec::new(),
+                    nr_vertices,
+                },
+            )],
+        }
     }
 
     pub fn export_grid(
@@ -460,12 +495,18 @@ pub struct Feature {
     pub(crate) centroid: [f64; 2],
     pub reference: FeatureReference,
     pub bbox: Bbox,
+    #[serde(default = "default_feature_needs_type_filter")]
+    pub needs_type_filter: bool,
 }
 
 impl Feature {
     pub fn centroid(&self) -> [f64; 2] {
         self.centroid
     }
+}
+
+fn default_feature_needs_type_filter() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -532,8 +573,9 @@ fn selected_geometry_stats(
     model: &cityjson::v2_0::OwnedCityModel,
     filter: Option<&Vec<CityObjectType>>,
 ) -> SelectedGeometryStats {
-    let mut selected_vertices = Vec::new();
-    let mut geometry_scratch = Vec::new();
+    let vertex_scratch_capacity = model.vertices().len().min(4096);
+    let mut selected_vertices = Vec::with_capacity(vertex_scratch_capacity);
+    let mut geometry_scratch = Vec::with_capacity(vertex_scratch_capacity);
     let mut bbox: Option<Bbox> = None;
     let mut x_sum = 0.0;
     let mut y_sum = 0.0;
@@ -569,6 +611,18 @@ fn selected_geometry_stats(
         selected_object_types,
         ignored_object_types,
     }
+}
+
+fn selected_types_use_unique_assignment(selected_object_types: &[CityObjectType]) -> bool {
+    selected_object_types.iter().any(|cotype| {
+        // Building-like features are assigned once, to the cell with the
+        // highest feature score. Terrain and similar surface features keep
+        // their bbox-spanning duplicate assignment.
+        matches!(
+            cotype,
+            CityObjectType::Building | CityObjectType::BuildingPart
+        )
+    })
 }
 
 fn collect_selected_vertex_indices(
@@ -631,6 +685,74 @@ fn count_vertices_in_grid(
     }
 
     CellCounts::merge_vertex_counts_with_bbox(vertex_counts.into_iter().collect(), grid, bbox)
+}
+
+fn count_unique_assignment_cell(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &crate::spatial_structs::SquareGrid,
+    bbox: &Bbox,
+) -> Option<(CellId, usize)> {
+    if selected_vertices.is_empty() {
+        return None;
+    }
+
+    let vertex_counts = if selected_vertices.len() >= LARGE_FEATURE_VERTEX_COUNT_THRESHOLD {
+        count_vertex_cells_parallel(model, selected_vertices, grid)
+    } else {
+        count_vertex_cells(model, selected_vertices, grid)
+    };
+
+    if vertex_counts.is_empty() {
+        return None;
+    }
+
+    max_merged_vertex_count_with_bbox(vertex_counts, grid, bbox)
+}
+
+fn max_merged_vertex_count_with_bbox(
+    vertex_counts: BTreeMap<CellId, usize>,
+    grid: &crate::spatial_structs::SquareGrid,
+    bbox: &Bbox,
+) -> Option<(CellId, usize)> {
+    let (columns, rows) = grid.intersect_bbox_ranges(bbox);
+    let min_column = *columns.start();
+    let max_column = *columns.end();
+    let min_row = *rows.start();
+    let max_row = *rows.end();
+    let mut vertex_counts = vertex_counts.into_iter().peekable();
+    let mut best: Option<(CellId, usize)> = None;
+
+    for row in min_row..=max_row {
+        for column in min_column..=max_column {
+            let bbox_cellid = CellId { row, column };
+            while let Some((cellid, count)) =
+                vertex_counts.next_if(|(cellid, _)| *cellid < bbox_cellid)
+            {
+                update_best_cell(&mut best, cellid, count);
+            }
+
+            if let Some((_, count)) = vertex_counts.next_if(|(cellid, _)| *cellid == bbox_cellid) {
+                update_best_cell(&mut best, bbox_cellid, count + 1);
+            } else {
+                update_best_cell(&mut best, bbox_cellid, 2);
+            }
+        }
+    }
+
+    for (cellid, count) in vertex_counts {
+        update_best_cell(&mut best, cellid, count);
+    }
+
+    best
+}
+
+fn update_best_cell(best: &mut Option<(CellId, usize)>, cellid: CellId, count: usize) {
+    if best.as_ref().is_none_or(|(best_cellid, best_count)| {
+        count > *best_count || (count == *best_count && cellid > *best_cellid)
+    }) {
+        *best = Some((cellid, count));
+    }
 }
 
 fn count_vertex_cells(
@@ -888,6 +1010,196 @@ mod tests {
         let bbox = stats.bbox.unwrap();
         assert!(bbox[0] > 0.0);
         assert!(bbox[1] > 0.0);
+    }
+
+    fn parse_feature(feature: serde_json::Value) -> cityjson::v2_0::OwnedCityModel {
+        cityjson_lib::json::from_feature_slice(&serde_json::to_vec(&feature).unwrap()).unwrap()
+    }
+
+    fn unique_assignment_winner_from_full_counts(counts: &CellCounts) -> Option<(CellId, usize)> {
+        counts
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1))
+            .map(|(cellid, count)| (*cellid, *count))
+    }
+
+    fn assert_unique_assignment_matches_full_counts(
+        model: &cityjson::v2_0::OwnedCityModel,
+        object_type: CityObjectType,
+        grid: &crate::spatial_structs::SquareGrid,
+    ) -> (CellId, usize) {
+        let stats = selected_geometry_stats(model, Some(&vec![object_type]));
+        let bbox = stats.bbox.unwrap();
+        let full_counts = count_vertices_in_grid(model, &stats.selected_vertices, grid, &bbox);
+        let expected = unique_assignment_winner_from_full_counts(&full_counts);
+        let optimized = count_unique_assignment_cell(model, &stats.selected_vertices, grid, &bbox);
+
+        assert_eq!(optimized, expected);
+        optimized.expect("unique assignment should produce a winning cell")
+    }
+
+    #[test]
+    fn unique_assignment_single_cell_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 100.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn unique_assignment_multi_cell_counts_match_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3, 4]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [2, 0, 0],
+                [150, 0, 0],
+                [250, 0, 0]
+            ]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn unique_assignment_equal_count_tie_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [150, 0, 0],
+                [151, 0, 0]
+            ]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 200.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[150.0, 0.0]));
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn unique_assignment_large_bbox_keeps_bbox_only_cells_lower_scored() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [250, 250, 0], [0, 250, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[250.0, 250.0]));
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn unique_assignment_building_part_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-part-1",
+            "CityObjects": {
+                "building-part-1": {
+                    "type": "BuildingPart",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 100.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) = assert_unique_assignment_matches_full_counts(
+            &model,
+            CityObjectType::BuildingPart,
+            &grid,
+        );
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
     }
 
     #[test]

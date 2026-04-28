@@ -11,6 +11,10 @@ check:
 build *args:
     cargo build --workspace --all-targets --all-features {{args}}
 
+# Run a perf + Massif profiling session for tyler.
+profile *args:
+    @bash scripts/profile-tyler.sh {{args}}
+
 # Run clippy with strict lint settings across the workspace.
 lint:
     RUSTFLAGS='-Dclippy::all -Dclippy::pedantic' RUSTC_WORKSPACE_WRAPPER="$(command -v clippy-driver)" cargo check --workspace --all-targets --all-features

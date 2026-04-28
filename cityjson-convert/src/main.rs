@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use cityjson_convert::{convert_to_glb, ExportOptions, GeometryPlacement};
 use cityjson_lib::json;
 use clap::Parser;
-
-use cityjson_convert::{convert_to_glb, ExportOptions, GeometryPlacement};
+use log::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -48,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         meshopt_compression: !cli.no_meshopt_compression,
     };
 
-    convert_to_glb(&model, cli.output, &options)?;
+    info!("Converting to GLB");
+    convert_to_glb(&model, &cli.output, &options)?;
+    info!("GLB written to {}", cli.output.display());
     Ok(())
 }

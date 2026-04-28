@@ -336,6 +336,49 @@ It is possible to only generate the tileset, without running the glTF conversion
 This can be helpful for debugging the tileset itself.
 You can enable this with the `--3dtiles-tileset-only` option.
 
+## Contributing
+
+### Profiling
+
+Use `just profile -- --help` to see the repo-local profiling wrapper options.
+Run a profile with `just profile -- --profile <case-spec>`.
+The wrapper builds `tyler` in release mode with debuginfo and frame pointers,
+then resolves the input and the case-specific `tyler` arguments from Geodepot.
+It reads the Geodepot executable path from the repo-local `.env` file via
+`GEODEPOT_BIN`, and expects each case to carry a `profile-tyler.json` data item
+at the case root, for example `bvz-dh-coast-5/profile-tyler.json` for the
+`bvz-dh-coast-5/bvz_dh` case spec, with the matching command-line flags.
+When `--profile` is used, `--input` and `--label` are rejected because the case
+spec already determines both.
+Use `--runner perf`, `--runner massif`, or the default `--runner all` to choose
+which profiler(s) run. This is useful when Massif is too slow for a routine
+iteration.
+
+The profiler then captures the selected `perf stat` and/or Valgrind Massif
+summaries into a new directory under `docs/performance/runs/`.
+Tyler's own output is stored only in a temporary staging area during the run
+and is removed before the final profiling directory is published.
+If the script exits with an error, the staging directory is retained as a
+`<run-id>.failed/` directory under `docs/performance/runs/` so you can inspect
+partial results without rerunning long profiles.
+
+Example invocations:
+
+```bash
+just profile -- --profile bvz-dh-coast-5/bvz_dh
+just profile -- --profile bvz-dh-coast-5/bvz_dh --runner perf
+just profile -- --profile bvz-dh-coast-5/bvz_dh --runner massif
+just profile -- --profile bvz-dh-coast-5/bvz_dh --output-root docs/performance/runs
+just profile -- --input /data/cases/demo --label manual-smoke
+```
+
+Profiling Dependencies:
+
+- [geodepot](https://github.com/3DBAG/geodepot)
+- [jq](https://jqlang.github.io/jq/)
+- [massif](https://valgrind.org/docs/manual/ms-manual.html)
+- [perf](https://perfwiki.github.io/main/)
+
 ## Roadmap
 
 - [x] Parallel extent computation
