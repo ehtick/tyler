@@ -981,6 +981,24 @@ impl MeshCollector {
             return Ok(());
         }
 
+        if surface.len() == 1 && exterior.len() == 3 {
+            let primitive = self.primitives.entry(feature_type.to_string()).or_default();
+            let source_triangle = [
+                source_positions[0],
+                source_positions[1],
+                source_positions[2],
+            ];
+            let local_triangle = [local_positions[0], local_positions[1], local_positions[2]];
+            primitive.add_triangle(
+                feature_id,
+                source_triangle,
+                local_triangle,
+                Self::compute_face_normal,
+                self.smooth_normals,
+            );
+            return Ok(());
+        }
+
         let drop_axis = Self::find_projection_axis(&local_positions[..exterior.len()]);
         for pos in &local_positions {
             match drop_axis {
