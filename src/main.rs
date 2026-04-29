@@ -2190,6 +2190,9 @@ mod tests {
         );
     }
 
+    /// Test plan 1: omitting `--object-type` keeps all CityObjects, selecting
+    /// one or many types filters to that union, and duplicate selections remain
+    /// valid while producing the same filtered result.
     #[test]
     fn object_type_filter_supports_all_single_multi_and_duplicate_selection() {
         let model = mixed_object_type_fixture();
@@ -2300,6 +2303,8 @@ mod tests {
         assert_eq!(feature_root_id(&filtered), None);
     }
 
+    /// Supporting regression for test plan 1: after type filtering and cleanup,
+    /// the intermediary tile keeps a correct geographical extent.
     #[test]
     fn prepare_model_filters_cityobject_types_and_updates_extent() {
         let model = cityjson_lib::json::merge_feature_stream_slice(include_bytes!(
@@ -2328,6 +2333,8 @@ mod tests {
         );
     }
 
+    /// Test plan 3.1: `--object-attributes` subsets the intermediary tile
+    /// attributes to only the requested `name:type` mappings.
     #[test]
     fn object_attributes_subset_the_incoming_cityobject_attributes() {
         let mut model = parent_attribute_remapping_fixture(serde_json::json!({
@@ -2353,6 +2360,8 @@ mod tests {
         assert!(!attributes.contains_key("shared"));
     }
 
+    /// Test plan 3.2: `--object-attributes` coerces values to the requested
+    /// glTF metadata scalar types for string, bool, int, and float mappings.
     #[test]
     fn object_attributes_coerce_values_to_the_requested_types() {
         let mut model = cityjson_lib::json::from_feature_slice(
@@ -2402,6 +2411,8 @@ mod tests {
             .is_some_and(|value| (value - 3.0).abs() < f64::EPSILON));
     }
 
+    /// Test plan 4.1: without any explicit `--lod-*` selectors, each
+    /// multi-geometry CityObject keeps its highest available LoD by default.
     #[test]
     fn prepare_model_defaults_to_the_highest_lod_per_cityobject() {
         let mut model = cityjson_lib::json::merge_feature_stream_slice(include_bytes!(
@@ -2433,6 +2444,9 @@ mod tests {
         );
     }
 
+    /// Test plan 4.2: a type-specific `--lod-*` selection applies only to that
+    /// CityObject type, while unconfigured types still fall back to their
+    /// highest available LoD.
     #[test]
     fn prepare_model_uses_type_specific_lod_selectors() {
         let mut model = multi_type_lod_fixture();
@@ -2449,6 +2463,8 @@ mod tests {
         );
     }
 
+    /// Supporting regression for the `--include-parent-attributes` refactor:
+    /// when enabled, parent attributes are copied onto selected children.
     #[test]
     fn prepare_model_copies_parent_attributes_when_enabled() {
         let model = parent_attribute_remapping_fixture(serde_json::json!({}));
@@ -2482,6 +2498,8 @@ mod tests {
         assert_eq!(feature_root_id(&enabled), Some("building-part".to_string()));
     }
 
+    /// Supporting regression for the `--include-parent-attributes` refactor:
+    /// child attributes win when parent and child define the same key.
     #[test]
     fn prepare_model_keeps_child_attributes_on_conflict() {
         let model = parent_attribute_remapping_fixture(serde_json::json!({
@@ -2515,6 +2533,9 @@ mod tests {
         );
     }
 
+    /// Test plan 5.1: `--include-parent-attributes --object-type BuildingPart`
+    /// still inherits the parent `Building` attributes even when the parent
+    /// object itself is filtered out of the intermediary tile.
     #[test]
     fn prepare_model_inherits_parent_attributes_when_parent_type_is_not_selected() {
         let model = parent_attribute_remapping_fixture(serde_json::json!({}));

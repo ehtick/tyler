@@ -337,7 +337,8 @@ mod tests {
         Cli::command().debug_assert()
     }
 
-    /// Can we pass multiple CityObject types?
+    /// CLI arguments review item 7: the CityJSON v2.0 `--object-type` parser
+    /// still accepts repeated occurrences and stores all requested types.
     #[test]
     fn verify_object_types() {
         let dataset_dir = legacy_dataset_dir();
@@ -355,6 +356,8 @@ mod tests {
         assert!(otypes.contains(&crate::parser::CityObjectType::PlantCover));
     }
 
+    /// CLI arguments review item 10: `--include-parent-attributes` remains the
+    /// supported flag after removing `--bag3d-attributes-per-part`.
     #[test]
     fn verify_include_parent_attributes_flag() {
         let dataset_dir = legacy_dataset_dir();
@@ -364,6 +367,8 @@ mod tests {
         assert!(cli.include_parent_attributes);
     }
 
+    /// CLI arguments review item 12: `--3dtiles-geometric-error-factor`
+    /// replaces the old flag name and still parses the configured float value.
     #[test]
     fn verify_geometric_error_factor() {
         let dataset_dir = legacy_dataset_dir();
@@ -376,6 +381,8 @@ mod tests {
         assert!((cli.cesium3dtiles_geometric_error_factor - 0.05).abs() < f64::EPSILON);
     }
 
+    /// CLI arguments review item 8: `--object-attributes` now accepts a
+    /// comma-separated `name:type` mapping list and splits it into entries.
     #[test]
     fn verify_object_attributes_csv_mapping() {
         let dataset_dir = legacy_dataset_dir();
