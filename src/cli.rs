@@ -28,29 +28,28 @@ pub struct Cli {
     // /// Output format.
     // #[arg(long, value_enum)]
     // pub format: crate::Formats,
-    /// The CityObject type to use for the 3D Tiles
-    /// (https://www.cityjson.org/specs/1.1.3/#the-different-city-objects).
+    /// The CityObject type to include
+    /// (https://www.cityjson.org/specs/2.0.1/#city-objects).
     /// You can specify it multiple times.
     #[arg(long, value_enum)]
     pub object_type: Option<Vec<crate::parser::CityObjectType>>,
     /// The CityObject attribute name and value type to include as feature attribute when the
-    /// output is 3D Tiles. Format: <attribute_name>:<attribute_type> eg: 'name1:string'.
+    /// output is 3D Tiles. Format: <attribute_name>:<attribute_type>,<attribute_name>:<attribute_type>
+    /// eg: 'name1:string,name2:bool'.
     /// Possible value types are, 'bool', 'int', 'float', 'string'.
-    /// You can specify it multiple times.
-    #[arg(long)]
-    pub object_attribute: Option<Vec<String>>,
-    /// The CityObject attribute
+    #[arg(long, value_delimiter = ',')]
+    pub object_attributes: Option<Vec<String>>,
     /// The metadata class to assign to the property table when the output is
     /// 3D Tiles (https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_structural_metadata#class).
-    #[arg(long = "3dtiles-metadata-class")]
-    pub cesium3dtiles_metadata_class: Option<String>,
+    #[arg(long = "3dtiles-metadata-class", default_value = "citymodel")]
+    pub cesium3dtiles_metadata_class: String,
     /// Create implicit tiling when the output format is 3D Tiles (https://docs.ogc.org/cs/22-025r4/22-025r4.html#toc31).
     /// By default, explicit tiling is created for the 3D Tiles output.
     #[arg(long = "3dtiles-implicit")]
     pub cesium3dtiles_implicit: bool,
     /// Generate and write the Tileset only, without exporting the glTF tiles, when the output format is 3D Tiles (https://docs.ogc.org/cs/22-025r4/22-025r4.html#toc31).
-    #[arg(long = "3dtiles-tileset-only")]
-    pub cesium3dtiles_tileset_only: bool,
+    #[arg(long = "debug-3dtiles-tileset-only")]
+    pub debug_cesium3dtiles_tileset_only: bool,
     /// Use the tile boundingVolume as the content boundingVolume, instead of calculating the content boundingVolume from the data.
     #[arg(long = "3dtiles-content-bv-from-tile")]
     pub cesium3dtiles_content_bv_from_tile: bool,
@@ -63,17 +62,18 @@ pub struct Cli {
     /// Set the geometric error factor (see 3D Tiles specification) for internal tiles.
     /// Internal tile geometricError is computed as tile width multiplied by this factor.
     /// Higher values make detailed content visible earlier when zooming in.
-    #[arg(long = "geometric-error-factor", short = 'e', default_value = "0.024")]
-    pub geometric_error_factor: Option<f64>,
+    #[arg(long = "3dtiles-geometric-error-factor", default_value = "0.024")]
+    pub cesium3dtiles_geometric_error_factor: f64,
     /// Set the 2D cell size for the grid that is used for constructing the quadtree.
     /// In input units (eg. meters). Note that the cell size will be adjusted so that it is
     /// possible to construct a tightly fit square, containing 4^n cells. The final cell size will
     /// larger than this value.
     #[arg(long, default_value = "250")]
     pub grid_cellsize: Option<u32>,
-    /// Generate the quadtree directly from a grid.tsv file, skipping the extent computation and feature indexing. A grid.tsv file is created with the --grid-export option. Used for debugging.
-    #[arg(long)]
-    pub grid_file: Option<String>,
+    /// Load grid.tsv debug output and use it for quadtree construction. If a sibling
+    /// features.tsv exists, it is also loaded.
+    #[arg(long = "debug-load-grid", value_parser = existing_canonical_path)]
+    pub debug_load_grid: Option<PathBuf>,
     /// Limit the minimum z coordinate for the bounding box that is computed from the
     /// features. Useful if the features contain errors with extremely small z
     /// coordinates. In input units (eg. meters).
@@ -84,14 +84,13 @@ pub struct Cli {
     /// coordinates. In input units (eg. meters).
     #[arg(long)]
     pub grid_maxz: Option<i32>,
-    /// Export the grid into .tsv files in the working
-    /// directory. Used for debugging.
-    #[arg(long)]
-    pub grid_export: bool,
+    /// Export the grid into .tsv files in the debug output directory.
+    #[arg(long = "debug-dump-grid")]
+    pub debug_dump_grid: bool,
     /// Export the grid, and also the feature centroids into .tsv files in the working
     /// directory. Used for debugging.
-    #[arg(long)]
-    pub grid_export_features: bool,
+    #[arg(long = "debug-dump-grid-features")]
+    pub debug_dump_grid_features: bool,
     /// Load instances from this directory.
     /// In debug mode, tyler writes the generated world, quadtree etc. instances to .bincode files, which later can be used for debugging.
     /// When this argument is specified, tyler will load the instances from the .bincode files that are available in the directory.
@@ -100,22 +99,17 @@ pub struct Cli {
     /// The maximum number of vertices in a leaf of the quadtree.
     #[arg(long, default_value = "42000")]
     pub qtree_capacity: Option<usize>,
-    /// Write the per-tile CityJSONFeature streams used for GLB conversion to output/inputs/.
-    #[arg(long)]
-    pub debug_tile_inputs: bool,
+    /// Dump debug data for the current run, including `.bincode` snapshots and
+    /// per-tile intermediary CityJSONFeature streams.
+    #[arg(long = "debug-dump-data")]
+    pub debug_dump_data: bool,
     /// Copy inherited parent attributes onto geometry-bearing CityObjects before GLB conversion.
     /// This is useful for 3DBAG/roofer-style parent-child models where attributes live on the parent.
     #[arg(long)]
     pub include_parent_attributes: bool,
-    /// Maximum error that is allowed in mesh simplification to reduce the number of vertices. Value should be a float that represents that maximum allowed error in meters. Ignored for building object types.
-    #[arg(long, default_value = "1.0")]
-    pub simplification_max_error: Option<f64>,
     /// Compute smooth vertex normals.
     #[arg(long)]
     pub smooth_normals: bool,
-    /// Wait for the tile conversion process to finish, or terminate it if it is not finished after the provided number of seconds.
-    #[arg(long)]
-    pub timeout: Option<u64>,
     /// LoD to use in output for Building features
     #[arg(long)]
     pub lod_building: Option<String>,
@@ -248,12 +242,6 @@ pub struct Cli {
     // /// installed.
     // #[arg(long, value_parser = existing_path)]
     // pub exe_python: Option<PathBuf>,
-    /// Assume 3DBAG Building-BuildingPart structure
-    #[arg(long)]
-    pub bag3d_buildings_mode: bool,
-    /// Push attributes for every BuildingPart (in bag3d_buildings_mode only)
-    #[arg(long)]
-    pub bag3d_attributes_per_part: bool,
 }
 
 fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
@@ -349,7 +337,8 @@ mod tests {
         Cli::command().debug_assert()
     }
 
-    /// Can we pass multiple CityObject types?
+    /// CLI arguments review item 7: the CityJSON v2.0 `--object-type` parser
+    /// still accepts repeated occurrences and stores all requested types.
     #[test]
     fn verify_object_types() {
         let dataset_dir = legacy_dataset_dir();
@@ -367,6 +356,8 @@ mod tests {
         assert!(otypes.contains(&crate::parser::CityObjectType::PlantCover));
     }
 
+    /// CLI arguments review item 10: `--include-parent-attributes` remains the
+    /// supported flag after removing `--bag3d-attributes-per-part`.
     #[test]
     fn verify_include_parent_attributes_flag() {
         let dataset_dir = legacy_dataset_dir();
@@ -376,13 +367,39 @@ mod tests {
         assert!(cli.include_parent_attributes);
     }
 
+    /// CLI arguments review item 12: `--3dtiles-geometric-error-factor`
+    /// replaces the old flag name and still parses the configured float value.
     #[test]
     fn verify_geometric_error_factor() {
         let dataset_dir = legacy_dataset_dir();
         let mut args = required_args(&dataset_dir);
-        args.extend(["--geometric-error-factor".to_string(), "0.05".to_string()]);
+        args.extend([
+            "--3dtiles-geometric-error-factor".to_string(),
+            "0.05".to_string(),
+        ]);
         let cli = Cli::try_parse_from(args).unwrap();
-        assert_eq!(cli.geometric_error_factor, Some(0.05));
+        assert!((cli.cesium3dtiles_geometric_error_factor - 0.05).abs() < f64::EPSILON);
+    }
+
+    /// CLI arguments review item 8: `--object-attributes` now accepts a
+    /// comma-separated `name:type` mapping list and splits it into entries.
+    #[test]
+    fn verify_object_attributes_csv_mapping() {
+        let dataset_dir = legacy_dataset_dir();
+        let mut args = required_args(&dataset_dir);
+        args.extend([
+            "--object-attributes".to_string(),
+            "name:string,levels:int,occupied:bool".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            cli.object_attributes,
+            Some(vec![
+                "name:string".to_string(),
+                "levels:int".to_string(),
+                "occupied:bool".to_string()
+            ])
+        );
     }
 
     #[test]

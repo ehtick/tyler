@@ -14,6 +14,8 @@
 - Per-run profiling artifacts under `docs/performance/runs/`, including structured summaries for `perf stat` and Valgrind Massif.
 - Retention of raw profiling artifacts and Tyler output under the gitignored `docs/performance/runs/raw/` tree for later analysis.
 - Runner selection for profiling sessions so `perf` and Massif can be run independently or together, with failed runs preserved for later inspection.
+- A focused CLI/debug regression test suite for intermediary tile preparation, debug data replay, grid export/load, tileset-only runs, and object-attribute mapping.
+- A `just coverage` recipe backed by `cargo tarpaulin`, plus a recorded baseline under `docs/testing/coverage-baseline.md`.
 
 ### Changed
 
@@ -38,6 +40,27 @@
 - Tyler no longer depends on an external `geoflow-bundle` installation for GLB export.
 - For implicit 3DTiles, tiling is now performed in geographic coordinates
 - 3DTiles now use bounding volume region instead of box
+- The CLI debug/export surface was consolidated:
+  `--debug-tile-inputs` became `--debug-dump-data`,
+  `--grid-export` became `--debug-dump-grid`,
+  `--grid-export-features` became `--debug-dump-grid-features`,
+  `--grid-file` became `--debug-load-grid`,
+  `--3dtiles-tileset-only` became `--debug-3dtiles-tileset-only`,
+  and `--geometric-error-factor` became `--3dtiles-geometric-error-factor`
+  with the `-e` shorthand removed.
+- `--debug-dump-data` now dumps the bincode snapshots and intermediary per-tile
+  CityJSONFeature streams under `debug/`, and `RUST_LOG=debug` follows the same
+  dump path while also enabling debug logging.
+- `--debug-load-data` now continues to support partial replay from any available
+  subset of dumped debug data, and `--debug-load-grid` now actively reloads
+  exported `grid.tsv`/`features.tsv` data for quadtree recomputation.
+- `--object-attribute` was replaced by comma-separated `--object-attributes`
+  mappings, which now subset and coerce CityObject attributes before GLB export.
+- `--3dtiles-metadata-class` now defaults to `citymodel`.
+- When no `--lod-*` override is supplied, Tyler now keeps the highest available
+  LoD per CityObject by default.
+- The deprecated `--timeout`, `--simplification-max-error`,
+  `--bag3d-buildings-mode`, and `--bag3d-attributes-per-part` parameters were removed.
 - README, Dockerfiles, Nix flake files, and bundled resources were updated for the new pipeline.
 
 ## tyler 0.3.14 (2025-10-22)

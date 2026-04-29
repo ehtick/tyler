@@ -31,6 +31,10 @@ fmt-check:
 test:
     cargo test --workspace --all-targets --all-features
 
+# Collect test coverage with cargo-tarpaulin.
+coverage:
+    cargo tarpaulin --workspace --all-targets --all-features --out Stdout --out Xml
+
 # Clean the workspace by removing all build artifacts and test artifacts.
 clean: clean-output
     cargo clean
