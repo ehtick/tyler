@@ -1,6 +1,6 @@
 # Changelog
 
-## tyler 0.4.0 (unreleased)
+## tyler 0.4.1 (unreleased)
 
 ### Added
 

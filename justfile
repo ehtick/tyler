@@ -41,17 +41,8 @@ clean-output:
     rm -rf cityjson-convert/tests/output
 
 # Run the full local validation sequence.
-ci:
-    just fmt
-    just lint
-    just check
-    just build
-    just test
+ci: fmt lint check build test
 
 # Run the full validation sequence without modifying files.
-ci-check:
-    just fmt-check
-    just lint
-    just check
-    just build
-    just test
+ci-check: fmt-check lint check build test
+

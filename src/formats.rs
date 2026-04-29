@@ -240,7 +240,10 @@ pub mod cesium3dtiles {
                 // But it can happen with faulty data, eg. 3D Basisvoorziening,
                 // that maxz is less than minz.
                 if tile_bbox[5] < tile_bbox[2] {
-                    debug!("Internal tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_bbox, tile_bbox[5], tile_bbox[2]);
+                    debug!(
+                        "Internal tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                    );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
@@ -282,7 +285,10 @@ pub mod cesium3dtiles {
                 let mut tile_bbox = quadtree.bbox(&world.grid);
                 if tile_bbox[5] < tile_bbox[2] {
                     // See explanation above
-                    debug!("Leaf tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_bbox, tile_bbox[5], tile_bbox[2]);
+                    debug!(
+                        "Leaf tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                    );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
@@ -317,7 +323,10 @@ pub mod cesium3dtiles {
 
                     if tile_content_bbox_rw[5] < tile_content_bbox_rw[2] {
                         // See explanation above
-                        debug!("Leaf tile content {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]);
+                        debug!(
+                            "Leaf tile content {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                            &tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]
+                        );
                         tile_content_bbox_rw[5] =
                             tile_content_bbox_rw[2] + tile_content_bbox_rw[2] * 0.01;
                     }
@@ -552,10 +561,14 @@ pub mod cesium3dtiles {
                             let vc = content_availability_for_level.get(*i_z_curve);
                             let tile_id_subtree = &tileids_contiguous_vec[*i_z_curve];
                             if va.is_none() {
-                                error!("tileAvailability bitstream is inconsistent, there is no value at index {i_z_curve}");
+                                error!(
+                                    "tileAvailability bitstream is inconsistent, there is no value at index {i_z_curve}"
+                                );
                             };
                             if vc.is_none() {
-                                error!("contentAvailability bitstream is inconsistent, there is no value at index {i_z_curve}");
+                                error!(
+                                    "contentAvailability bitstream is inconsistent, there is no value at index {i_z_curve}"
+                                );
                             }
                             let tile_available = va.unwrap();
                             let content_available = vc.unwrap();
