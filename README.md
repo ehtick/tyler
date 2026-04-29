@@ -6,10 +6,9 @@
 
 *tyler* creates tiles from 3D city objects.
 
-As input, *tyler* takes a dataset root. That root can either be a legacy
-directory containing `metadata.city.json` plus
-[CityJSON Features](https://www.cityjson.org/specs/1.1.3/#text-sequences-and-streaming-with-cityjsonfeature),
-or a `cjindex` dataset root.
+As input, *tyler* takes a single directory, containing regular `CityJSON`, `CityJSONSeq` or the legacy `CityJSONFeature`-files.
+Tyler no longer walks raw `metadata.city.json` plus [CityJSON Features](https://www.cityjson.org/specs/1.1.3/#text-sequences-and-streaming-with-cityjsonfeature) trees on its own, but it
+uses [cityjson-index](https://github.com/3DGI/cityjson/tree/main/crates/cityjson-index) for input resolution.
 
 As output, *tyler* can create:
 
@@ -34,8 +33,8 @@ Pull the docker image with `docker pull 3dgi/tyler:<version>`, e.g. `docker pull
 ### Using the pre-compiled binaries on windows
 
 1. Download the latest Tyler binary package for windows from the [Tyler release page](https://github.com/3DGI/tyler/releases)
-1. Unzip the Tyler binary package to a folder, for example `C:\software\tyler`
-1. You can now run Tyler using the `run_tyler_example.bat` file inside this directory by double clicking on it. You can also copy and open this file in a text editor to change the parameters (eg.
+2. Unzip the Tyler binary package to a folder, for example `C:\software\tyler`
+3. You can now run Tyler using the `run_tyler_example.bat` file inside this directory by double clicking on it. You can also copy and open this file in a text editor to change the parameters (eg.
    input and output data directories) used for running.
 
 For testing purposes you download [this sample data](https://data.3dgi.xyz/3dtiles-test-data/download/3D-basisvoorziening-2021-30dz1_01.zip). Create a `data` folder in same the folder as the `.bat`
@@ -111,10 +110,12 @@ Set [PROJ_DATA](https://proj.org/usage/environmentvars.html#envvar-PROJ_DATA) if
 
 ### Performance
 
-For large input, like multiple millions of features you need have an SSD.
-Running on a HDD is not feasible for large areas.
+For large inputs with millions of features, use an SSD.
+Running on an HDD is not feasible for large areas.
 
-There are three resource intensive steps, 1) computing the extent of the input, 2) indexing the input with the grid, 3) converting the tiles.
+The expensive steps are still extent computation, grid indexing, and tile conversion.
+The current `cjindex` path batches feature scans and reuses index handles, so
+it avoids a lot of duplicate reads on large datasets.
 
 The profiling workflow is driven by `just profile`. It writes committed
 summaries under `docs/performance/runs/<run-id>/` and retains the raw profiler
@@ -151,11 +152,9 @@ In the example below, the coordinates are in *RD New (EPSG: 7415)*.
 [2023-07-05T08:52:06Z DEBUG tyler::parser] Computed extent from features in real-world coordinates: [84995.28, 446316.814, -5.333, 85644.749, 446996.133, 52.882]
 ```
 
-For legacy feature-file datasets, the extent calculation is done in parallel
-for each input subdirectory, if there are any. The contents of each
-subdirectory are processed sequentially. Individual files directly under the
-dataset root are processed sequentially after the subdirectories. Therefore,
-for optimal performance, organize legacy feature files into subdirectories.
+For large `cjindex` datasets, Tyler processes the extent in chunks and reuses
+the dataset index while it works. The practical requirement is still the same:
+give Tyler a dataset root that `cjindex` can resolve.
 
 ### Exporting 3D Tiles
 
@@ -181,14 +180,7 @@ tyler \
 
 #### Input data
 
-`tyler` accepts a single `input` dataset root:
-
-- Legacy feature-file dataset:
-  the directory must contain `metadata.city.json` and one or more
-  `.city.jsonl` feature files under that root.
-- `cjindex` dataset:
-  the directory must resolve as a `cjindex` dataset root in `ndjson`,
-  `cityjson`, or `feature-files` layout.
+`tyler` accepts a single `input` dataset directory with regulart CityJSON files, CityJSONSeq files, or the legacy `feature-files` layout.
 
 For example:
 
@@ -220,6 +212,7 @@ For example:
 
 The 3D Tiles metadata specification uses the concept of classes to categorize features.
 With the `--3dtiles-metadata-class` argument it is possible to set the metadata class for the features in the 3D Tiles output.
+It defaults to `citymodel`.
 The metadata class works in conjunction with selecting the CityObject types. Such that one declares a metadata class for a set of CityObject types.
 
 For example:
@@ -259,6 +252,10 @@ geometry-bearing child before GLB conversion.
 For example:
 
 `tyler … --object-type Building --object-type BuildingPart --include-parent-attributes`
+
+#### Mesh normals
+
+Use `--smooth-normals` when you want smooth vertex normals in the GLB output.
 
 #### Colors
 
@@ -304,6 +301,7 @@ You can enable this with the `--3dtiles-content-add-bv` option.
 
 If you do want a content bounding volume, but you want it to follow the tile bounding volume exactly, you can force this with the option `--3dtiles-content-bv-from-tile`.
 Usually, this happens for content that is clipped to the tile boundaries, such as terrain.
+If you clip the geometry before writing the GLB with `--3dtiles-content-clip-to-tile-bounds`, this is the flag to pair with it.
 
 ## Debugging
 
@@ -315,6 +313,7 @@ RUST_LOG=debug tyler ...
 
 In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and `tiles_failed` instances as [bincode](https://crates.io/crates/bincode) under `debug/`.
 In case of a large area and lots of features (eg. an entire country and multiple millions of features), the `world.bincode` file can become a couple GB in size.
+When `--debug-dump-data` is enabled, Tyler also writes intermediary per-tile CityJSONFeature streams under `debug/inputs/`.
 
 The bincode files can be loaded by passing the directory with the bincode files to the  `--debug-load-data` parameter. When *tyler* load the instance data from the file, it will skip the instance
 creation and use the loaded data instead.
@@ -331,7 +330,8 @@ The order in which *tyler* creates the instances:
 In addition to the instance data, *tyler* can export the grid (part of the `world`), quadtree and tileset data to Tab-separated values (`.tsv`), which you can load into a GIS.
 You can enable the `.tsv` export with the `--debug-dump-grid` flag.
 With the `--debug-dump-grid-features` flag, also the feature centroids and their grid cell assignment will be exported.
-Only use this for small amount of features.
+Use `--debug-load-grid` to reload a previously exported `grid.tsv` and matching `features.tsv` before quadtree recomputation.
+Only use this for a small number of features.
 
 In debug mode, *tyler* will write the unpruned tileset too, together with the tileset that was pruned after the glTF conversion.
 
@@ -396,4 +396,5 @@ Profiling Dependencies:
 
 ## Funding
 
-Version 0.3 (3D Tiles) was funded by the [Dutch Kadaster](https://www.kadaster.nl/).
+- Version 0.3 (3D Tiles) was funded by the [Dutch Kadaster](https://www.kadaster.nl/).
+- Version 0.4.1 was funded by the [Dutch Kadaster](https://www.kadaster.nl/).
