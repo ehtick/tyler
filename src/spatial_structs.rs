@@ -1058,10 +1058,16 @@ pub struct SquareGridStats {
 
 impl Display for SquareGridStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Nr. cells with vertices: {nr_cells}; Nr. vertices: {nr_vertices}, min.: {min}, max.: {max}, median: {median}, mean: {mean}",
-               nr_vertices = self.nr_vertices, nr_cells = self.nr_cells_with_content,
-               min = self.nr_vertices_min, max = self.nr_vertices_max,
-               median = self.nr_vertices_median, mean = self.nr_vertices_mean)
+        write!(
+            f,
+            "Nr. cells with vertices: {nr_cells}; Nr. vertices: {nr_vertices}, min.: {min}, max.: {max}, median: {median}, mean: {mean}",
+            nr_vertices = self.nr_vertices,
+            nr_cells = self.nr_cells_with_content,
+            min = self.nr_vertices_min,
+            max = self.nr_vertices_max,
+            median = self.nr_vertices_median,
+            mean = self.nr_vertices_mean
+        )
     }
 }
 

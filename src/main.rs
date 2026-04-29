@@ -1320,7 +1320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if cli.cesium3dtiles_content_bv_from_tile && !cli.cesium3dtiles_content_add_bv {
-        warn!("cesium3dtiles_content_bv_from_tile is true, but cesium3dtiles_content_add_bv is false. The tile content bounding volumes are not going to be added, unless you set --3dtiles-content-add-bv");
+        warn!(
+            "cesium3dtiles_content_bv_from_tile is true, but cesium3dtiles_content_add_bv is false. The tile content bounding volumes are not going to be added, unless you set --3dtiles-content-add-bv"
+        );
     }
     let debug_data = match cli.debug_load_data {
         None => DebugData::default(),

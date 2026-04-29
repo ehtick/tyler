@@ -1,6 +1,6 @@
 [package]
 name = "tyler"
-version = "0.4.1-alpha1"
+version = "0.4.1-beta1"
 edition = "2021"
 authors = ["Balázs Dukai <balazs.dukai@3dgi.nl>", "Ravi Peters <ravi.peters@3dgi.nl>"]
 description = "Create tiles from 3D city objects encoded as CityJSONFeatures."
@@ -40,9 +40,3 @@ bincode = "1.3.3"
 [workspace]
 members = [".", "cityjson-convert"]
 resolver = "2"
-
-#[patch."https://github.com/3DGI/cityjson"]
-#cityjson = { path = "../cityjson/crates/cityjson" }
-#cityjson-index = { path = "../cityjson/crates/cityjson-index" }
-#cityjson-json = { path = "../cityjson/crates/cityjson-json" }
-#cityjson-lib = { path = "../cityjson/crates/cityjson-lib" }
