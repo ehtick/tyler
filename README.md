@@ -57,10 +57,7 @@ set PROJ_DATA=%~dp0\share\proj
 --object-type Road ^
 --object-type GenericCityObject ^
 --object-type Bridge ^
---object-attribute objectid:int ^
---object-attribute bronhouder:string ^
---object-attribute bgt_fysiekvoorkomen:string ^
---object-attribute bgt_type:string ^
+--object-attributes objectid:int,bronhouder:string,bgt_fysiekvoorkomen:string,bgt_type:string ^
 --3dtiles-metadata-class terrain ^
 --grid-minz=-15 ^
 --grid-maxz=400 >> log.txt 2>&1
@@ -176,8 +173,7 @@ tyler \
     --object-type Road \
     --object-type GenericCityObject \
     --object-type Bridge \
-    --object-attribute objectid:int \
-    --object-attribute bronhouder:string \
+    --object-attributes objectid:int,bronhouder:string \
     --3dtiles-metadata-class terrain \
     --grid-minz=-5 \
     --grid-maxz=300
@@ -206,8 +202,8 @@ The output is written to the directory set in `--output`.
 For 3D Tiles output, it will contain a `tileset.json` file and `t/` directory with the glTF files.
 In case of implicit tiling, also a `subtrees/` directory is written with the subtrees.
 
-For `cjindex` datasets, Tyler writes a derived metadata file under `metadata/`. Per-tile CityJSONFeature streams are kept in memory by default. To inspect them, pass `--debug-tile-inputs`; Tyler then
-writes `inputs/<tile>.city.jsonl` and keeps the `inputs/` directory.
+For `cjindex` datasets, Tyler writes a derived metadata file under `metadata/`. Per-tile CityJSONFeature streams are kept in memory by default. To inspect them, pass `--debug-dump-data`; Tyler then
+writes `debug/inputs/<tile>.city.jsonl`.
 
 #### CityObject type
 
@@ -233,11 +229,11 @@ For example:
 #### Level of Detail (LoD)
 
 CityJSON can store city objects with multiple levels of detail.
-For each CityObject type, its LoD needs to be specified as well.
+For each CityObject type, its LoD can be specified explicitly.
 This is the LoD defined in the input data.
 The LoD value for each CityObject type is set with the `--lod-<cityobject type>` arguments. The `<cityobject type>` is the CityJSON CityObject type, such as BuildingPart or LandUse.
 The arguments are lower-case, thus “BuildingPart” becomes “building-part” and “LandUse” becomes “land-use”.
-If the value of `--lod-<cityobject type>` is an empty string (this is the default), then Tyler will select the highest available LoD for the city object.
+If no `--lod-<cityobject type>` is provided, Tyler selects the highest available LoD for each CityObject.
 
 For example:
 
@@ -245,15 +241,15 @@ For example:
 
 #### Attributes
 
-Attributes on the glTF features are set with the `--object-attribute` argument.
+Attributes on the glTF features are set with the `--object-attributes` argument.
 The argument takes the attribute name and attribute value type as its value.
 The attribute name and type are separated by a colon “:” and concatenated into a single string, such as “name:type”.
 The possible value types are “string”, “int”, “float”, “bool”.
-The `--object-attribute` argument can be specified multiple times to include multiple attributes.
+Multiple mappings are passed as a comma-separated list.
 
 For example:
 
-`tyler … --object-attribute bouwjaar:int --object-attribute objectid:int --object-attribute bagpandid:string --object-attribute bgt_type:string`
+`tyler … --object-attributes bouwjaar:int,objectid:int,bagpandid:string,bgt_type:string`
 
 Some datasets, such as 3DBAG or roofer exports, store the attributes on a parent `Building`
 while the geometry lives on the child `BuildingPart`. In that case, enable
@@ -301,7 +297,7 @@ geometricError = tile_width * geometric_error_factor
 ```
 
 Leaf tiles use `geometricError: 0.0`. Tune the factor with
-`--geometric-error-factor`; higher values make detailed content refine earlier.
+`--3dtiles-geometric-error-factor`; higher values make detailed content refine earlier.
 
 For explicit tilesets, it is possible to add a tightly-fitted bounding volume to the [tile's content](https://docs.ogc.org/cs/22-025r4/22-025r4.html#core-content-bounding-volume).
 You can enable this with the `--3dtiles-content-add-bv` option.
@@ -317,7 +313,7 @@ Run *tyler* in debug mode, by setting the logging level to `debug` in the `RUST_
 RUST_LOG=debug tyler ...
 ```
 
-In debug mode, *tyler* will write the `world`, `quadtree` and `tiles_failed` instances to [bincode](https://crates.io/crates/bincode) to the working directory.
+In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and `tiles_failed` instances as [bincode](https://crates.io/crates/bincode) under `debug/`.
 In case of a large area and lots of features (eg. an entire country and multiple millions of features), the `world.bincode` file can become a couple GB in size.
 
 The bincode files can be loaded by passing the directory with the bincode files to the  `--debug-load-data` parameter. When *tyler* load the instance data from the file, it will skip the instance
@@ -333,15 +329,15 @@ The order in which *tyler* creates the instances:
 6. pruned tileset
 
 In addition to the instance data, *tyler* can export the grid (part of the `world`), quadtree and tileset data to Tab-separated values (`.tsv`), which you can load into a GIS.
-You can enable the `.tsv` export with the `--grid-export` flag.
-With the `--grid-export-features` flag, also the feature feature centorids and their grid cell assignment will be exported.
+You can enable the `.tsv` export with the `--debug-dump-grid` flag.
+With the `--debug-dump-grid-features` flag, also the feature centroids and their grid cell assignment will be exported.
 Only use this for small amount of features.
 
 In debug mode, *tyler* will write the unpruned tileset too, together with the tileset that was pruned after the glTF conversion.
 
 It is possible to only generate the tileset, without running the glTF conversion.
 This can be helpful for debugging the tileset itself.
-You can enable this with the `--3dtiles-tileset-only` option.
+You can enable this with the `--debug-3dtiles-tileset-only` option.
 
 ## Contributing
 

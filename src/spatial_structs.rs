@@ -16,7 +16,7 @@ use crate::parser::FeatureSet;
 use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
@@ -642,6 +642,129 @@ impl SquareGrid {
         }
     }
 
+    pub fn from_debug_tsv(
+        grid_path: &Path,
+        features_path: Option<&Path>,
+        epsg: u16,
+        fallback_grid: Option<&Self>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let grid_tsv = fs::read_to_string(grid_path)?;
+        let mut lines = grid_tsv.lines();
+        let _header = lines.next();
+        let root = lines.next().ok_or_else(|| {
+            format!(
+                "debug grid file {} is missing its root row",
+                grid_path.display()
+            )
+        })?;
+        let mut root_parts = root.splitn(3, '\t');
+        let root_id = root_parts.next().unwrap_or_default();
+        if root_id != "x-x" {
+            return Err(format!(
+                "debug grid file {} has invalid root row id {root_id:?}",
+                grid_path.display()
+            )
+            .into());
+        }
+        let _root_count = root_parts.next();
+        let root_wkt = root_parts.next().ok_or_else(|| {
+            format!(
+                "debug grid file {} is missing root WKT",
+                grid_path.display()
+            )
+        })?;
+        let [minx, miny, maxx, maxy] = parse_grid_polygon_wkt(root_wkt)?;
+
+        let mut cells = Vec::new();
+        let mut max_column = 0usize;
+        let mut max_row = 0usize;
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(3, '\t');
+            let cell_id = parse_cell_id(parts.next().unwrap_or_default())?;
+            let nr_vertices = parts
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "debug grid file {} is missing nr_items",
+                        grid_path.display()
+                    )
+                })?
+                .parse::<usize>()?;
+            max_column = max_column.max(cell_id.column);
+            max_row = max_row.max(cell_id.row);
+            cells.push((cell_id, nr_vertices));
+        }
+
+        let length = max_column.max(max_row) + 1;
+        let cellsize = ((maxx - minx) / length as f64).round() as u32;
+        let fallback_bbox = fallback_grid.map_or([0.0; 6], |grid| grid.bbox);
+        let bbox = [minx, miny, fallback_bbox[2], maxx, maxy, fallback_bbox[5]];
+
+        let mut data = vec![
+            vec![
+                Cell {
+                    feature_ids: Vec::new(),
+                    nr_vertices: 0,
+                };
+                length
+            ];
+            length
+        ];
+        for (cell_id, nr_vertices) in cells {
+            data[cell_id.column][cell_id.row].nr_vertices = nr_vertices;
+        }
+
+        if let Some(grid) = fallback_grid {
+            let limit = length.min(grid.length);
+            for (column_index, column) in data.iter_mut().enumerate().take(limit) {
+                for (row_index, cell) in column.iter_mut().enumerate().take(limit) {
+                    cell.feature_ids = grid.data[column_index][row_index].feature_ids.clone();
+                }
+            }
+        }
+
+        if let Some(features_path) = features_path.filter(|path| path.exists()) {
+            for column in &mut data {
+                for cell in column {
+                    cell.feature_ids.clear();
+                }
+            }
+
+            let features_tsv = fs::read_to_string(features_path)?;
+            for line in features_tsv.lines().skip(1) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let mut parts = line.splitn(3, '\t');
+                let feature_id = parts
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "debug features file {} is missing feature id",
+                            features_path.display()
+                        )
+                    })?
+                    .parse::<usize>()?;
+                let cell_id = parse_cell_id(parts.next().unwrap_or_default())?;
+                data[cell_id.column][cell_id.row]
+                    .feature_ids
+                    .push(feature_id);
+            }
+        }
+
+        Ok(Self {
+            origin: [minx, miny, bbox[2]],
+            bbox,
+            length,
+            cellsize,
+            data,
+            epsg,
+        })
+    }
+
     /// Returns the cell index (x, y) where the point is located.
     pub fn locate_point(&self, point: &[f64; 2]) -> CellId {
         let dx = point[0] - self.origin[0];
@@ -834,6 +957,46 @@ impl SquareGrid {
             nr_vertices_median: median,
         }
     }
+}
+
+fn parse_cell_id(value: &str) -> Result<CellId, Box<dyn std::error::Error>> {
+    let (column, row) = value
+        .split_once('-')
+        .ok_or_else(|| format!("invalid cell id {value:?}"))?;
+    Ok(CellId {
+        column: column.parse::<usize>()?,
+        row: row.parse::<usize>()?,
+    })
+}
+
+fn parse_grid_polygon_wkt(value: &str) -> Result<[f64; 4], Box<dyn std::error::Error>> {
+    let coordinates = value
+        .strip_prefix("POLYGON((")
+        .and_then(|value| value.strip_suffix("))"))
+        .ok_or_else(|| format!("invalid grid polygon WKT {value:?}"))?;
+    let mut points = coordinates.split(',');
+    let first = points
+        .next()
+        .ok_or_else(|| format!("grid polygon WKT is missing its first point: {value:?}"))?;
+    let third = points
+        .nth(1)
+        .ok_or_else(|| format!("grid polygon WKT is missing its third point: {value:?}"))?;
+    let [minx, miny] = parse_wkt_point(first)?;
+    let [maxx, maxy] = parse_wkt_point(third)?;
+    Ok([minx, miny, maxx, maxy])
+}
+
+fn parse_wkt_point(value: &str) -> Result<[f64; 2], Box<dyn std::error::Error>> {
+    let mut parts = value.split_whitespace();
+    let x = parts
+        .next()
+        .ok_or_else(|| format!("invalid WKT point {value:?}"))?
+        .parse::<f64>()?;
+    let y = parts
+        .next()
+        .ok_or_else(|| format!("invalid WKT point {value:?}"))?
+        .parse::<f64>()?;
+    Ok([x, y])
 }
 
 /// Returns a tuple of `(CellId, &Cell)` for each cell in column-major order.

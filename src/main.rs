@@ -126,6 +126,14 @@ struct GeographicBounds {
     north: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectAttributeType {
+    String,
+    Bool,
+    Int,
+    Float,
+}
+
 fn build_glb_export_options(
     cli: &crate::cli::Cli,
     geometry_placement: cityjson_convert::GeometryPlacement,
@@ -171,10 +179,7 @@ fn build_glb_export_options(
 
     cityjson_convert::ExportOptions {
         native_glb_color: "#FFC0CB".to_string(),
-        metadata_class_name: cli
-            .cesium3dtiles_metadata_class
-            .clone()
-            .unwrap_or_else(|| "cityobject".to_string()),
+        metadata_class_name: cli.cesium3dtiles_metadata_class.clone(),
         feature_type_colors,
         geometry_placement,
         clip_bbox,
@@ -225,6 +230,42 @@ fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
     }
 
     feature_type_lods
+}
+
+fn build_object_attribute_types(
+    cli: &crate::cli::Cli,
+) -> Result<BTreeMap<String, ObjectAttributeType>, Box<dyn std::error::Error>> {
+    let mut attribute_types = BTreeMap::new();
+    let Some(mappings) = cli.object_attributes.as_ref() else {
+        return Ok(attribute_types);
+    };
+
+    for mapping in mappings {
+        let (name, value_type) = mapping
+            .split_once(':')
+            .ok_or_else(|| format!("invalid object attribute mapping {mapping:?}"))?;
+        if name.is_empty() {
+            return Err(format!("object attribute name cannot be empty in {mapping:?}").into());
+        }
+        let value_type = match value_type {
+            "string" => ObjectAttributeType::String,
+            "bool" => ObjectAttributeType::Bool,
+            "int" => ObjectAttributeType::Int,
+            "float" => ObjectAttributeType::Float,
+            _ => {
+                return Err(
+                    format!("invalid object attribute type {value_type:?} in {mapping:?}").into(),
+                )
+            }
+        };
+        attribute_types.insert(name.to_string(), value_type);
+    }
+
+    Ok(attribute_types)
+}
+
+fn should_dump_debug_data(cli: &crate::cli::Cli) -> bool {
+    cli.debug_dump_data || log_enabled!(Level::Debug)
 }
 
 fn compute_root_enu_frame(
@@ -680,6 +721,7 @@ fn build_tile_model_from_feature_ids(
     world: &parser::World,
     feature_ids: &[usize],
     feature_type_lods: &BTreeMap<String, String>,
+    object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
     let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
@@ -687,6 +729,7 @@ fn build_tile_model_from_feature_ids(
         world,
         &deduplicated_feature_ids,
         feature_type_lods,
+        object_attribute_types,
         include_parent_attributes,
         false,
     )?;
@@ -710,13 +753,20 @@ fn build_tile_model(
     qtree_node: &spatial_structs::QuadTree,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
     let feature_ids = collect_tile_feature_ids(world, qtree_node);
-    build_tile_model_from_feature_ids(world, &feature_ids, &BTreeMap::new(), false)
+    build_tile_model_from_feature_ids(
+        world,
+        &feature_ids,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        false,
+    )
 }
 
 fn build_tile_debug_cityjsonseq(
     world: &parser::World,
     feature_ids: &[usize],
     feature_type_lods: &BTreeMap<String, String>,
+    object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
@@ -724,6 +774,7 @@ fn build_tile_debug_cityjsonseq(
         world,
         &deduplicated_feature_ids,
         feature_type_lods,
+        object_attribute_types,
         include_parent_attributes,
         true,
     )?;
@@ -742,6 +793,7 @@ fn prepare_tile_feature_models(
     world: &parser::World,
     feature_ids: &[usize],
     feature_type_lods: &BTreeMap<String, String>,
+    object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cleanup_features: bool,
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
@@ -759,6 +811,7 @@ fn prepare_tile_feature_models(
                     .as_ref()
                     .is_some_and(|_| world.features[feature_id].needs_type_filter),
                 feature_type_lods,
+                object_attribute_types,
                 include_parent_attributes,
                 cleanup_features,
             ) {
@@ -776,15 +829,18 @@ fn prepare_feature_model(
     cityobject_types: Option<&Vec<parser::CityObjectType>>,
     needs_type_filter: bool,
     feature_type_lods: &BTreeMap<String, String>,
+    object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut model = model;
     let prepare_started = Instant::now();
-    let lods_pruned = !feature_type_lods.is_empty();
-    prune_lod_geometries(&mut model, feature_type_lods)?;
+    let lods_pruned = prune_lod_geometries(&mut model, feature_type_lods)?;
     if include_parent_attributes {
         inherit_parent_attributes(&mut model)?;
+    }
+    if !object_attribute_types.is_empty() {
+        apply_object_attribute_types(&mut model, object_attribute_types)?;
     }
     let type_filter_started = Instant::now();
     let model = if needs_type_filter {
@@ -799,8 +855,11 @@ fn prepare_feature_model(
             type_filter_started.elapsed()
         );
     }
-    let remove_empty_geometry =
-        cleanup_feature || lods_pruned || include_parent_attributes || needs_type_filter;
+    let remove_empty_geometry = cleanup_feature
+        || lods_pruned
+        || include_parent_attributes
+        || needs_type_filter
+        || !object_attribute_types.is_empty();
     let model = if remove_empty_geometry {
         remove_empty_geometry_cityobjects(&model)?
     } else {
@@ -1001,62 +1060,190 @@ fn filter_cityobject_types(
     })
 }
 
-fn prune_lod_geometries(
+fn apply_object_attribute_types(
     model: &mut cityjson_lib::CityModel,
-    feature_type_lods: &BTreeMap<String, String>,
+    object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if feature_type_lods.is_empty() {
-        return Ok(());
-    }
-
-    let retained_by_object = model
-        .cityobjects()
-        .iter()
-        .map(|(handle, cityobject)| {
-            let feature_type = cityobject.type_cityobject().to_string();
-            let retained = cityobject
-                .geometry()
-                .unwrap_or(&[])
-                .iter()
-                .copied()
-                .filter(|geometry_handle| {
-                    geometry_matches_lod(
-                        model,
-                        *geometry_handle,
-                        feature_type_lods.get(&feature_type),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (handle, retained)
-        })
-        .collect::<Vec<_>>();
-
-    for (handle, retained) in retained_by_object {
-        let cityobject = model
-            .cityobjects_mut()
-            .get_mut(handle)
-            .ok_or_else(|| format!("missing CityObject handle {handle} during LoD pruning"))?;
-        cityobject.clear_geometry();
-        for geometry_handle in retained {
-            cityobject.add_geometry(geometry_handle);
+    let handles = model.cityobjects().ids().collect::<Vec<_>>();
+    for handle in handles {
+        let Some(cityobject) = model.cityobjects_mut().get_mut(handle) else {
+            return Err(format!(
+                "missing CityObject handle {handle} during object attribute remapping"
+            )
+            .into());
+        };
+        let remapped = object_attribute_types
+            .iter()
+            .filter_map(|(name, attribute_type)| {
+                cityobject
+                    .attributes()
+                    .and_then(|attributes| attributes.get(name))
+                    .and_then(|value| coerce_object_attribute_value(value, *attribute_type))
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Vec<_>>();
+        let attributes = cityobject.attributes_mut();
+        attributes.clear();
+        for (name, value) in remapped {
+            attributes.insert(name, value);
         }
     }
 
     Ok(())
 }
 
+fn coerce_object_attribute_value(
+    value: &cityjson_lib::cityjson::v2_0::OwnedAttributeValue,
+    attribute_type: ObjectAttributeType,
+) -> Option<cityjson_lib::cityjson::v2_0::OwnedAttributeValue> {
+    use cityjson_lib::cityjson::v2_0::OwnedAttributeValue as AttributeValue;
+
+    match attribute_type {
+        ObjectAttributeType::String => match value {
+            AttributeValue::Bool(value) => Some(AttributeValue::String(value.to_string())),
+            AttributeValue::Unsigned(value) => Some(AttributeValue::String(value.to_string())),
+            AttributeValue::Integer(value) => Some(AttributeValue::String(value.to_string())),
+            AttributeValue::Float(value) if value.is_finite() => {
+                Some(AttributeValue::String(value.to_string()))
+            }
+            AttributeValue::String(value) => Some(AttributeValue::String(value.clone())),
+            _ => None,
+        },
+        ObjectAttributeType::Bool => match value {
+            AttributeValue::Bool(value) => Some(AttributeValue::Bool(*value)),
+            AttributeValue::Unsigned(value) => Some(AttributeValue::Bool(*value != 0)),
+            AttributeValue::Integer(value) => Some(AttributeValue::Bool(*value != 0)),
+            AttributeValue::Float(value) if value.is_finite() => {
+                Some(AttributeValue::Bool(*value != 0.0))
+            }
+            AttributeValue::String(value) => parse_bool_attribute(value).map(AttributeValue::Bool),
+            _ => None,
+        },
+        ObjectAttributeType::Int => match value {
+            AttributeValue::Bool(value) => Some(AttributeValue::Integer(i64::from(*value))),
+            AttributeValue::Unsigned(value) => {
+                i64::try_from(*value).ok().map(AttributeValue::Integer)
+            }
+            AttributeValue::Integer(value) => Some(AttributeValue::Integer(*value)),
+            AttributeValue::Float(value) if value.is_finite() =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                Some(AttributeValue::Integer(*value as i64))
+            }
+            AttributeValue::String(value) => value.parse::<i64>().ok().map(AttributeValue::Integer),
+            _ => None,
+        },
+        ObjectAttributeType::Float => match value {
+            AttributeValue::Bool(value) => Some(AttributeValue::Float(f64::from(u8::from(*value)))),
+            AttributeValue::Unsigned(value) => Some(AttributeValue::Float(*value as f64)),
+            AttributeValue::Integer(value) => Some(AttributeValue::Float(*value as f64)),
+            AttributeValue::Float(value) if value.is_finite() => {
+                Some(AttributeValue::Float(*value))
+            }
+            AttributeValue::String(value) => value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(AttributeValue::Float),
+            _ => None,
+        },
+    }
+}
+
+fn parse_bool_attribute(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn prune_lod_geometries(
+    model: &mut cityjson_lib::CityModel,
+    feature_type_lods: &BTreeMap<String, String>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let retained_by_object = model
+        .cityobjects()
+        .iter()
+        .map(|(handle, cityobject)| {
+            let feature_type = cityobject.type_cityobject().to_string();
+            let selected_lod = feature_type_lods.get(&feature_type);
+            let retained = selected_geometry_handles_for_lod(
+                model,
+                cityobject.geometry().unwrap_or(&[]),
+                selected_lod,
+            );
+            (handle, retained)
+        })
+        .collect::<Vec<_>>();
+
+    let mut changed = false;
+    for (handle, retained) in retained_by_object {
+        let cityobject = model
+            .cityobjects_mut()
+            .get_mut(handle)
+            .ok_or_else(|| format!("missing CityObject handle {handle} during LoD pruning"))?;
+        let original = cityobject.geometry().unwrap_or(&[]).to_vec();
+        if original != retained {
+            changed = true;
+        }
+        cityobject.clear_geometry();
+        for geometry_handle in retained {
+            cityobject.add_geometry(geometry_handle);
+        }
+    }
+
+    Ok(changed)
+}
+
+fn selected_geometry_handles_for_lod(
+    model: &cityjson_lib::CityModel,
+    geometries: &[GeometryHandle],
+    selected_lod: Option<&String>,
+) -> Vec<GeometryHandle> {
+    let Some(selected_lod) = selected_lod
+        .cloned()
+        .or_else(|| highest_lod(model, geometries))
+    else {
+        return geometries.to_vec();
+    };
+    geometries
+        .iter()
+        .copied()
+        .filter(|geometry_handle| {
+            geometry_matches_lod(model, *geometry_handle, selected_lod.as_str())
+        })
+        .collect()
+}
+
+fn highest_lod(model: &cityjson_lib::CityModel, geometries: &[GeometryHandle]) -> Option<String> {
+    geometries
+        .iter()
+        .filter_map(|geometry_handle| {
+            model
+                .get_geometry(*geometry_handle)
+                .and_then(|geometry| geometry.lod())
+                .map(std::string::ToString::to_string)
+        })
+        .max_by(|lhs, rhs| compare_lod_strings(lhs, rhs))
+}
+
+fn compare_lod_strings(lhs: &str, rhs: &str) -> std::cmp::Ordering {
+    match (lhs.parse::<f64>(), rhs.parse::<f64>()) {
+        (Ok(lhs), Ok(rhs)) => lhs.total_cmp(&rhs),
+        _ => lhs.cmp(rhs),
+    }
+}
+
 fn geometry_matches_lod(
     model: &cityjson_lib::CityModel,
     geometry_handle: GeometryHandle,
-    selected_lod: Option<&String>,
+    selected_lod: &str,
 ) -> bool {
-    let Some(selected_lod) = selected_lod else {
-        return true;
-    };
     model
         .get_geometry(geometry_handle)
         .and_then(|geometry| geometry.lod())
-        .is_some_and(|lod| lod.to_string() == *selected_lod)
+        .is_some_and(|lod| lod.to_string() == selected_lod)
 }
 
 fn remove_empty_geometry_cityobjects(
@@ -1117,13 +1304,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Since we have a default value, we can safely unwrap.
     let grid_cellsize = cli.grid_cellsize.unwrap();
-    let geometric_error_factor = cli.geometric_error_factor.unwrap();
+    let geometric_error_factor = cli.cesium3dtiles_geometric_error_factor;
     if geometric_error_factor < 0.0 {
-        return Err("--geometric-error-factor must be non-negative".into());
+        return Err("--3dtiles-geometric-error-factor must be non-negative".into());
     }
-    let format = Formats::_3DTiles; // override --format
-                                    // Since we have a default value, it is safe to unwrap
-                                    // let qtree_capacity = 0; // override cli.qtree_capacity
+    // Since we have a default value, it is safe to unwrap
+    // let qtree_capacity = 0; // override cli.qtree_capacity
     let qtree_criteria = spatial_structs::QuadTreeCriteria::Vertices; // override --qtree-criteria
     let quadtree_capacity = match qtree_criteria {
         spatial_structs::QuadTreeCriteria::Objects => {
@@ -1132,19 +1318,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         spatial_structs::QuadTreeCriteria::Vertices => {
             spatial_structs::QuadTreeCapacity::Vertices(cli.qtree_capacity.unwrap())
         }
-    };
-    #[allow(unused)]
-    let metadata_class: String = match format {
-        Formats::_3DTiles => {
-            if cli.cesium3dtiles_tileset_only {
-                String::new()
-            } else if cli.cesium3dtiles_metadata_class.is_none() {
-                panic!("metadata_class must be set for writing 3D Tiles")
-            } else {
-                cli.cesium3dtiles_metadata_class.clone().unwrap()
-            }
-        }
-        Formats::CityJSON => "".to_string(),
     };
     if cli.cesium3dtiles_content_bv_from_tile && !cli.cesium3dtiles_content_add_bv {
         warn!("cesium3dtiles_content_bv_from_tile is true, but cesium3dtiles_content_add_bv is false. The tile content bounding volumes are not going to be added, unless you set --3dtiles-content-add-bv");
@@ -1172,9 +1345,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     debug!("{:?}", debug_data);
     let debug_data_output_path = cli.output.join("debug");
-    if (cli.grid_export || log_enabled!(Level::Debug)) && !debug_data_output_path.exists() {
+    if (cli.debug_dump_grid || should_dump_debug_data(&cli)) && !debug_data_output_path.exists() {
         fs::create_dir(&debug_data_output_path)?;
     }
+    let object_attribute_types = build_object_attribute_types(&cli)?;
     // --- end of argument parsing
 
     // Populate the World with features
@@ -1205,6 +1379,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cli.grid_maxz,
             )?;
             world.index_with_grid()?; // todo input: in general, build a line index
+            if let Some(grid_path) = cli.debug_load_grid.as_ref() {
+                let features_path = grid_path.parent().map(|parent| parent.join("features.tsv"));
+                world.grid = spatial_structs::SquareGrid::from_debug_tsv(
+                    grid_path,
+                    features_path.as_deref(),
+                    world.crs.to_epsg()?,
+                    Some(&world.grid),
+                )?;
+            }
             world
         }
         Some(world_path) => {
@@ -1219,11 +1402,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         world.grid.compute_statistics()
     );
 
-    if cli.grid_export {
+    if cli.debug_dump_grid {
         info!("Exporting the grid to TSV to {:?}", &debug_data_output_path);
-        world.export_grid(cli.grid_export_features, Some(&debug_data_output_path))?;
+        world.export_grid(cli.debug_dump_grid_features, Some(&debug_data_output_path))?;
     }
-    if log_enabled!(Level::Debug) {
+    if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the world instance to bincode to {:?}",
             &debug_data_output_path
@@ -1244,14 +1427,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if cli.grid_export {
+    if cli.debug_dump_grid {
         info!(
             "Exporting the quadtree to TSV to {:?}",
             &debug_data_output_path
         );
         quadtree.export(&world, Some(&debug_data_output_path))?;
     }
-    if log_enabled!(Level::Debug) {
+    if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the quadtree instance to bincode to {:?}",
             &debug_data_output_path
@@ -1279,7 +1462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &root_enu_frame,
     );
 
-    if cli.grid_export {
+    if cli.debug_dump_grid {
         info!(
             "Exporting the explicit tileset to TSV files to {:?}",
             &debug_data_output_path
@@ -1315,7 +1498,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let subtrees = tileset_implicit
                 .make_implicit_from_content_tile_ids(&content_tile_ids, subtrees_dir_option);
 
-            if cli.cesium3dtiles_tileset_only || log_enabled!(Level::Debug) {
+            if cli.debug_cesium3dtiles_tileset_only || should_dump_debug_data(&cli) {
                 info!("Writing unpruned 3D Tiles tileset");
                 tileset_implicit.to_file(&tileset_path_unpruned)?;
 
@@ -1352,13 +1535,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Export each tile by merging its selected CityJSONFeature stream in memory.
     let path_output_tiles = cli.output.join("t");
-    let path_features_input_dir = cli.output.join("inputs");
+    let path_features_input_dir = debug_data_output_path.join("inputs");
     // TODO: need to refactor this parallel loop somehow that it does not only read the
     //  3d tiles tiles, but also works with cityjson output
-    if !cli.cesium3dtiles_tileset_only {
+    if !cli.debug_cesium3dtiles_tileset_only {
         fs::create_dir_all(&path_output_tiles)?;
         info!("Created output directory {:#?}", &path_output_tiles);
-        if cli.debug_tile_inputs {
+        if should_dump_debug_data(&cli) {
             fs::create_dir_all(&path_features_input_dir)?;
             info!("Created output directory {:#?}", &path_features_input_dir);
         }
@@ -1372,6 +1555,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let export_options = build_glb_export_options(&cli, geometry_placement, None);
         let feature_type_lods = build_feature_type_lods(&cli);
+        let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
         let all_content_tile_ids: Vec<TileId> = export_jobs
             .iter()
@@ -1394,6 +1578,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &world,
                 &job.feature_ids,
                 &feature_type_lods,
+                &object_attribute_types,
                 cli.include_parent_attributes,
             ) {
                 Ok(model) => model,
@@ -1405,11 +1590,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Some(job);
                 }
             };
-            if cli.debug_tile_inputs {
+            if should_dump_debug_data(&cli) {
                 let cityjsonseq_bytes = match build_tile_debug_cityjsonseq(
                     &world,
                     &job.feature_ids,
                     &feature_type_lods,
+                    &object_attribute_types,
                     cli.include_parent_attributes,
                 ) {
                     Ok(bytes) => bytes,
@@ -1520,7 +1706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             info!("Converting and optimizing {tiles_len} tiles");
             tiles_failed_iter.collect_into_vec(&mut tiles_results);
-            if log_enabled!(Level::Debug) {
+            if should_dump_debug_data(&cli) {
                 debug!(
                     "Exporting the tiles_results instance to bincode to {:?}",
                     &debug_data_output_path
@@ -1607,6 +1793,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (filename, child_tileset) in &external_tilesets {
                     let tileset_path = cli.output.join(filename);
                     child_tileset.to_file(&tileset_path)?;
+                }
+            }
+        }
+        info!("Writing 3D Tiles tileset");
+        tileset.to_file(&tileset_path)?;
+    } else {
+        if cli.cesium3dtiles_implicit {
+            let content_tile_ids: Vec<TileId> = export_jobs
+                .iter()
+                .map(|job| job.content_tile_id.clone())
+                .collect();
+            let components: Vec<_> = subtrees_path
+                .components()
+                .map(|comp| comp.as_os_str())
+                .collect();
+            let subtrees_dir_option = components.last().cloned().unwrap().to_str();
+            let subtrees =
+                tileset.make_implicit_from_content_tile_ids(&content_tile_ids, subtrees_dir_option);
+            info!("Writing subtrees for implicit tiling");
+            fs::create_dir_all(&subtrees_path)?;
+            for (subtree_id, subtree_bytes) in subtrees {
+                fs::create_dir_all(
+                    subtrees_path.join(format!("{}/{}", subtree_id.level, subtree_id.x)),
+                )
+                .unwrap();
+                let out_path = subtrees_path
+                    .join(&subtree_id.to_string())
+                    .with_extension("subtree");
+                let mut subtree_file = File::create(&out_path)
+                    .unwrap_or_else(|_| panic!("could not create {:?} for writing", &out_path));
+                if let Err(_e) = subtree_file.write_all(&subtree_bytes) {
+                    warn!("Failed to write subtree {} content", subtree_id);
                 }
             }
         }
@@ -1758,6 +1976,84 @@ mod tests {
             })
     }
 
+    fn feature_attribute_value<'a>(
+        feature: &'a Value,
+        object_id: &str,
+        key: &str,
+    ) -> Option<&'a Value> {
+        feature
+            .get("CityObjects")?
+            .get(object_id)?
+            .get("attributes")?
+            .get(key)
+    }
+
+    fn retained_lods_by_object_id(
+        model: &cityjson_lib::CityModel,
+    ) -> BTreeMap<String, Vec<String>> {
+        model
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| {
+                let lods = cityobject
+                    .geometry()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|geometry_handle| {
+                        model
+                            .get_geometry(*geometry_handle)
+                            .and_then(|geometry| geometry.lod())
+                            .map(std::string::ToString::to_string)
+                    })
+                    .collect::<Vec<_>>();
+                (cityobject.id().to_string(), lods)
+            })
+            .collect()
+    }
+
+    fn mixed_object_type_fixture() -> cityjson_lib::CityModel {
+        cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"building",
+                "CityObjects":{
+                    "building":{"type":"Building","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2]]]}]},
+                    "water":{"type":"WaterBody","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[3,4,5]]]}]},
+                    "plant":{"type":"PlantCover","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[6,7,8]]]}]}
+                },
+                "vertices":[[0,0,0],[1,0,0],[0,1,0],[2,0,0],[3,0,0],[2,1,0],[4,0,0],[5,0,0],[4,1,0]]
+            }"#,
+        )
+        .expect("mixed object type fixture should parse")
+    }
+
+    fn multi_type_lod_fixture() -> cityjson_lib::CityModel {
+        cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"building",
+                "CityObjects":{
+                    "building":{
+                        "type":"Building",
+                        "geometry":[
+                            {"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2]]]},
+                            {"type":"MultiSurface","lod":"2","boundaries":[[[0,2,3]]]}
+                        ]
+                    },
+                    "building-part":{
+                        "type":"BuildingPart",
+                        "geometry":[
+                            {"type":"MultiSurface","lod":"1","boundaries":[[[4,5,6]]]},
+                            {"type":"MultiSurface","lod":"3","boundaries":[[[4,6,7]]]}
+                        ]
+                    }
+                },
+                "vertices":[[0,0,0],[1,0,0],[1,1,0],[0,1,0],[2,0,0],[3,0,0],[3,1,0],[2,1,0]]
+            }"#,
+        )
+        .expect("multi type lod fixture should parse")
+    }
+
     fn indexed_feature_ref(feature_id: &str, source_id: i64, row_id: i64) -> parser::Feature {
         parser::Feature {
             centroid: [0.0, 0.0],
@@ -1826,6 +2122,7 @@ mod tests {
             None,
             false,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             false,
             false,
         )
@@ -1868,6 +2165,7 @@ mod tests {
             Some(&selected_types),
             false,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             false,
             false,
         )
@@ -1879,6 +2177,7 @@ mod tests {
             Some(&selected_types),
             true,
             &BTreeMap::new(),
+            &BTreeMap::new(),
             false,
             false,
         )
@@ -1889,6 +2188,66 @@ mod tests {
             geometry_relevant_signature(&skipped),
             geometry_relevant_signature(&filtered)
         );
+    }
+
+    #[test]
+    fn object_type_filter_supports_all_single_multi_and_duplicate_selection() {
+        let model = mixed_object_type_fixture();
+
+        let unfiltered = filter_cityobject_types(model.clone(), None).expect("unfiltered types");
+        let mut unfiltered_types = unfiltered
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        unfiltered_types.sort();
+        assert_eq!(
+            unfiltered_types,
+            vec!["Building", "PlantCover", "WaterBody"]
+        );
+
+        let building_only =
+            filter_cityobject_types(model.clone(), Some(&vec![parser::CityObjectType::Building]))
+                .expect("building-only filter");
+        let mut building_only_types = building_only
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        building_only_types.sort();
+        assert_eq!(building_only_types, vec!["Building"]);
+
+        let union = filter_cityobject_types(
+            model.clone(),
+            Some(&vec![
+                parser::CityObjectType::Building,
+                parser::CityObjectType::WaterBody,
+            ]),
+        )
+        .expect("union filter");
+        let mut union_types = union
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        union_types.sort();
+        assert_eq!(union_types, vec!["Building", "WaterBody"]);
+
+        let duplicates = filter_cityobject_types(
+            model,
+            Some(&vec![
+                parser::CityObjectType::Building,
+                parser::CityObjectType::Building,
+            ]),
+        )
+        .expect("duplicate selection");
+        let mut duplicate_types = duplicates
+            .cityobjects()
+            .iter()
+            .map(|(_, cityobject)| cityobject.type_cityobject().to_string())
+            .collect::<Vec<_>>();
+        duplicate_types.sort();
+        assert_eq!(duplicate_types, vec!["Building"]);
     }
 
     #[test]
@@ -1970,14 +2329,87 @@ mod tests {
     }
 
     #[test]
-    fn prepare_model_prunes_lod_geometry_before_gltf_writer() {
+    fn object_attributes_subset_the_incoming_cityobject_attributes() {
+        let mut model = parent_attribute_remapping_fixture(serde_json::json!({
+            "child_only": "child",
+            "levels": 3,
+            "shared": "child"
+        }));
+        let object_attribute_types = BTreeMap::from([
+            ("child_only".to_string(), ObjectAttributeType::String),
+            ("levels".to_string(), ObjectAttributeType::Int),
+        ]);
+
+        apply_object_attribute_types(&mut model, &object_attribute_types)
+            .expect("attribute subsetting should succeed");
+        let feature = feature_json(&model);
+        let attributes = feature["CityObjects"]["building-part"]["attributes"]
+            .as_object()
+            .expect("attributes should exist");
+
+        assert_eq!(attributes.len(), 2);
+        assert!(attributes.contains_key("child_only"));
+        assert!(attributes.contains_key("levels"));
+        assert!(!attributes.contains_key("shared"));
+    }
+
+    #[test]
+    fn object_attributes_coerce_values_to_the_requested_types() {
+        let mut model = cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"building",
+                "CityObjects":{
+                    "building":{
+                        "type":"Building",
+                        "attributes":{
+                            "as_text":7,
+                            "as_bool":"true",
+                            "as_int":9.0,
+                            "as_float":3
+                        },
+                        "geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2]]]}]
+                    }
+                },
+                "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+            }"#,
+        )
+        .expect("attribute type fixture should parse");
+        let object_attribute_types = BTreeMap::from([
+            ("as_text".to_string(), ObjectAttributeType::String),
+            ("as_bool".to_string(), ObjectAttributeType::Bool),
+            ("as_int".to_string(), ObjectAttributeType::Int),
+            ("as_float".to_string(), ObjectAttributeType::Float),
+        ]);
+
+        apply_object_attribute_types(&mut model, &object_attribute_types)
+            .expect("attribute coercion should succeed");
+        let feature = feature_json(&model);
+
+        assert_eq!(
+            feature_attribute_value(&feature, "building", "as_text"),
+            Some(&Value::String("7".to_string()))
+        );
+        assert_eq!(
+            feature_attribute_value(&feature, "building", "as_bool"),
+            Some(&Value::Bool(true))
+        );
+        assert!(feature_attribute_value(&feature, "building", "as_int")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == 9));
+        assert!(feature_attribute_value(&feature, "building", "as_float")
+            .and_then(Value::as_f64)
+            .is_some_and(|value| (value - 3.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
+    fn prepare_model_defaults_to_the_highest_lod_per_cityobject() {
         let mut model = cityjson_lib::json::merge_feature_stream_slice(include_bytes!(
             "../cityjson-convert/tests/data/multi_lod_building_part.city.jsonl"
         ))
         .expect("fixture feature stream should parse");
-        let lods = BTreeMap::from([("BuildingPart".to_string(), "2.2".to_string())]);
 
-        prune_lod_geometries(&mut model, &lods).expect("LoD pruning should succeed");
+        prune_lod_geometries(&mut model, &BTreeMap::new()).expect("LoD pruning should succeed");
         let model =
             remove_empty_geometry_cityobjects(&model).expect("empty object removal should succeed");
         let model = cleanup_and_update_extents(model).expect("cleanup should succeed");
@@ -1998,6 +2430,22 @@ mod tests {
             model.geometry_count(),
             1,
             "cleanup should remove geometries no longer referenced by CityObjects"
+        );
+    }
+
+    #[test]
+    fn prepare_model_uses_type_specific_lod_selectors() {
+        let mut model = multi_type_lod_fixture();
+        let lods = BTreeMap::from([("Building".to_string(), "1".to_string())]);
+
+        prune_lod_geometries(&mut model, &lods).expect("LoD pruning should succeed");
+        let retained = retained_lods_by_object_id(&model);
+
+        assert_eq!(retained.get("building"), Some(&vec!["1".to_string()]));
+        assert_eq!(
+            retained.get("building-part"),
+            Some(&vec!["3".to_string()]),
+            "unconfigured types should still default to their highest LoD"
         );
     }
 
@@ -2141,8 +2589,14 @@ mod tests {
         let quadtree = build_quadtree(&world);
         let feature_ids = collect_tile_feature_ids(&world, &quadtree);
 
-        let model = build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), true)
-            .expect("build tile model with inherited attributes");
+        let model = build_tile_model_from_feature_ids(
+            &world,
+            &feature_ids,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            true,
+        )
+        .expect("build tile model with inherited attributes");
         let model_feature = feature_json(&model);
 
         assert_eq!(
@@ -2193,8 +2647,14 @@ mod tests {
         let quadtree = build_quadtree(&world);
         let feature_ids = collect_tile_feature_ids(&world, &quadtree);
 
-        let model = build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), true)
-            .expect("build tile model with inherited attributes");
+        let model = build_tile_model_from_feature_ids(
+            &world,
+            &feature_ids,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            true,
+        )
+        .expect("build tile model with inherited attributes");
         let model_feature = feature_json(&model);
 
         assert_eq!(
