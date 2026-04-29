@@ -601,15 +601,91 @@ fn read_tile_feature_models(
     Ok(models)
 }
 
+fn deduplicate_tile_feature_ids(world: &parser::World, feature_ids: &[usize]) -> Vec<usize> {
+    deduplicate_feature_ids_by_reference(&world.features, feature_ids)
+}
+
+fn deduplicate_feature_ids_by_reference(
+    features: &[parser::Feature],
+    feature_ids: &[usize],
+) -> Vec<usize> {
+    let mut retained_by_source_id = BTreeMap::<String, usize>::new();
+
+    for feature_id in feature_ids {
+        let key = feature_reference_public_id(&features[*feature_id].reference);
+        match retained_by_source_id.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(*feature_id);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let retained = *entry.get();
+                if feature_reference_precedes(
+                    &features[*feature_id].reference,
+                    &features[retained].reference,
+                ) {
+                    entry.insert(*feature_id);
+                }
+            }
+        }
+    }
+
+    let mut retained = retained_by_source_id.into_values().collect::<Vec<_>>();
+    retained.sort_unstable();
+    if retained.len() != feature_ids.len() {
+        debug!(
+            "Deduplicated tile feature list from {} to {} source feature IDs",
+            feature_ids.len(),
+            retained.len()
+        );
+    }
+    retained
+}
+
+fn feature_reference_public_id(reference: &parser::FeatureReference) -> String {
+    match reference {
+        parser::FeatureReference::CjIndexRef(feature) => feature.feature_id.clone(),
+        parser::FeatureReference::CjIndexId(feature_id) => feature_id.clone(),
+    }
+}
+
+fn feature_reference_precedes(
+    lhs: &parser::FeatureReference,
+    rhs: &parser::FeatureReference,
+) -> bool {
+    match (lhs, rhs) {
+        (parser::FeatureReference::CjIndexRef(lhs), parser::FeatureReference::CjIndexRef(rhs)) => {
+            (
+                lhs.source_id,
+                lhs.row_id,
+                lhs.offset,
+                lhs.length,
+                &lhs.source_path,
+            ) < (
+                rhs.source_id,
+                rhs.row_id,
+                rhs.offset,
+                rhs.length,
+                &rhs.source_path,
+            )
+        }
+        (parser::FeatureReference::CjIndexRef(_), parser::FeatureReference::CjIndexId(_)) => true,
+        (parser::FeatureReference::CjIndexId(_), parser::FeatureReference::CjIndexRef(_)) => false,
+        (parser::FeatureReference::CjIndexId(lhs), parser::FeatureReference::CjIndexId(rhs)) => {
+            lhs < rhs
+        }
+    }
+}
+
 fn build_tile_model_from_feature_ids(
     world: &parser::World,
     feature_ids: &[usize],
     feature_type_lods: &BTreeMap<String, String>,
     include_parent_attributes: bool,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
     let models = prepare_tile_feature_models(
         world,
-        feature_ids,
+        &deduplicated_feature_ids,
         feature_type_lods,
         include_parent_attributes,
         false,
@@ -620,8 +696,9 @@ fn build_tile_model_from_feature_ids(
     let merge_started = Instant::now();
     let merged = cityjson_lib::ops::merge(models)?;
     debug!(
-        "Merged tile model for {} selected features in {:?}",
+        "Merged tile model for {} selected features ({} after deduplication) in {:?}",
         feature_ids.len(),
+        deduplicated_feature_ids.len(),
         merge_started.elapsed()
     );
     Ok(merged)
@@ -642,9 +719,10 @@ fn build_tile_debug_cityjsonseq(
     feature_type_lods: &BTreeMap<String, String>,
     include_parent_attributes: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
     let models = prepare_tile_feature_models(
         world,
-        feature_ids,
+        &deduplicated_feature_ids,
         feature_type_lods,
         include_parent_attributes,
         true,
@@ -1402,6 +1480,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Some(job);
             }
+            match output_file.metadata() {
+                Ok(metadata) if metadata.len() == 0 => {
+                    warn!(
+                        "Tile {} conversion produced empty GLB at {}",
+                        job.content_tile_id,
+                        output_file.display()
+                    );
+                    if let Err(error) = fs::remove_file(&output_file) {
+                        warn!(
+                            "Failed to remove empty GLB for tile {} at {}: {}",
+                            job.content_tile_id,
+                            output_file.display(),
+                            error
+                        );
+                    }
+                    return Some(job);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        "Tile {} conversion failed: could not inspect {}: {}",
+                        job.content_tile_id,
+                        output_file.display(),
+                        error
+                    );
+                    return Some(job);
+                }
+            }
 
             None
         });
@@ -1650,6 +1756,46 @@ mod tests {
                 Value::Bool(value) => value.to_string(),
                 _ => value.to_string(),
             })
+    }
+
+    fn indexed_feature_ref(feature_id: &str, source_id: i64, row_id: i64) -> parser::Feature {
+        parser::Feature {
+            centroid: [0.0, 0.0],
+            reference: parser::FeatureReference::CjIndexRef(cityjson_index::IndexedFeatureRef {
+                row_id,
+                feature_id: feature_id.to_string(),
+                source_id,
+                source_path: PathBuf::from(format!("source-{source_id}.city.json")),
+                offset: row_id as u64,
+                length: 1,
+                vertices_offset: None,
+                vertices_length: None,
+                member_ranges_json: None,
+                bounds: cityjson_index::FeatureBounds {
+                    min_x: 0.0,
+                    max_x: 1.0,
+                    min_y: 0.0,
+                    max_y: 1.0,
+                    min_z: 0.0,
+                    max_z: 1.0,
+                },
+            }),
+            bbox: [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            needs_type_filter: false,
+        }
+    }
+
+    #[test]
+    fn deduplicate_feature_ids_keeps_canonical_cjindex_duplicate() {
+        let features = vec![
+            indexed_feature_ref("duplicate", 2, 20),
+            indexed_feature_ref("unique", 2, 21),
+            indexed_feature_ref("duplicate", 1, 10),
+        ];
+
+        let deduplicated = deduplicate_feature_ids_by_reference(&features, &[0, 1, 2]);
+
+        assert_eq!(deduplicated, vec![1, 2]);
     }
 
     fn prepare_attribute_inheritance_model(
