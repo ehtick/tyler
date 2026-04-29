@@ -1482,7 +1482,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             match output_file.metadata() {
                 Ok(metadata) if metadata.len() == 0 => {
-                    warn!(
+                    debug!(
                         "Tile {} conversion produced empty GLB at {}",
                         job.content_tile_id,
                         output_file.display()
