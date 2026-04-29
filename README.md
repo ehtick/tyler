@@ -28,39 +28,7 @@ Additional information about the internals of *tyler* you will find in the [desi
 
 ## Installation
 
-Pull the docker image with `docker pull 3dgi/tyler:<version>`, e.g. `docker pull 3dgi/tyler:0.3.12`.
-
-### Using the pre-compiled binaries on windows
-
-1. Download the latest Tyler binary package for windows from the [Tyler release page](https://github.com/3DGI/tyler/releases)
-2. Unzip the Tyler binary package to a folder, for example `C:\software\tyler`
-3. You can now run Tyler using the `run_tyler_example.bat` file inside this directory by double clicking on it. You can also copy and open this file in a text editor to change the parameters (eg.
-   input and output data directories) used for running.
-
-For testing purposes you download [this sample data](https://data.3dgi.xyz/3dtiles-test-data/download/3D-basisvoorziening-2021-30dz1_01.zip). Create a `data` folder in same the folder as the `.bat`
-file mentioned above and unzip the contents there.
-
-Contents of the `run_tyler_example.bat` file :
-
-```
-set RUST_LOG=debug
-set PROJ_DATA=%~dp0\share\proj
-
-%~dp0\bin\tyler.exe ^
-%~dp0\data ^
---output %~dp0\data-out\3dtiles-terrain ^
---3dtiles-implicit ^
---object-type LandUse ^
---object-type PlantCover ^
---object-type WaterBody ^
---object-type Road ^
---object-type GenericCityObject ^
---object-type Bridge ^
---object-attributes objectid:int,bronhouder:string,bgt_fysiekvoorkomen:string,bgt_type:string ^
---3dtiles-metadata-class terrain ^
---grid-minz=-15 ^
---grid-maxz=400 >> log.txt 2>&1
-```
+Pull the docker image with `docker pull 3dgi/tyler:<version>`, e.g. `docker pull 3dgi/tyler:0.4.1`.
 
 ### Compiling from source
 
@@ -109,21 +77,6 @@ Tyler uses the [proj](https://proj.org/) library for reprojecting the input to t
 Set [PROJ_DATA](https://proj.org/usage/environmentvars.html#envvar-PROJ_DATA) if your environment requires a custom PROJ data directory.
 
 ### Performance
-
-For large inputs with millions of features, use an SSD.
-Running on an HDD is not feasible for large areas.
-
-The expensive steps are still extent computation, grid indexing, and tile conversion.
-The current `cjindex` path batches feature scans and reuses index handles, so
-it avoids a lot of duplicate reads on large datasets.
-
-The profiling workflow is driven by `just profile`. It writes committed
-summaries under `docs/performance/runs/<run-id>/` and retains the raw profiler
-artifacts, plus Tyler's own run output, under the gitignored
-`docs/performance/runs/raw/<run-id>/` tree. Use `--profile` to resolve the
-input and Tyler arguments through Geodepot, or `--runner perf` /
-`--runner massif` to run only one profiler.
-Each of the three steps are executed concurrently, with the help of the [rayon library](https://crates.io/crates/rayon).
 
 You can control the level of parallelism by setting the `RAYON_NUM_THREADS` environment variables.
 By default *tyler* (rayon) will use the same number of threads as the number of CPUs available.
