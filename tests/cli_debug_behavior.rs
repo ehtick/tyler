@@ -346,3 +346,83 @@ fn object_attributes_filter_and_type_glb_metadata_schema() {
     );
     assert!(!properties.contains_key("ignored"));
 }
+
+#[test]
+fn object_type_building_single_tile_tileset_keeps_positive_root_geometric_error() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = serde_json::json!({
+        "type": "CityJSONFeature",
+        "id": "single-building",
+        "transform": {
+            "scale": [1.0, 1.0, 1.0],
+            "translate": [0.0, 0.0, 0.0]
+        },
+        "CityObjects": {
+            "building": {
+                "type": "Building",
+                "attributes": {
+                    "name": "Single building"
+                },
+                "geometry": [{
+                    "type": "MultiSurface",
+                    "lod": "1",
+                    "boundaries": [[[0, 1, 2], [0, 2, 3]]]
+                }]
+            }
+        },
+        "vertices": [
+            [0, 0, 0],
+            [4, 0, 0],
+            [4, 4, 0],
+            [0, 4, 0]
+        ]
+    })
+    .to_string();
+    let dataset = write_ndjson_dataset("object-type-building-single", &metadata, &[feature]);
+    let output_dir = unique_test_dir("object-type-building-single-output");
+
+    let output = run_tyler(&dataset, &output_dir, &["--object-type", "Building"]);
+    assert_success(&output, "single building tileset run");
+
+    let tileset = read_json(&output_dir.join("tileset.json"));
+    let root = &tileset["root"];
+    assert!(root["content"].is_object(), "root tile should keep content");
+    assert!(
+        root.get("children").is_none(),
+        "single-building dataset should produce a single root tile"
+    );
+    let root_geometric_error = root["geometricError"]
+        .as_f64()
+        .expect("root geometricError should be numeric");
+    assert!(
+        root_geometric_error.abs() <= f64::EPSILON,
+        "root tile geometricError can remain zero"
+    );
+    let tileset_geometric_error = tileset["geometricError"]
+        .as_f64()
+        .expect("tileset geometricError should be numeric");
+    assert!(
+        tileset_geometric_error > 0.0,
+        "tileset geometricError should stay positive for a single-tile tileset"
+    );
+    assert!(tileset_geometric_error > f64::EPSILON);
+
+    let unpruned_tileset = read_json(&output_dir.join("tileset_unpruned.json"));
+    let unpruned_root = &unpruned_tileset["root"];
+    assert!(unpruned_root["content"].is_object());
+    let unpruned_root_geometric_error = unpruned_root["geometricError"]
+        .as_f64()
+        .expect("unpruned root geometricError should be numeric");
+    assert!(
+        unpruned_root_geometric_error.abs() <= f64::EPSILON,
+        "unpruned root geometricError can remain zero"
+    );
+    let unpruned_tileset_geometric_error = unpruned_tileset["geometricError"]
+        .as_f64()
+        .expect("unpruned tileset geometricError should be numeric");
+    assert!(
+        unpruned_tileset_geometric_error > 0.0,
+        "unpruned tileset geometricError should stay positive"
+    );
+    assert!(unpruned_tileset_geometric_error > f64::EPSILON);
+}

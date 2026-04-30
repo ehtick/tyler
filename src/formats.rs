@@ -56,6 +56,17 @@ pub mod cesium3dtiles {
     }
 
     impl Tileset {
+        fn normalize_tileset_geometric_error(
+            root: &Tile,
+            geometric_error: GeometricError,
+        ) -> GeometricError {
+            if root.children.is_none() {
+                geometric_error.max(f64::EPSILON)
+            } else {
+                geometric_error
+            }
+        }
+
         /// Write the tileset to a `tileset.json` file
         pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
             let file_out = File::create(path.as_ref())?;
@@ -165,6 +176,10 @@ pub mod cesium3dtiles {
         ) -> Self {
             let crs_from = format!("EPSG:{}", world.crs.to_epsg().unwrap());
             let transformer = Proj::new_known_crs(&crs_from, "EPSG:4979", None).unwrap();
+            let root_bbox = quadtree.bbox(&world.grid);
+            let root_geometric_error = ((root_bbox[3] - root_bbox[0])
+                .max(root_bbox[4] - root_bbox[1]))
+                * geometric_error_factor;
 
             let root = Self::generate_tiles(
                 quadtree,
@@ -201,10 +216,12 @@ pub mod cesium3dtiles {
             // Apply root transform to root tile
             let mut root_with_transform = root;
             root_with_transform.transform = Some(root_transform);
+            let geometric_error =
+                Self::normalize_tileset_geometric_error(&root_with_transform, root_geometric_error);
 
             Self {
                 asset: Default::default(),
-                geometric_error: root_with_transform.geometric_error,
+                geometric_error,
                 root: root_with_transform,
                 properties: None,
                 extensions_used: Some(vec![ExtensionName::ContentGltf]),
@@ -1072,12 +1089,15 @@ pub mod cesium3dtiles {
                     let filename =
                         format!("tileset-{}-{}-{}.json", tile.id.level, tile.id.x, tile.id.y);
                     // Create the new tileset
+                    let root = tile.clone();
+                    let geometric_error =
+                        Self::normalize_tileset_geometric_error(&root, root.geometric_error);
                     child_tilesets.push((
                         filename.clone(),
                         Tileset {
                             asset: Default::default(),
-                            geometric_error: tile.geometric_error,
-                            root: tile.clone(),
+                            geometric_error,
+                            root,
                             properties: None,
                             extensions_used: None,
                             extensions_required: None,
@@ -1925,7 +1945,14 @@ pub mod cesium3dtiles {
             );
             assert_tile_bounding_volumes_are_regions(&tileset.root);
             assert_geometric_error_decreases_to_zero(&tileset.root);
-            assert!((tileset.geometric_error - tileset.root.geometric_error).abs() <= f64::EPSILON);
+            if tileset.root.children.is_some() {
+                assert!(
+                    (tileset.geometric_error - tileset.root.geometric_error).abs() <= f64::EPSILON
+                );
+            } else {
+                assert!(tileset.root.geometric_error.abs() <= f64::EPSILON);
+                assert!(tileset.geometric_error > f64::EPSILON);
+            }
             let root_transform = tileset
                 .root
                 .transform
