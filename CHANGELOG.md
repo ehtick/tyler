@@ -41,7 +41,13 @@
 - `--include-parent-attributes` now copies inherited parent attributes even when the parent object type itself is not selected.
 - `--3dtiles-metadata-class` now defaults to `citymodel`.
 - When no `--lod-*` override is supplied, Tyler now keeps the highest available LoD per CityObject by default.
+- CityObject type and LoD filtering now run once through the shared `cjindex` filtering path before extent, grid, tile, and export decisions, so tile bounds and output content use the same retained geometry.
 - README, Dockerfiles, Nix, and bundled resources were updated for the new pipeline.
+
+### Fixed
+
+- Missing explicit `--lod-*` selections now fail before tile export with diagnostics for available LoDs instead of producing empty tile models late in the pipeline.
+- `--object-type Building` filtering now keeps descendant geometry such as `BuildingPart` objects when those children are part of the selected building hierarchy.
 
 ## tyler 0.3.14 (2025-10-22)
 

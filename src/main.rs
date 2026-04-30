@@ -64,7 +64,7 @@ mod parser;
 mod proj;
 mod spatial_structs;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -74,7 +74,7 @@ use std::time::Instant;
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use crate::proj::Proj;
-use cityjson_lib::cityjson::prelude::{CityObjectHandle, GeometryHandle};
+use cityjson_lib::cityjson::prelude::CityObjectHandle;
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
@@ -230,6 +230,30 @@ fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
     }
 
     feature_type_lods
+}
+
+fn build_feature_filter(
+    cityobject_types: Option<&Vec<parser::CityObjectType>>,
+    feature_type_lods: &BTreeMap<String, String>,
+) -> cityjson_index::FeatureFilter {
+    cityjson_index::FeatureFilter {
+        cityobject_types: cityobject_types.map(|types| {
+            types
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        }),
+        default_lod: cityjson_index::LodSelection::Highest,
+        lods_by_type: feature_type_lods
+            .iter()
+            .map(|(feature_type, lod)| {
+                (
+                    feature_type.clone(),
+                    cityjson_index::LodSelection::Exact(lod.clone()),
+                )
+            })
+            .collect(),
+    }
 }
 
 fn build_object_attribute_types(
@@ -720,7 +744,6 @@ fn feature_reference_precedes(
 fn build_tile_model_from_feature_ids(
     world: &parser::World,
     feature_ids: &[usize],
-    feature_type_lods: &BTreeMap<String, String>,
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
@@ -728,7 +751,6 @@ fn build_tile_model_from_feature_ids(
     let models = prepare_tile_feature_models(
         world,
         &deduplicated_feature_ids,
-        feature_type_lods,
         object_attribute_types,
         include_parent_attributes,
         false,
@@ -753,19 +775,12 @@ fn build_tile_model(
     qtree_node: &spatial_structs::QuadTree,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
     let feature_ids = collect_tile_feature_ids(world, qtree_node);
-    build_tile_model_from_feature_ids(
-        world,
-        &feature_ids,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        false,
-    )
+    build_tile_model_from_feature_ids(world, &feature_ids, &BTreeMap::new(), false)
 }
 
 fn build_tile_debug_cityjsonseq(
     world: &parser::World,
     feature_ids: &[usize],
-    feature_type_lods: &BTreeMap<String, String>,
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -773,7 +788,6 @@ fn build_tile_debug_cityjsonseq(
     let models = prepare_tile_feature_models(
         world,
         &deduplicated_feature_ids,
-        feature_type_lods,
         object_attribute_types,
         include_parent_attributes,
         true,
@@ -792,7 +806,6 @@ fn build_tile_debug_cityjsonseq(
 fn prepare_tile_feature_models(
     world: &parser::World,
     feature_ids: &[usize],
-    feature_type_lods: &BTreeMap<String, String>,
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cleanup_features: bool,
@@ -806,11 +819,7 @@ fn prepare_tile_feature_models(
                 model,
                 feature_id,
                 world.cityobject_types.as_ref(),
-                world
-                    .cityobject_types
-                    .as_ref()
-                    .is_some_and(|_| world.features[feature_id].needs_type_filter),
-                feature_type_lods,
+                &world.feature_filter,
                 object_attribute_types,
                 include_parent_attributes,
                 cleanup_features,
@@ -825,41 +834,24 @@ fn prepare_tile_feature_models(
 
 fn prepare_feature_model(
     model: cityjson_lib::CityModel,
-    feature_id: usize,
-    cityobject_types: Option<&Vec<parser::CityObjectType>>,
-    needs_type_filter: bool,
-    feature_type_lods: &BTreeMap<String, String>,
+    _feature_id: usize,
+    _cityobject_types: Option<&Vec<parser::CityObjectType>>,
+    feature_filter: &cityjson_index::FeatureFilter,
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut model = model;
-    let prepare_started = Instant::now();
-    let lods_pruned = prune_lod_geometries(&mut model, feature_type_lods)?;
     if include_parent_attributes {
         inherit_parent_attributes(&mut model)?;
     }
     if !object_attribute_types.is_empty() {
         apply_object_attribute_types(&mut model, object_attribute_types)?;
     }
-    let type_filter_started = Instant::now();
-    let model = if needs_type_filter {
-        filter_cityobject_types(model, cityobject_types)?
-    } else {
-        model
-    };
-    if needs_type_filter {
-        debug!(
-            "Filtered feature {} cityobject types in {:?}",
-            feature_id,
-            type_filter_started.elapsed()
-        );
-    }
-    let remove_empty_geometry = cleanup_feature
-        || lods_pruned
-        || include_parent_attributes
-        || needs_type_filter
-        || !object_attribute_types.is_empty();
+    let filtered = feature_filter.apply(&model)?;
+    model = filtered.model;
+    let remove_empty_geometry =
+        cleanup_feature || include_parent_attributes || !object_attribute_types.is_empty();
     let model = if remove_empty_geometry {
         remove_empty_geometry_cityobjects(&model)?
     } else {
@@ -869,23 +861,9 @@ fn prepare_feature_model(
         return Ok(None);
     }
     if cleanup_feature {
-        let cleanup_started = Instant::now();
         let cleaned = cleanup_and_update_extents(model)?;
-        debug!(
-            "Cleaned debug tile feature {} in {:?} (total prepare {:?})",
-            feature_id,
-            cleanup_started.elapsed(),
-            prepare_started.elapsed()
-        );
         Ok(Some(cleaned))
     } else {
-        debug!(
-            "Prepared tile feature {} in {:?} (type_filter={}, remove_empty={}, cleanup=false)",
-            feature_id,
-            prepare_started.elapsed(),
-            needs_type_filter,
-            remove_empty_geometry
-        );
         Ok(Some(model))
     }
 }
@@ -1033,6 +1011,38 @@ where
     Ok(filtered)
 }
 
+#[cfg(test)]
+pub(crate) fn filter_cityjsonfeature_preserving_root_with_policy(
+    model: &cityjson_lib::CityModel,
+    cityobject_types: Option<&Vec<parser::CityObjectType>>,
+    feature_type_lods: &BTreeMap<String, String>,
+    default_highest_lod: bool,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let filter = cityjson_index::FeatureFilter {
+        cityobject_types: cityobject_types.map(|types| {
+            types
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<BTreeSet<_>>()
+        }),
+        default_lod: if default_highest_lod {
+            cityjson_index::LodSelection::Highest
+        } else {
+            cityjson_index::LodSelection::All
+        },
+        lods_by_type: feature_type_lods
+            .iter()
+            .map(|(feature_type, lod)| {
+                (
+                    feature_type.clone(),
+                    cityjson_index::LodSelection::Exact(lod.clone()),
+                )
+            })
+            .collect(),
+    };
+    Ok(filter.apply(model)?.model)
+}
+
 fn parentless_cityobject_handle(model: &cityjson_lib::CityModel) -> Option<CityObjectHandle> {
     model.cityobjects().iter().find_map(|(handle, cityobject)| {
         let has_surviving_parent = cityobject.parents().is_some_and(|parents| {
@@ -1044,20 +1054,17 @@ fn parentless_cityobject_handle(model: &cityjson_lib::CityModel) -> Option<CityO
     })
 }
 
+#[cfg(test)]
 fn filter_cityobject_types(
     model: cityjson_lib::CityModel,
     cityobject_types: Option<&Vec<parser::CityObjectType>>,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
-    let Some(cityobject_types) = cityobject_types else {
-        return Ok(model);
-    };
-    let selected = cityobject_types
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<HashSet<_>>();
-    filter_cityjsonfeature_preserving_root(&model, |ctx| {
-        selected.contains(&ctx.cityobject().type_cityobject().to_string())
-    })
+    filter_cityjsonfeature_preserving_root_with_policy(
+        &model,
+        cityobject_types,
+        &BTreeMap::new(),
+        false,
+    )
 }
 
 fn apply_object_attribute_types(
@@ -1158,92 +1165,17 @@ fn parse_bool_attribute(value: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 fn prune_lod_geometries(
     model: &mut cityjson_lib::CityModel,
     feature_type_lods: &BTreeMap<String, String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let retained_by_object = model
-        .cityobjects()
-        .iter()
-        .map(|(handle, cityobject)| {
-            let feature_type = cityobject.type_cityobject().to_string();
-            let selected_lod = feature_type_lods.get(&feature_type);
-            let retained = selected_geometry_handles_for_lod(
-                model,
-                cityobject.geometry().unwrap_or(&[]),
-                selected_lod,
-            );
-            (handle, retained)
-        })
-        .collect::<Vec<_>>();
-
-    let mut changed = false;
-    for (handle, retained) in retained_by_object {
-        let cityobject = model
-            .cityobjects_mut()
-            .get_mut(handle)
-            .ok_or_else(|| format!("missing CityObject handle {handle} during LoD pruning"))?;
-        let original = cityobject.geometry().unwrap_or(&[]).to_vec();
-        if original != retained {
-            changed = true;
-        }
-        cityobject.clear_geometry();
-        for geometry_handle in retained {
-            cityobject.add_geometry(geometry_handle);
-        }
-    }
-
+    let filtered =
+        filter_cityjsonfeature_preserving_root_with_policy(model, None, feature_type_lods, true)?;
+    let changed = filtered.geometry_count() != model.geometry_count()
+        || filtered.cityobjects().len() != model.cityobjects().len();
+    *model = filtered;
     Ok(changed)
-}
-
-fn selected_geometry_handles_for_lod(
-    model: &cityjson_lib::CityModel,
-    geometries: &[GeometryHandle],
-    selected_lod: Option<&String>,
-) -> Vec<GeometryHandle> {
-    let Some(selected_lod) = selected_lod
-        .cloned()
-        .or_else(|| highest_lod(model, geometries))
-    else {
-        return geometries.to_vec();
-    };
-    geometries
-        .iter()
-        .copied()
-        .filter(|geometry_handle| {
-            geometry_matches_lod(model, *geometry_handle, selected_lod.as_str())
-        })
-        .collect()
-}
-
-fn highest_lod(model: &cityjson_lib::CityModel, geometries: &[GeometryHandle]) -> Option<String> {
-    geometries
-        .iter()
-        .filter_map(|geometry_handle| {
-            model
-                .get_geometry(*geometry_handle)
-                .and_then(|geometry| geometry.lod())
-                .map(std::string::ToString::to_string)
-        })
-        .max_by(|lhs, rhs| compare_lod_strings(lhs, rhs))
-}
-
-fn compare_lod_strings(lhs: &str, rhs: &str) -> std::cmp::Ordering {
-    match (lhs.parse::<f64>(), rhs.parse::<f64>()) {
-        (Ok(lhs), Ok(rhs)) => lhs.total_cmp(&rhs),
-        _ => lhs.cmp(rhs),
-    }
-}
-
-fn geometry_matches_lod(
-    model: &cityjson_lib::CityModel,
-    geometry_handle: GeometryHandle,
-    selected_lod: &str,
-) -> bool {
-    model
-        .get_geometry(geometry_handle)
-        .and_then(|geometry| geometry.lod())
-        .is_some_and(|lod| lod.to_string() == selected_lod)
 }
 
 fn remove_empty_geometry_cityobjects(
@@ -1365,6 +1297,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let cityobject_types = cli.object_type.clone();
+    let feature_type_lods = build_feature_type_lods(&cli);
+    let feature_filter = build_feature_filter(cityobject_types.as_ref(), &feature_type_lods);
 
     let world: parser::World = match debug_data.world {
         None => {
@@ -1377,6 +1311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 prepared_input.feature_base_document.clone(),
                 grid_cellsize,
                 cityobject_types,
+                feature_filter,
                 cli.grid_minz,
                 cli.grid_maxz,
             )?;
@@ -1556,7 +1491,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             up: root_enu_frame.up,
         };
         let export_options = build_glb_export_options(&cli, geometry_placement, None);
-        let feature_type_lods = build_feature_type_lods(&cli);
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
         let all_content_tile_ids: Vec<TileId> = export_jobs
@@ -1579,7 +1513,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model = match build_tile_model_from_feature_ids(
                 &world,
                 &job.feature_ids,
-                &feature_type_lods,
                 &object_attribute_types,
                 cli.include_parent_attributes,
             ) {
@@ -1596,7 +1529,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cityjsonseq_bytes = match build_tile_debug_cityjsonseq(
                     &world,
                     &job.feature_ids,
-                    &feature_type_lods,
                     &object_attribute_types,
                     cli.include_parent_attributes,
                 ) {
@@ -2102,12 +2034,16 @@ mod tests {
         include_parent_attributes: bool,
     ) -> cityjson_lib::CityModel {
         let mut model = model;
-        prune_lod_geometries(&mut model, &BTreeMap::new()).expect("LoD pruning should succeed");
         if include_parent_attributes {
             inherit_parent_attributes(&mut model).expect("attribute inheritance should succeed");
         }
-        let model = filter_cityobject_types(model, Some(&cityobject_types))
-            .expect("type filter should succeed");
+        let model = filter_cityjsonfeature_preserving_root_with_policy(
+            &model,
+            Some(&cityobject_types),
+            &BTreeMap::new(),
+            true,
+        )
+        .expect("type filter should succeed");
         let model =
             remove_empty_geometry_cityobjects(&model).expect("empty object removal should succeed");
         cleanup_and_update_extents(model).expect("cleanup should succeed")
@@ -2115,15 +2051,31 @@ mod tests {
 
     #[test]
     fn prepare_feature_model_skips_empty_geometry_removal_for_gltf_noop_path() {
-        let model = parent_attribute_remapping_fixture(serde_json::json!({}));
+        let model = cityjson_lib::json::from_feature_slice(
+            br#"{
+                "type":"CityJSONFeature",
+                "id":"building-part",
+                "CityObjects":{
+                    "building-part":{
+                        "type":"BuildingPart",
+                        "geometry":[{
+                            "type":"MultiSurface",
+                            "lod":"1",
+                            "boundaries":[[[0,1,2]]]
+                        }]
+                    }
+                },
+                "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+            }"#,
+        )
+        .expect("simple model should parse");
         let original_signature = geometry_relevant_signature(&model);
 
         let prepared = prepare_feature_model(
             model.clone(),
             0,
             None,
-            false,
-            &BTreeMap::new(),
+            &cityjson_index::FeatureFilter::default(),
             &BTreeMap::new(),
             false,
             false,
@@ -2160,13 +2112,13 @@ mod tests {
         )
         .expect("building-part fixture should parse");
         let selected_types = vec![parser::CityObjectType::BuildingPart];
+        let feature_filter = build_feature_filter(Some(&selected_types), &BTreeMap::new());
 
         let skipped = prepare_feature_model(
             model.clone(),
             0,
             Some(&selected_types),
-            false,
-            &BTreeMap::new(),
+            &feature_filter,
             &BTreeMap::new(),
             false,
             false,
@@ -2177,8 +2129,7 @@ mod tests {
             model,
             0,
             Some(&selected_types),
-            true,
-            &BTreeMap::new(),
+            &feature_filter,
             &BTreeMap::new(),
             false,
             false,
@@ -2253,6 +2204,159 @@ mod tests {
             .collect::<Vec<_>>();
         duplicate_types.sort();
         assert_eq!(duplicate_types, vec!["Building"]);
+    }
+
+    #[test]
+    fn build_feature_filter_maps_cli_types_lods_and_default_highest_policy() {
+        let cityobject_types = vec![
+            parser::CityObjectType::Building,
+            parser::CityObjectType::BuildingPart,
+        ];
+        let lods = BTreeMap::from([
+            ("Building".to_string(), "2.0".to_string()),
+            ("BuildingPart".to_string(), "1.3".to_string()),
+        ]);
+
+        let filter = build_feature_filter(Some(&cityobject_types), &lods);
+
+        assert_eq!(
+            filter.cityobject_types,
+            Some(BTreeSet::from([
+                "Building".to_string(),
+                "BuildingPart".to_string(),
+            ]))
+        );
+        assert_eq!(filter.default_lod, cityjson_index::LodSelection::Highest);
+        assert_eq!(
+            filter.lods_by_type.get("Building"),
+            Some(&cityjson_index::LodSelection::Exact("2.0".to_string()))
+        );
+        assert_eq!(
+            filter.lods_by_type.get("BuildingPart"),
+            Some(&cityjson_index::LodSelection::Exact("1.3".to_string()))
+        );
+    }
+
+    #[test]
+    fn shared_filter_object_type_only_keeps_all_geometries_for_selected_types() {
+        let model = multi_type_lod_fixture();
+        let filtered = filter_cityjsonfeature_preserving_root_with_policy(
+            &model,
+            Some(&vec![parser::CityObjectType::BuildingPart]),
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("type-only filtering should succeed");
+
+        let retained = retained_lods_by_object_id(&filtered);
+        assert_eq!(
+            retained.get("building-part"),
+            Some(&vec!["1".to_string(), "3".to_string()])
+        );
+        assert!(!retained.contains_key("building"));
+    }
+
+    #[test]
+    fn shared_filter_defaults_to_highest_lod_for_every_cityobject() {
+        let model = multi_type_lod_fixture();
+        let filtered = filter_cityjsonfeature_preserving_root_with_policy(
+            &model,
+            None,
+            &BTreeMap::new(),
+            true,
+        )
+        .expect("default highest filtering should succeed");
+
+        let retained = retained_lods_by_object_id(&filtered);
+        assert_eq!(retained.get("building"), Some(&vec!["2".to_string()]));
+        assert_eq!(retained.get("building-part"), Some(&vec!["3".to_string()]));
+    }
+
+    #[test]
+    fn world_extent_uses_highest_lod_geometry_for_selected_types() {
+        let dataset_dir = unique_test_dir("highest-lod-extent");
+        let feature_base_document =
+            fs::read(resource_path("3dbag_x00.city.json")).expect("read metadata");
+        let metadata_path = dataset_dir.join("metadata.json");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+        let feature_path = dataset_dir.join("source.city.jsonl");
+        fs::write(
+            &feature_path,
+            serde_json::json!({
+                "type": "CityJSONFeature",
+                "id": "lod-extent",
+                "CityObjects": {
+                    "lod-extent": {
+                        "type": "BuildingPart",
+                        "geometry": [
+                            {
+                                "type": "MultiSurface",
+                                "lod": "1.0",
+                                "boundaries": [[[0, 1, 2]]]
+                            },
+                            {
+                                "type": "MultiSurface",
+                                "lod": "2.0",
+                                "boundaries": [[[3, 4, 5]]]
+                            }
+                        ]
+                    }
+                },
+                "vertices": [
+                    [0, 0, 0],
+                    [1, 0, 0],
+                    [0, 1, 0],
+                    [10, 10, 0],
+                    [11, 10, 0],
+                    [10, 11, 0]
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write highest-lod extent feature");
+
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve highest-lod extent dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex extent dataset");
+        let feature_base_document =
+            derive_base_document(&city_index).expect("derive base doc for extent dataset");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let low_types = Some(vec![parser::CityObjectType::BuildingPart]);
+        let low_lods = BTreeMap::from([("BuildingPart".to_string(), "1.0".to_string())]);
+        let low_filter = build_feature_filter(low_types.as_ref(), &low_lods);
+        let world_low = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path.clone(),
+            feature_base_document.clone(),
+            200,
+            low_types,
+            low_filter,
+            None,
+            None,
+        )
+        .expect("build low-lod cjindex world");
+
+        let high_types = Some(vec![parser::CityObjectType::BuildingPart]);
+        let high_lods = BTreeMap::from([("BuildingPart".to_string(), "2.0".to_string())]);
+        let high_filter = build_feature_filter(high_types.as_ref(), &high_lods);
+        let world_high = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
+            200,
+            high_types,
+            high_filter,
+            None,
+            None,
+        )
+        .expect("build high-lod cjindex world");
+
+        assert!(world_low.grid.bbox[0] < world_high.grid.bbox[0]);
+        assert!(world_low.grid.bbox[3] < world_high.grid.bbox[3]);
     }
 
     #[test]
@@ -2595,15 +2699,18 @@ mod tests {
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let cityobject_types = Some(vec![
+            parser::CityObjectType::Building,
+            parser::CityObjectType::BuildingPart,
+        ]);
+        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
-            Some(vec![
-                parser::CityObjectType::Building,
-                parser::CityObjectType::BuildingPart,
-            ]),
+            cityobject_types,
+            feature_filter,
             None,
             None,
         )
@@ -2612,14 +2719,8 @@ mod tests {
         let quadtree = build_quadtree(&world);
         let feature_ids = collect_tile_feature_ids(&world, &quadtree);
 
-        let model = build_tile_model_from_feature_ids(
-            &world,
-            &feature_ids,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            true,
-        )
-        .expect("build tile model with inherited attributes");
+        let model = build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), true)
+            .expect("build tile model with inherited attributes");
         let model_feature = feature_json(&model);
 
         assert_eq!(
@@ -2656,12 +2757,15 @@ mod tests {
         let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let cityobject_types = Some(vec![parser::CityObjectType::BuildingPart]);
+        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
-            Some(vec![parser::CityObjectType::BuildingPart]),
+            cityobject_types,
+            feature_filter,
             None,
             None,
         )
@@ -2670,14 +2774,8 @@ mod tests {
         let quadtree = build_quadtree(&world);
         let feature_ids = collect_tile_feature_ids(&world, &quadtree);
 
-        let model = build_tile_model_from_feature_ids(
-            &world,
-            &feature_ids,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            true,
-        )
-        .expect("build tile model with inherited attributes");
+        let model = build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), true)
+            .expect("build tile model with inherited attributes");
         let model_feature = feature_json(&model);
 
         assert_eq!(
@@ -2696,6 +2794,101 @@ mod tests {
             Some(1)
         );
         assert_eq!(feature_root_id(&model), Some("building-part".to_string()));
+    }
+
+    #[test]
+    fn single_building_type_filter_retains_child_geometry_for_tiles() {
+        let dataset_dir = unique_test_dir("building-parent-child-geometry");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        let metadata_path = dataset_dir.join("metadata.json");
+        let feature_path = features_dir.join("sample.city.jsonl");
+        fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
+        fs::write(
+            &feature_path,
+            parent_attribute_remapping_fixture_bytes(serde_json::json!({})),
+        )
+        .expect("write feature");
+
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve building-only parent-child dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex");
+        let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let cityobject_types = Some(vec![parser::CityObjectType::Building]);
+        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
+        let mut world = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
+            200,
+            cityobject_types,
+            feature_filter,
+            None,
+            None,
+        )
+        .expect("build building-only world");
+        world.index_with_grid().expect("index building-only world");
+        let quadtree = build_quadtree(&world);
+        let feature_ids = collect_tile_feature_ids(&world, &quadtree);
+
+        let model =
+            build_tile_model_from_feature_ids(&world, &feature_ids, &BTreeMap::new(), false)
+                .expect("build tile model");
+        let retained = retained_lods_by_object_id(&model);
+
+        assert!(retained
+            .get("building-part")
+            .is_some_and(|lods| !lods.is_empty() && lods.iter().all(|lod| lod == "1")));
+        assert!(model.vertices().len() >= 3);
+    }
+
+    #[test]
+    fn world_from_cjindex_errors_before_export_when_explicit_lod_is_missing() {
+        let dataset_dir = unique_test_dir("missing-explicit-lod");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        let metadata_path = dataset_dir.join("metadata.json");
+        let feature_path = features_dir.join("sample.city.jsonl");
+        fs::copy(resource_path("3dbag_x00.city.json"), &metadata_path).expect("copy metadata");
+        fs::write(
+            &feature_path,
+            parent_attribute_remapping_fixture_bytes(serde_json::json!({})),
+        )
+        .expect("write feature");
+
+        let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+            .expect("resolve missing-lod dataset");
+        let mut city_index =
+            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                .expect("open index");
+        city_index.reindex().expect("reindex");
+        let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
+        fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+        let lods = BTreeMap::from([("BuildingPart".to_string(), "99".to_string())]);
+        let feature_filter = build_feature_filter(None, &lods);
+        let Err(error) = parser::World::from_cjindex(
+            parser::InputSource::from_cjindex_resolved(&resolved),
+            metadata_path,
+            feature_base_document,
+            200,
+            None,
+            feature_filter,
+            None,
+            None,
+        ) else {
+            panic!("missing explicit LoD should fail before grid/export");
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("requested LoD selector matched no geometry"));
+        assert!(message.contains("BuildingPart requested LoD '99'"));
+        assert!(message.contains("available LoDs are: 1"));
     }
 
     #[test]
@@ -2749,12 +2942,14 @@ mod tests {
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
             None,
+            feature_filter,
             None,
             None,
         )
@@ -2796,12 +2991,14 @@ mod tests {
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
             None,
+            feature_filter,
             None,
             None,
         )
@@ -2845,12 +3042,15 @@ mod tests {
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let cityobject_types = Some(vec![parser::CityObjectType::Building]);
+        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
-            Some(vec![parser::CityObjectType::Building]),
+            cityobject_types,
+            feature_filter,
             None,
             None,
         )
@@ -2939,12 +3139,15 @@ mod tests {
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+        let cityobject_types = Some(vec![parser::CityObjectType::Building]);
+        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
             metadata_path,
             feature_base_document,
             200,
-            Some(vec![parser::CityObjectType::Building]),
+            cityobject_types,
+            feature_filter,
             None,
             None,
         )

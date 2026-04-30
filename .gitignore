@@ -15,9 +15,10 @@
 # Test data
 /tests/output*
 /cityjson-convert/tests/output/
-.geodepot
+.geodepot.bak
 
 # Debug data
 *.tsv
 *.bincode
 *.log
+/docs/plans/
