@@ -1,5 +1,54 @@
 # Changelog
 
+## tyler 0.4.1 (unreleased)
+
+### Added
+
+- Native GLB generation in Rust through `cityjson-convert`, so Tyler no longer depends on an external `geoflow` installation for export.
+- Optional intermediary tile materialization in CityJSONSeq format for debugging.
+- First-class `cjindex` input support for `cityjsonseq`, `cityjson`, and `feature-files` datasets.
+- `--include-parent-attributes` for 3DBAG/roofer-style parent-child datasets.
+- `--smooth-normals` for smoother glTF output.
+- A `just ci-check` recipe and the GitHub Actions workflow that runs it.
+- ADRs and supporting documentation for the `cjindex` input model, CityJSONSeq exchange, and grid traversal changes.
+- A repo-local profiling workflow driven by `just profile`, `scripts/profile-tyler.sh`, and Geodepot-backed profile-by-name resolution.
+- Per-run profiling artifacts under `docs/performance/runs/`, including structured summaries for `perf stat` and Valgrind Massif.
+- Retention of raw profiling artifacts and Tyler output under the gitignored `docs/performance/runs/raw/` tree for later analysis.
+- Runner selection for profiling sessions so `perf` and Massif can be run independently or together, with failed runs preserved for later inspection.
+- A focused CLI/debug regression test suite for intermediary tile preparation, debug data replay, grid export/load, tileset-only runs, and object-attribute mapping.
+- A `just coverage` recipe backed by `cargo tarpaulin`, plus a recorded baseline under `docs/testing/coverage-baseline.md`.
+
+### Changed
+
+- Tyler now resolves every input through `cjindex`; the old `metadata.city.json` + `**/*.city.jsonl` parser is gone. Tyler now takes a single dataset root input instead of separate `--metadata` and
+  `--features` arguments.
+- Tile-model building now relies on `cityjson_lib::ops::merge` to reconcile mixed input transforms, so cjindex inputs with differing transforms no longer need local normalization.
+- Large `cjindex` runs are handled in page-sized chunks with thread-local index reuse, which cuts repeated reads during extent and tile processing.
+- Grid indexing for `cjindex` inputs now consumes decoded scan pages directly instead of paging references and issuing per-feature reads.
+- Grid vertex counting now accumulates directly into per-cell counts, avoiding per-feature vertex-cell sorting except for thresholded large-feature parallelism.
+- Tile conversion now uses thread-local `CityIndex` handles for cjindex reads and defers normal per-feature cleanup until after tile model merging.
+- The CityJSON-to-GLB pre-write path now skips redundant cleanup and filtering work where the GLB output would not change, and records extra timing information around the remaining hot spots.
+- Tyler no longer depends on an external `geoflow-bundle` installation for GLB export.
+- For implicit 3D Tiles, tiling is now performed in geographic coordinates.
+- 3D Tiles now use `region` bounding volumes instead of boxes.
+- `--debug-dump-data` now dumps bincode snapshots and intermediary per-tile CityJSONFeature streams under `debug/`, and `RUST_LOG=debug` follows the same dump path while also enabling debug logging.
+- `--debug-load-data` now continues to support partial replay from any available subset of dumped debug data, and `--debug-load-grid` now actively reloads exported `grid.tsv` and `features.tsv` data
+  for quadtree recomputation.
+- The CLI debug/export surface was consolidated: `--debug-tile-inputs` became `--debug-dump-data`, `--grid-export` became `--debug-dump-grid`, `--grid-export-features` became
+  `--debug-dump-grid-features`, `--grid-file` became `--debug-load-grid`, `--3dtiles-tileset-only` became `--debug-3dtiles-tileset-only`, and `--geometric-error-factor` became
+  `--3dtiles-geometric-error-factor` with the `-e` shorthand removed.
+- `--object-attributes` now accepts comma-separated `name:type` mappings and still subsets and coerces CityObject attributes before GLB export.
+- `--include-parent-attributes` now copies inherited parent attributes even when the parent object type itself is not selected.
+- `--3dtiles-metadata-class` now defaults to `citymodel`.
+- When no `--lod-*` override is supplied, Tyler now keeps the highest available LoD per CityObject by default.
+- CityObject type and LoD filtering now run once through the shared `cjindex` filtering path before extent, grid, tile, and export decisions, so tile bounds and output content use the same retained geometry.
+- README, Dockerfiles, Nix, and bundled resources were updated for the new pipeline.
+
+### Fixed
+
+- Missing explicit `--lod-*` selections now fail before tile export with diagnostics for available LoDs instead of producing empty tile models late in the pipeline.
+- `--object-type Building` filtering now keeps descendant geometry such as `BuildingPart` objects when those children are part of the selected building hierarchy.
+
 ## tyler 0.3.14 (2025-10-22)
 
 ### Fixed

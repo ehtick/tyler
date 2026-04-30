@@ -1,5 +1,4 @@
-//! CityJSON parser.
-//! The module is responsible for parsing CityJSON data and populating the World.
+//! CityJSON parsing and feature indexing built directly on `cityjson-lib`.
 // Copyright 2023 Balázs Dukai, Ravi Peters
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,136 +13,236 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{read_to_string, File};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use log::{debug, error, info, warn};
+use cityjson::v2_0::vertex::VertexIndex as GeometryVertexIndex;
+use cityjson_index::{CityIndex, StorageLayout};
+use cityjson_lib::{cityjson, json};
+use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::from_str;
-use walkdir::WalkDir;
 
-use crate::spatial_structs::{BboxQc, Cell, CellId};
+use crate::spatial_structs::{Bbox, Cell, CellId, GridLayout};
 
-/// Represents the "world" that contains some features and needs to be partitioned into
-/// tiles.
-///
-/// # Members
-///
-/// `path_features_root` - The path to the root directory containing all features.
-///
-/// `path_metadata` - The path to the JSON file that stores the
-/// [CityJSON object](https://www.cityjson.org/specs/1.1.3/#cityjson-object)
-/// (also called CityJSON metadata in *tyler*).
-///
-/// `cityobject_types` - The World only contains features of these types.
+const CJINDEX_PAGE_SIZE: usize = 65_536;
+const CJINDEX_PARALLEL_CHUNK_SIZE: usize = 2_048;
+const LARGE_FEATURE_VERTEX_COUNT_THRESHOLD: usize = 50_000;
+
+thread_local! {
+    static CJINDEX_THREAD_LOCAL: RefCell<Option<(PathBuf, CityIndex)>> = const { RefCell::new(None) };
+    static UNIQUE_ASSIGNMENT_VERTEX_COUNTS: RefCell<Vec<(CellId, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct World {
     pub cityobject_types: Option<Vec<CityObjectType>>,
+    pub feature_filter: cityjson_index::FeatureFilter,
     pub crs: Crs,
     pub features: FeatureSet,
+    pub feature_base_document: Vec<u8>,
     pub grid: crate::spatial_structs::SquareGrid,
-    pub path_features_root: PathBuf,
     pub path_metadata: PathBuf,
-    pub transform: Transform,
+    pub input_source: InputSource,
 }
 
-struct ExtentQcResult {
-    extent_qc: BboxQc,
-    nr_features: usize,
-    cityobject_types_ignored: Vec<CityObjectType>,
-    nr_features_ignored: usize,
-}
-
-struct FeatureDirsFiles {
-    feature_dirs: Vec<PathBuf>,
-    feature_files: Vec<PathBuf>,
-}
-
-/// Stores the [Feature] and the grid cells that the feature is located in.
 struct FeatureInGridCells {
     feature: Feature,
     cells: Vec<(CellId, Cell)>,
 }
 
+#[derive(Default)]
+struct SelectedGeometryStats {
+    bbox: Option<Bbox>,
+    centroid: Option<[f64; 2]>,
+    selected_vertices: Vec<GeometryVertexIndex<u32>>,
+    selected_object_types: Vec<CityObjectType>,
+    ignored_object_types: Vec<CityObjectType>,
+}
+
+#[derive(Default)]
+struct ExtentStats {
+    extent: Option<Bbox>,
+    nr_features: usize,
+    nr_features_ignored: usize,
+    cityobject_types_ignored: Vec<CityObjectType>,
+    filter_summary: cityjson_index::FeatureFilterSummary,
+}
+
+impl ExtentStats {
+    fn add_selected_geometry_stats(
+        &mut self,
+        stats: SelectedGeometryStats,
+        diagnostics: &cityjson_index::FeatureFilterDiagnostics,
+    ) {
+        self.filter_summary.add(diagnostics);
+        if let Some(model_bbox) = stats.bbox {
+            if let Some(current) = self.extent.as_mut() {
+                merge_bbox(current, &model_bbox);
+            } else {
+                self.extent = Some(model_bbox);
+            }
+            self.nr_features += 1;
+        } else {
+            self.nr_features_ignored += 1;
+            self.extend_ignored_types(stats.ignored_object_types);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if let Some(other_extent) = other.extent {
+            if let Some(current) = self.extent.as_mut() {
+                merge_bbox(current, &other_extent);
+            } else {
+                self.extent = Some(other_extent);
+            }
+        }
+        self.nr_features += other.nr_features;
+        self.nr_features_ignored += other.nr_features_ignored;
+        self.extend_ignored_types(other.cityobject_types_ignored);
+        merge_filter_summary(&mut self.filter_summary, other.filter_summary);
+    }
+
+    fn extend_ignored_types(&mut self, ignored_types: Vec<CityObjectType>) {
+        for cotype in ignored_types {
+            if !self.cityobject_types_ignored.contains(&cotype) {
+                self.cityobject_types_ignored.push(cotype);
+            }
+        }
+    }
+}
+
+fn merge_filter_summary(
+    target: &mut cityjson_index::FeatureFilterSummary,
+    source: cityjson_index::FeatureFilterSummary,
+) {
+    target.available_types.extend(source.available_types);
+    target.retained_types.extend(source.retained_types);
+    target.ignored_types.extend(source.ignored_types);
+    merge_lod_summary(&mut target.available_lods, source.available_lods);
+    merge_lod_summary(&mut target.retained_lods, source.retained_lods);
+    target.missing_lods.extend(source.missing_lods);
+    target.retained_feature_count += source.retained_feature_count;
+    target.ignored_feature_count += source.ignored_feature_count;
+}
+
+fn merge_lod_summary(
+    target: &mut BTreeMap<String, std::collections::BTreeSet<String>>,
+    source: BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (cityobject_type, lods) in source {
+        target.entry(cityobject_type).or_default().extend(lods);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputSource {
+    pub dataset_root: PathBuf,
+    pub index_path: PathBuf,
+    pub layout: CjIndexLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CjIndexLayout {
+    Ndjson,
+    CityJson,
+    FeatureFiles,
+}
+
+impl CjIndexLayout {
+    fn storage_layout(self, dataset_root: &Path) -> StorageLayout {
+        match self {
+            Self::Ndjson => StorageLayout::Ndjson {
+                paths: vec![dataset_root.to_path_buf()],
+            },
+            Self::CityJson => StorageLayout::CityJson {
+                paths: vec![dataset_root.to_path_buf()],
+            },
+            Self::FeatureFiles => StorageLayout::FeatureFiles {
+                root: dataset_root.to_path_buf(),
+                metadata_glob: "**/metadata.json".to_owned(),
+                feature_glob: "**/*.city.jsonl".to_owned(),
+            },
+        }
+    }
+}
+
+impl InputSource {
+    pub fn from_cjindex_resolved(resolved: &cityjson_index::ResolvedDataset) -> Self {
+        let layout = match resolved.layout {
+            cityjson_index::DatasetLayoutKind::Ndjson => CjIndexLayout::Ndjson,
+            cityjson_index::DatasetLayoutKind::CityJson => CjIndexLayout::CityJson,
+            cityjson_index::DatasetLayoutKind::FeatureFiles => CjIndexLayout::FeatureFiles,
+        };
+        Self {
+            dataset_root: resolved.dataset_root.clone(),
+            index_path: resolved.index_path.clone(),
+            layout,
+        }
+    }
+
+    pub fn open_index(&self) -> Result<CityIndex, Box<dyn std::error::Error>> {
+        Ok(CityIndex::open(
+            self.layout.storage_layout(&self.dataset_root),
+            &self.index_path,
+        )?)
+    }
+}
+
 impl World {
-    pub fn new<P: AsRef<Path>>(
-        path_metadata: P,
-        path_features_root: P,
+    pub fn from_cjindex(
+        input_source: InputSource,
+        path_metadata: PathBuf,
+        feature_base_document: Vec<u8>,
         cellsize: u32,
         cityobject_types: Option<Vec<CityObjectType>>,
+        feature_filter: cityjson_index::FeatureFilter,
         arg_minz: Option<i32>,
         arg_maxz: Option<i32>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let path_features_root = path_features_root.as_ref().to_path_buf();
-        let path_metadata = path_metadata.as_ref().to_path_buf();
-        let cm = CityJSONMetadata::from_file(&path_metadata)?;
-        let crs = cm.metadata.reference_system;
-        let transform = cm.transform;
+        let metadata = json::from_slice(&feature_base_document)?;
+        let crs = Crs::from_model(&metadata)?;
 
         info!(
-            "Computing extent from the features of type {:?}",
-            cityobject_types
+            "Computing extent from features with CityObject types {:?} and LoD filter {:?}",
+            cityobject_types, feature_filter
         );
-        // FIXME: if cityobject_types is None, then all cityobject are ignored, instead of included
-        // Compute the extent of the features and the number of features.
-        // We don't store the computed extent explicitly, because the grid contains that info.
-        let feature_dirs_files = Self::find_feature_dirs_and_files(&path_features_root);
-        // Walk the subdirectories of the root
-        debug!(
-            "Found {} subdirectories and {} CityJSONFeature files at the root directory",
-            feature_dirs_files.feature_dirs.len(),
-            feature_dirs_files.feature_files.len()
-        );
-        let extents: Vec<ExtentQcResult> = feature_dirs_files
-            .feature_dirs
-            .into_par_iter()
-            .filter_map(|dir| Self::extent_qc(dir, cityobject_types.as_ref()))
-            .collect();
-        let mut nr_features = 0;
-        let mut nr_features_ignored = 0;
-        let mut extent_qc = Self::extent_qc_init(&path_features_root, cityobject_types.as_ref())
-            .unwrap_or_else(|| {
-                panic!(
-                    "Did not find any CityJSONFeature of type {:?} in {}",
-                    cityobject_types,
-                    path_features_root.display()
-                )
-            });
-        let mut cityobject_types_ignored: Vec<CityObjectType> = Vec::new();
-        for (i, extent) in extents.iter().enumerate() {
-            nr_features += extent.nr_features;
-            nr_features_ignored += extent.nr_features_ignored;
-            if i == 0 {
-                extent_qc = extent.extent_qc.clone();
+
+        let (extent, nr_features, nr_features_ignored, cityobject_types_ignored, filter_summary) =
+            if feature_filter.is_active() {
+                Self::extent_from_cjindex_features(
+                    &input_source,
+                    cityobject_types.as_ref(),
+                    &feature_filter,
+                )?
             } else {
-                extent_qc.update_with(&extent.extent_qc);
+                let city_index = input_source.open_index()?;
+                Self::extent_from_cjindex_bbox_pages(&city_index)?
+            };
+        filter_summary.ensure_requested_lods_available(&feature_filter)?;
+
+        let mut extent = extent.ok_or_else(|| {
+            format!(
+                "Did not find any CityJSONFeatures matching CityObject types {:?} and LoD filter {:?} in cjindex dataset",
+                cityobject_types, feature_filter
+            )
+        })?;
+
+        if let Some(minz) = arg_minz {
+            if extent[2] < minz as f64 {
+                extent[2] = minz as f64;
             }
-            for cotype in &extent.cityobject_types_ignored {
-                if !cityobject_types_ignored.contains(cotype) {
-                    cityobject_types_ignored.push(*cotype);
-                }
+        }
+        if let Some(maxz) = arg_maxz {
+            if extent[5] > maxz as f64 {
+                extent[5] = maxz as f64;
             }
         }
-        // Walk the files at the root and update the counters
-        for feature_path in &feature_dirs_files.feature_files {
-            Self::extent_qc_file(
-                cityobject_types.as_ref(),
-                &mut extent_qc,
-                &mut nr_features,
-                &mut nr_features_ignored,
-                &mut cityobject_types_ignored,
-                feature_path,
-            );
-        }
-        if nr_features == 0 {
-            panic!(
-                "Did not find any CityJSONFeatures of type {:?}",
-                cityobject_types
-            );
-        }
+
         info!(
             "Found {} features of type {:?}",
             nr_features, &cityobject_types
@@ -152,394 +251,455 @@ impl World {
             "Ignored {} features of type {:?}",
             nr_features_ignored, &cityobject_types_ignored
         );
-        debug!("extent_qc: {:?}", &extent_qc);
-        let extent_rw = extent_qc.to_bbox(&transform, arg_minz, arg_maxz);
+        info!(
+            "Available CityObject types after scan: {:?}",
+            filter_summary.available_types
+        );
+        info!(
+            "Retained CityObject types after filtering: {:?}",
+            filter_summary.retained_types
+        );
+        info!(
+            "Available LoDs by CityObject type after filtering: {:?}",
+            filter_summary.available_lods
+        );
+        info!(
+            "Retained LoDs by CityObject type after filtering: {:?}",
+            filter_summary.retained_lods
+        );
+        debug!("extent: {:?}", &extent);
         info!(
             "Computed extent from features: {}",
-            crate::spatial_structs::bbox_to_wkt(&extent_rw)
+            crate::spatial_structs::bbox_to_wkt(&extent)
         );
 
-        // Allocate the grid, but at this point it is still empty
-        let epsg = crs.to_epsg()?;
-        let grid = crate::spatial_structs::SquareGrid::new(&extent_rw, cellsize, epsg);
+        let grid = crate::spatial_structs::SquareGrid::new(&extent, cellsize, crs.to_epsg()?);
         debug!("{}", grid);
 
-        // Allocate the features container, but at this point it is still empty
-        let mut features: FeatureSet = Vec::with_capacity(nr_features + 1);
-        features.resize(nr_features + 1, Feature::default());
-
         Ok(Self {
-            features,
+            features: Vec::with_capacity(nr_features),
             crs,
-            transform,
+            feature_base_document,
+            feature_filter,
             grid,
             cityobject_types,
-            path_features_root,
             path_metadata,
+            input_source,
         })
     }
 
-    /// Find the direct subdirectories and CityJSONFeature files in the directory.
-    /// Returns a Vec of the subdirectory paths and a Vec of CityJSONFeature paths.
-    /// Note that it is not guaranteed that the returned directories contain any CityJSONFeatures.
-    fn find_feature_dirs_and_files(path_features_root: &PathBuf) -> FeatureDirsFiles {
-        let mut path_features_root_dirs: Vec<PathBuf> = Vec::new();
-        let mut path_features_root_files: Vec<PathBuf> = Vec::new();
-        for entry_res in WalkDir::new(path_features_root).min_depth(1).max_depth(1) {
-            if let Ok(entry) = entry_res {
-                if entry.file_type().is_dir() {
-                    path_features_root_dirs.push(entry.path().to_path_buf());
-                } else if entry.file_type().is_file() {
-                    if let Some(jsonl_path) = Self::direntry_to_jsonl(entry) {
-                        path_features_root_files.push(jsonl_path)
-                    }
-                }
-            } else {
-                error!(
-                    "Error in walking the directory {}, error: {}",
-                    &path_features_root.display(),
-                    entry_res.unwrap_err()
-                )
-            }
-        }
-        FeatureDirsFiles {
-            feature_dirs: path_features_root_dirs,
-            feature_files: path_features_root_files,
-        }
-    }
-
-    /// Compute the extent (in quantized coordinates), the number of features and the
-    /// CityObject types that are present in the data but not selected.
-    fn extent_qc<P: AsRef<Path> + std::fmt::Debug>(
-        path_features: P,
+    fn extent_from_cjindex_features(
+        input_source: &InputSource,
         cityobject_types: Option<&Vec<CityObjectType>>,
-    ) -> Option<ExtentQcResult> {
-        // Do a first loop over the features to calculate their extent and their number.
-        // Need a mutable iterator, because .next() consumes the next value and advances the iterator.
-        let mut features_enum_iter = WalkDir::new(&path_features)
-            .into_iter()
-            .filter_map(Self::jsonl_path);
-        // Init the extent with from the first feature of the requested types.
-        // We do not use extent_qc_init() here, because we need to collect the CityObject types
-        // and counts accurately, and we want to retain the position of the features_enum_iter
-        // for the full iteration after the first feature has been found.
-        let mut extent_qc = BboxQc([0, 0, 0, 0, 0, 0]);
-        let mut found_feature_type = false;
-        let mut nr_features = 0;
-        let mut nr_features_ignored = 0;
-        let mut cityobject_types_ignored: Vec<CityObjectType> = Vec::new();
-        // Iterate only until the first feature is found
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(feature_path) = features_enum_iter.next() {
-            match CityJSONFeatureVertices::from_file(&feature_path) {
-                Ok(cf) => {
-                    if let Some(eqc) = cf.bbox_of_types(cityobject_types) {
-                        extent_qc = eqc;
-                        found_feature_type = true;
-                        nr_features += 1;
-                        break;
-                    } else {
-                        for (_, co) in cf.cityobjects.iter() {
-                            if !cityobject_types_ignored.contains(&co.cotype) {
-                                cityobject_types_ignored.push(co.cotype);
-                            }
-                            nr_features_ignored += 1;
+        feature_filter: &cityjson_index::FeatureFilter,
+    ) -> Result<
+        (
+            Option<Bbox>,
+            usize,
+            usize,
+            Vec<CityObjectType>,
+            cityjson_index::FeatureFilterSummary,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let city_index = input_source.open_index()?;
+        let (chunk_tx, chunk_rx) =
+            std::sync::mpsc::sync_channel::<Vec<cityjson_index::IndexedFeatureRef>>(64);
+
+        // Same 2-stage pipeline as `index_with_grid`: a dedicated page-loader
+        // thread streams owned chunks to `chunk_tx` so workers can start
+        // processing before all pages have been read.
+        let total = std::thread::scope(|s| -> Result<ExtentStats, std::io::Error> {
+            let page_loader = s.spawn(move || -> Result<(), std::io::Error> {
+                let pages_iter = city_index
+                    .iter_all_feature_ref_pages(CJINDEX_PAGE_SIZE)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                for page_result in pages_iter {
+                    let page = page_result.map_err(|e| std::io::Error::other(e.to_string()))?;
+                    for chunk in page.chunks(CJINDEX_PARALLEL_CHUNK_SIZE) {
+                        if chunk_tx.send(chunk.to_vec()).is_err() {
+                            return Ok(());
                         }
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to parse {:?} with {:?}", &feature_path, e)
-                }
-            }
-        }
-        if !found_feature_type {
-            return None;
-        }
-        for feature_path in features_enum_iter {
-            Self::extent_qc_file(
-                cityobject_types,
-                &mut extent_qc,
-                &mut nr_features,
-                &mut nr_features_ignored,
-                &mut cityobject_types_ignored,
-                &feature_path,
+                Ok(())
+            });
+
+            let total = chunk_rx
+                .into_iter()
+                .par_bridge()
+                .map(|chunk| {
+                    Self::extent_from_cjindex_feature_refs_chunk(
+                        input_source,
+                        &chunk,
+                        cityobject_types,
+                        feature_filter,
+                    )
+                })
+                .try_reduce(ExtentStats::default, |mut a, b| {
+                    a.merge(b);
+                    Ok(a)
+                })?;
+
+            page_loader.join().expect("page loader thread panicked")?;
+            Ok(total)
+        })?;
+
+        Ok((
+            total.extent,
+            total.nr_features,
+            total.nr_features_ignored,
+            total.cityobject_types_ignored,
+            total.filter_summary,
+        ))
+    }
+
+    fn extent_from_cjindex_bbox_pages(
+        city_index: &CityIndex,
+    ) -> Result<
+        (
+            Option<Bbox>,
+            usize,
+            usize,
+            Vec<CityObjectType>,
+            cityjson_index::FeatureFilterSummary,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let Some(summary) = city_index.feature_bounds_summary()? else {
+            return Ok((
+                None,
+                0,
+                0,
+                Vec::new(),
+                cityjson_index::FeatureFilterSummary::default(),
+            ));
+        };
+        Ok((
+            Some(Self::cjindex_bounds_to_world_bbox(&summary.bounds)),
+            summary.feature_count,
+            0,
+            Vec::new(),
+            cityjson_index::FeatureFilterSummary::default(),
+        ))
+    }
+
+    fn cjindex_bounds_to_world_bbox(bounds: &cityjson_index::FeatureBounds) -> Bbox {
+        [
+            bounds.min_x,
+            bounds.min_y,
+            bounds.min_z,
+            bounds.max_x,
+            bounds.max_y,
+            bounds.max_z,
+        ]
+    }
+
+    fn extent_from_cjindex_feature_refs_chunk(
+        input_source: &InputSource,
+        feature_refs: &[cityjson_index::IndexedFeatureRef],
+        _cityobject_types: Option<&Vec<CityObjectType>>,
+        feature_filter: &cityjson_index::FeatureFilter,
+    ) -> Result<ExtentStats, std::io::Error> {
+        let filtered_features = Self::read_filtered_cjindex_features_thread_local(
+            input_source,
+            feature_refs,
+            feature_filter,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut chunk = ExtentStats::default();
+        for filtered in filtered_features {
+            chunk.add_selected_geometry_stats(
+                selected_geometry_stats(&filtered.model, None),
+                &filtered.diagnostics,
             );
         }
-        Some(ExtentQcResult {
-            extent_qc,
-            nr_features,
-            cityobject_types_ignored,
-            nr_features_ignored,
+        Ok(chunk)
+    }
+
+    pub(crate) fn read_cjindex_features_thread_local(
+        input_source: &InputSource,
+        features: &[cityjson_index::IndexedFeatureRef],
+    ) -> cityjson_lib::Result<Vec<cityjson_lib::CityModel>> {
+        let index_path = &input_source.index_path;
+
+        CJINDEX_THREAD_LOCAL.with(|cell| {
+            let needs_open = {
+                let slot = cell.borrow();
+                match slot.as_ref() {
+                    Some((cached_index_path, _)) => cached_index_path != index_path,
+                    None => true,
+                }
+            };
+
+            if needs_open {
+                let city_index = input_source.open_index().map_err(|error| {
+                    cityjson_lib::Error::Io(std::io::Error::other(error.to_string()))
+                })?;
+                *cell.borrow_mut() = Some((index_path.clone(), city_index));
+            }
+
+            let slot = cell.borrow();
+            let Some((_, city_index)) = slot.as_ref() else {
+                return Err(cityjson_lib::Error::Io(std::io::Error::other(
+                    "cjindex thread-local index cache was not initialized",
+                )));
+            };
+            city_index.read_features(features)
         })
     }
 
-    /// Initialize a [BboxQc] from the first feature of the correct type that is found in the
-    /// `path_features`.
-    fn extent_qc_init<P: AsRef<Path> + std::fmt::Debug>(
-        path_features: P,
-        cityobject_types: Option<&Vec<CityObjectType>>,
-    ) -> Option<BboxQc> {
-        let features_enum_iter = WalkDir::new(&path_features)
-            .into_iter()
-            .filter_map(Self::jsonl_path);
-        // Iterate only until the first feature is found
-        for feature_path in features_enum_iter {
-            match CityJSONFeatureVertices::from_file(&feature_path) {
-                Ok(cf) => {
-                    let extent_qc_op = cf.bbox_of_types(cityobject_types);
-                    if extent_qc_op.is_some() {
-                        return extent_qc_op;
-                    }
+    fn read_filtered_cjindex_features_thread_local(
+        input_source: &InputSource,
+        features: &[cityjson_index::IndexedFeatureRef],
+        filter: &cityjson_index::FeatureFilter,
+    ) -> cityjson_lib::Result<Vec<cityjson_index::FilteredFeature>> {
+        let index_path = &input_source.index_path;
+
+        CJINDEX_THREAD_LOCAL.with(|cell| {
+            let needs_open = {
+                let slot = cell.borrow();
+                match slot.as_ref() {
+                    Some((cached_index_path, _)) => cached_index_path != index_path,
+                    None => true,
                 }
-                Err(e) => {
-                    warn!("Failed to parse {:?} with {:?}", &feature_path, e)
-                }
+            };
+
+            if needs_open {
+                let city_index = input_source.open_index().map_err(|error| {
+                    cityjson_lib::Error::Io(std::io::Error::other(error.to_string()))
+                })?;
+                *cell.borrow_mut() = Some((index_path.clone(), city_index));
             }
-        }
-        None
+
+            let slot = cell.borrow();
+            let Some((_, city_index)) = slot.as_ref() else {
+                return Err(cityjson_lib::Error::Io(std::io::Error::other(
+                    "cjindex thread-local index cache was not initialized",
+                )));
+            };
+            city_index.read_filtered_features(features, filter)
+        })
     }
 
-    fn extent_qc_file(
-        cityobject_types: Option<&Vec<CityObjectType>>,
-        extent_qc: &mut BboxQc,
-        nr_features: &mut usize,
-        nr_features_ignored: &mut usize,
-        cityobject_types_ignored: &mut Vec<CityObjectType>,
-        feature_path: &PathBuf,
-    ) {
-        if let Ok(cf) = CityJSONFeatureVertices::from_file(feature_path) {
-            if let Some(bbox_qc) = cf.bbox_of_types(cityobject_types) {
-                let [x_min, y_min, z_min, x_max, y_max, z_max] = bbox_qc.0;
-                if x_min < extent_qc.0[0] {
-                    extent_qc.0[0] = x_min
-                } else if x_max > extent_qc.0[3] {
-                    extent_qc.0[3] = x_max
-                }
-                if y_min < extent_qc.0[1] {
-                    extent_qc.0[1] = y_min
-                } else if y_max > extent_qc.0[4] {
-                    extent_qc.0[4] = y_max
-                }
-                if z_min < extent_qc.0[2] {
-                    extent_qc.0[2] = z_min
-                } else if z_max > extent_qc.0[5] {
-                    extent_qc.0[5] = z_max
-                }
-                *nr_features += 1;
-            } else {
-                for (_, co) in cf.cityobjects.iter() {
-                    if !cityobject_types_ignored.contains(&co.cotype) {
-                        cityobject_types_ignored.push(co.cotype);
-                    }
-                    *nr_features_ignored += 1;
-                }
-            }
-        } else {
-            error!("Failed to parse {:?}", &feature_path);
-        }
-    }
-
-    /// Return the file path if the 'DirEntry' is a .jsonl file (eg. .city.jsonl).
-    pub fn jsonl_path(walkdir_res: Result<walkdir::DirEntry, walkdir::Error>) -> Option<PathBuf> {
-        if let Ok(entry) = walkdir_res {
-            Self::direntry_to_jsonl(entry)
-        } else {
-            // TODO: notify the user if some path cannot be accessed (eg. permission), https://docs.rs/walkdir/latest/walkdir/struct.Error.html
-            None
-        }
-    }
-
-    /// Convert a [walkdir::DirEntry] to [PathBuf] if the file is CityJSONFeature file.
-    fn direntry_to_jsonl(entry: walkdir::DirEntry) -> Option<PathBuf> {
-        if let Some(ext) = entry.path().extension() {
-            if ext == "jsonl" {
-                Some(entry.path().to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    // Loop through the features and assign the features to the grid cells.
-    pub fn index_with_grid(&mut self) {
-        let feature_dirs_files = Self::find_feature_dirs_and_files(&self.path_features_root);
+    pub fn index_with_grid(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Counting vertices in grid cells");
-        // todo input: split input file by newline?
-        // todo input: adapt to take paths from split files
-        let features_in_cells_dirs: Vec<Vec<FeatureInGridCells>> = feature_dirs_files
-            .feature_dirs
-            .into_par_iter()
-            .map(|dir| {
-                WalkDir::new(dir)
+
+        self.features.clear();
+        let started = Instant::now();
+        let city_index = self.input_source.open_index()?;
+
+        // Split the &mut self borrow into disjoint field borrows so workers can
+        // hold immutable views (input_source, grid_layout, cityobject_types)
+        // while the integrator mutates `features` and `grid`.
+        let features: &mut FeatureSet = &mut self.features;
+        let grid: &mut crate::spatial_structs::SquareGrid = &mut self.grid;
+        let input_source: &InputSource = &self.input_source;
+        let cityobject_types: Option<&Vec<CityObjectType>> = self.cityobject_types.as_ref();
+        let feature_filter: &cityjson_index::FeatureFilter = &self.feature_filter;
+        let grid_layout = grid.layout();
+
+        let (chunk_tx, chunk_rx) =
+            std::sync::mpsc::sync_channel::<Vec<cityjson_index::IndexedFeatureRef>>(64);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
+            Result<Vec<Option<FeatureInGridCells>>, std::io::Error>,
+        >(64);
+
+        let mut indexed_features = 0usize;
+        let mut consumer_err: Option<std::io::Error> = None;
+
+        // 3-stage pipeline:
+        //   Stage 1 (page_loader): streams pages from cjindex and pushes owned
+        //     chunks to chunk_tx. Runs on its own OS thread so I/O overlaps with
+        //     CPU work in the rayon pool.
+        //   Stage 2 (workers): par_bridge consumes chunk_rx and dispatches each
+        //     chunk to a rayon worker, which parses the features, counts vertices
+        //     in cells, and pushes the result to result_tx.
+        //   Stage 3 (integrator, main thread): drains result_rx and applies the
+        //     mutations to `features` and `grid`.
+        let loader_outcome = std::thread::scope(|s| -> Result<(usize, usize), std::io::Error> {
+            let page_loader = s.spawn(move || -> Result<(usize, usize), std::io::Error> {
+                let pages_iter = city_index
+                    .iter_all_feature_ref_pages(CJINDEX_PAGE_SIZE)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let mut page_count = 0usize;
+                let mut scanned_features = 0usize;
+                for page_result in pages_iter {
+                    let page = page_result.map_err(|e| std::io::Error::other(e.to_string()))?;
+                    page_count += 1;
+                    scanned_features += page.len();
+                    for chunk in page.chunks(CJINDEX_PARALLEL_CHUNK_SIZE) {
+                        if chunk_tx.send(chunk.to_vec()).is_err() {
+                            return Ok((page_count, scanned_features));
+                        }
+                    }
+                }
+                Ok((page_count, scanned_features))
+            });
+
+            s.spawn(move || {
+                chunk_rx
                     .into_iter()
-                    .filter_map(Self::jsonl_path)
-                    .filter_map(|feature_path| self.index_feature_path(&feature_path))
-                    .collect()
-            })
-            .collect();
+                    .par_bridge()
+                    .for_each_with(result_tx, |tx, chunk| {
+                        let result = Self::index_cjindex_feature_refs_chunk(
+                            input_source,
+                            &grid_layout,
+                            cityobject_types,
+                            feature_filter,
+                            &chunk,
+                        );
+                        let _ = tx.send(result);
+                    });
+            });
 
-        let features_in_cells_files: Vec<FeatureInGridCells> = feature_dirs_files
-            .feature_files
-            .iter()
-            .filter_map(|feature_path| self.index_feature_path(feature_path))
-            .collect();
-
-        let mut fcount: usize = 0;
-        for (fid, feature_in_cells) in features_in_cells_dirs
-            .iter()
-            .flatten()
-            .chain(features_in_cells_files.iter())
-            .enumerate()
-        {
-            self.features[fid] = feature_in_cells.feature.clone();
-            for (cellid, cell) in &feature_in_cells.cells {
-                let grid_cell = self.grid.cell_mut(cellid);
-                grid_cell.nr_vertices += cell.nr_vertices;
-                if !grid_cell.feature_ids.contains(&fid) {
-                    grid_cell.feature_ids.push(fid)
-                }
-            }
-            fcount += 1;
-        }
-        debug!("indexed {} features", fcount);
-    }
-
-    /// Indexes a CityJSONFeature file.
-    fn index_feature_path(&self, feature_path: &PathBuf) -> Option<FeatureInGridCells> {
-        // todo input: adapt to interate the newline-split file and index per line
-        let cf = CityJSONFeatureVertices::from_file(feature_path);
-        if let Ok(featurevertices) = cf {
-            let cell_vtx_cnt = self.count_vertices(&featurevertices);
-            if !cell_vtx_cnt.is_empty() {
-                // We found at least one CityObject of the required type
-                self.feature_to_cells(feature_path, &featurevertices, cell_vtx_cnt)
-            } else {
-                None
-            }
-        } else {
-            error!("Failed to parse the feature {:?}", &feature_path);
-            None
-        }
-    }
-
-    /// Counts the vertices of a CityJSONFeature in the grid.
-    /// Returns a [HashMap] of the grid [CellId] that contains vertices and the vertex count in
-    /// them.
-    fn count_vertices(&self, featurevertices: &CityJSONFeatureVertices) -> HashMap<CellId, usize> {
-        // We make a (cellid, vertex count) map and assign the feature to the cell that
-        // contains the most of the feature's vertices.
-        // But maybe a HashMap is not the most performant solution here? A Vec of tuples?
-        let mut cell_vtx_cnt: HashMap<CellId, usize> = HashMap::new();
-        for (_, co) in featurevertices.cityobjects.iter() {
-            if let Some(ref geom) = co.geometry {
-                // If the object_type argument was not passed, that means that we need all
-                // CityObject types. If it was passed, then we filter with its values.
-                // Doing this condition-tree would be much simpler if Option.is_some_and()
-                // was stable feature already.
-                let mut do_compute = self.cityobject_types.is_none();
-                if let Some(ref cotypes) = self.cityobject_types {
-                    do_compute = cotypes.contains(&co.cotype);
-                }
-                if do_compute {
-                    // Just counting vertices here
-                    if geom.len() > 0 && featurevertices.vertices.len() > 0 {
-                        for vtx_qc in featurevertices.vertices.iter() {
-                            let vtx_rw = [
-                                (vtx_qc[0] as f64 * self.transform.scale[0])
-                                    + self.transform.translate[0],
-                                (vtx_qc[1] as f64 * self.transform.scale[1])
-                                    + self.transform.translate[1],
-                            ];
-                            let cellid = self.grid.locate_point(&vtx_rw);
-                            *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+            while let Ok(result) = result_rx.recv() {
+                match result {
+                    Ok(fics) => {
+                        for fic in fics.into_iter().flatten() {
+                            indexed_features += 1;
+                            integrate_feature_in_cells(features, grid, fic);
+                        }
+                    }
+                    Err(e) => {
+                        if consumer_err.is_none() {
+                            consumer_err = Some(e);
                         }
                     }
                 }
             }
+
+            page_loader.join().expect("page loader thread panicked")
+        });
+
+        if let Some(e) = consumer_err {
+            return Err(Box::new(e));
         }
-        // After counting the object vertices in the cells, we need to
-        // assign the object to the cells that intersect with its bbox,
-        // because of https://github.com/3DGI/tyler/issues/28
-        if let Some(bbox_qc) = featurevertices.bbox_of_types(self.cityobject_types.as_ref()) {
-            let bbox = bbox_qc.to_bbox(&self.transform, None, None);
-            let intersecting_cellids = self.grid.intersect_bbox(&bbox);
-            for cellid in intersecting_cellids {
-                // Just add a new entry with the intersecting cell to the map, but no not
-                // increase the vertex count, because the vertices have been counted
-                // already, these might be cells where the object does not actually have a
-                // vertex.
-                // REVIEW: actually, let's just increase the vertex count
-                *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
-            }
-        }
-        cell_vtx_cnt
+        let (page_count, scanned_features) = loader_outcome?;
+
+        info!(
+            "Indexed {} of {} scanned features into grid cells across {} pages in {:?}",
+            features.len(),
+            scanned_features,
+            page_count,
+            started.elapsed()
+        );
+        Ok(())
     }
 
-    /// Converts the [CityJSONFeatureVertices] into a [Feature] and returns the grid cells where
-    /// where the feature is located.
-    fn feature_to_cells(
-        &self,
-        feature_path: &PathBuf,
-        featurevertices: &CityJSONFeatureVertices,
-        cell_vtx_cnt: HashMap<CellId, usize>,
-    ) -> Option<FeatureInGridCells> {
-        // TODO: what other cityobject types need to have 1-1 cell assignment?
-        if let Some(ref cotypes) = self.cityobject_types {
-            let feature = featurevertices.to_feature(feature_path);
-            let mut cells: Vec<(CellId, Cell)> = Vec::with_capacity(cell_vtx_cnt.len());
-            if cotypes.contains(&CityObjectType::Building)
-                || cotypes.contains(&CityObjectType::BuildingPart)
-            {
-                // In this case we have a 1-1 feature-to-cell assignment, we only retain the vertex
-                // count in the cell that gets the feature.
-                // The cell that receives the feature is the one with the highest vertex count
-                // of the feature.
-                // However, with this method it is not possible to combine cityobject types that
-                // require different cell-assignment methods into the same tileset.
-                // E.g. terrain features need to be duplicated across cells, buildings need to
-                // unique. The tileset for them must be generated separately.
-                let (cellid, nr_vertices) = cell_vtx_cnt
-                    .iter()
-                    .max_by(|a, b| a.1.cmp(b.1))
-                    .map(|(k, v)| (k, v))
-                    .unwrap();
-                cells.push((
-                    *cellid,
-                    Cell {
-                        feature_ids: Vec::new(),
-                        nr_vertices: *nr_vertices,
-                    },
-                ));
-            } else {
-                for (cellid, nr_vertices) in cell_vtx_cnt.iter() {
-                    cells.push((
-                        *cellid,
-                        Cell {
-                            feature_ids: Vec::new(),
-                            nr_vertices: *nr_vertices,
-                        },
-                    ));
-                }
-            }
-            Some(FeatureInGridCells { feature, cells })
-        } else {
-            None
+    fn index_cjindex_feature_refs_chunk(
+        input_source: &InputSource,
+        grid_layout: &GridLayout,
+        cityobject_types: Option<&Vec<CityObjectType>>,
+        feature_filter: &cityjson_index::FeatureFilter,
+        feature_refs: &[cityjson_index::IndexedFeatureRef],
+    ) -> Result<Vec<Option<FeatureInGridCells>>, std::io::Error> {
+        let filtered_features = Self::read_filtered_cjindex_features_thread_local(
+            input_source,
+            feature_refs,
+            feature_filter,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        feature_refs
+            .iter()
+            .cloned()
+            .zip(filtered_features.iter())
+            .map(|(feature_ref, filtered)| {
+                Self::index_feature_model(
+                    grid_layout,
+                    cityobject_types,
+                    FeatureReference::CjIndexRef(feature_ref),
+                    &filtered.model,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn index_feature_model(
+        grid_layout: &GridLayout,
+        _cityobject_types: Option<&Vec<CityObjectType>>,
+        feature_reference: FeatureReference,
+        model: &cityjson_lib::CityModel,
+    ) -> Result<Option<FeatureInGridCells>, std::io::Error> {
+        let stats = selected_geometry_stats(model, None);
+        let Some(bbox) = stats.bbox else {
+            return Ok(None);
+        };
+        let Some(centroid) = stats.centroid else {
+            return Ok(None);
+        };
+
+        let uses_unique_assignment =
+            selected_types_use_unique_assignment(&stats.selected_object_types);
+        let feature = Feature {
+            centroid,
+            reference: feature_reference,
+            bbox,
+            needs_type_filter: false,
+        };
+
+        if uses_unique_assignment {
+            let Some((cellid, nr_vertices)) =
+                count_unique_assignment_cell(model, &stats.selected_vertices, grid_layout, &bbox)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Self::feature_to_unique_cell(
+                feature,
+                cellid,
+                nr_vertices,
+            )));
+        }
+
+        let cell_vtx_cnt =
+            count_vertices_in_grid(model, &stats.selected_vertices, grid_layout, &bbox);
+        if cell_vtx_cnt.is_empty() {
+            return Ok(None);
+        }
+        Ok(Self::feature_to_cells(feature, cell_vtx_cnt))
+    }
+
+    fn feature_to_cells(feature: Feature, cell_vtx_cnt: CellCounts) -> Option<FeatureInGridCells> {
+        let mut cells: Vec<(CellId, Cell)> = Vec::with_capacity(cell_vtx_cnt.len());
+
+        for (cellid, nr_vertices) in cell_vtx_cnt.iter() {
+            cells.push((
+                *cellid,
+                Cell {
+                    feature_ids: Vec::new(),
+                    nr_vertices: *nr_vertices,
+                },
+            ));
+        }
+        Some(FeatureInGridCells { feature, cells })
+    }
+
+    fn feature_to_unique_cell(
+        feature: Feature,
+        cellid: CellId,
+        nr_vertices: usize,
+    ) -> FeatureInGridCells {
+        FeatureInGridCells {
+            feature,
+            cells: vec![(
+                cellid,
+                Cell {
+                    feature_ids: Vec::new(),
+                    nr_vertices,
+                },
+            )],
         }
     }
 
-    /// Export the grid of the World into the working directory.
     pub fn export_grid(
         &self,
         export_features: bool,
         output_dir: Option<&Path>,
     ) -> std::io::Result<()> {
         if export_features {
-            self.grid
-                .export(Some(&self.features), Some(&self.transform), output_dir)
+            self.grid.export(Some(&self.features), output_dir)
         } else {
-            self.grid.export(None, None, output_dir)
+            self.grid.export(None, output_dir)
         }
     }
 
@@ -557,41 +717,36 @@ impl World {
     }
 }
 
-/// A partial [CityJSON object](https://www.cityjson.org/specs/1.1.3/#cityjson-object).
-/// It is partial, because we only store the metadata that is necessary for parsing the
-/// CityJSONFeatures.
-#[derive(Deserialize, Debug)]
-pub struct CityJSONMetadata {
-    pub transform: Transform,
-    pub metadata: Metadata,
+fn integrate_feature_in_cells(
+    features: &mut FeatureSet,
+    grid: &mut crate::spatial_structs::SquareGrid,
+    feature_in_cells: FeatureInGridCells,
+) {
+    let fid = features.len();
+    features.push(feature_in_cells.feature);
+    for (cellid, cell) in feature_in_cells.cells {
+        let grid_cell = grid.cell_mut(&cellid);
+        grid_cell.nr_vertices += cell.nr_vertices;
+        grid_cell.feature_ids.push(fid);
+    }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Transform {
-    pub scale: [f64; 3],
-    pub translate: [f64; 3],
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct Metadata {
-    pub reference_system: Crs,
-}
-
-/// Coordinate Reference System as defined by the
-/// [referenceSystem](https://www.cityjson.org/specs/1.1.3/#referencesystem-crs) CityJSON object.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Crs(String);
 
 impl Crs {
-    /// Return the EPSG code from the CRS definition, if the CRS definition is indeed an EPSG.
-    ///
-    /// ## Examples
-    /// ```
-    /// let crs = CRS("https://www.opengis.net/def/crs/EPSG/0/7415");
-    /// let epsg_code = crs.to_epsg().unwrap();
-    /// assert_eq!(7415_u16, epsg_code);
-    /// ```
+    fn from_model(
+        model: &cityjson::v2_0::OwnedCityModel,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let metadata = model
+            .metadata()
+            .ok_or_else(|| "CityJSON metadata is missing".to_string())?;
+        let reference_system = metadata
+            .reference_system()
+            .ok_or_else(|| "CityJSON metadata.referenceSystem is missing".to_string())?;
+        Ok(Self(reference_system.to_string()))
+    }
+
     pub fn to_epsg(&self) -> Result<u16, Box<dyn std::error::Error>> {
         let parts: Vec<&str> = self.0.split('/').collect();
         if let Some(authority) = parts.get(parts.len() - 3) {
@@ -603,269 +758,46 @@ impl Crs {
                 .unwrap());
             }
         }
-        return if let Some(c) = parts.last() {
-            let code: u16 = c.parse::<u16>().unwrap();
-            Ok(code)
+        if let Some(code) = parts.last() {
+            Ok(code.parse::<u16>()?)
         } else {
             Err(Box::try_from(format!(
                 "the CRS definition should contain the EPSG code as its last element: {}",
                 self.0
             ))
             .unwrap())
-        };
-    }
-}
-
-/// Container for storing the CityJSONFeature vertices.
-///
-/// CityJSONFeature coordinates are supposed to be within the range of an `i32`,
-/// `[-2147483648, 2147483647]`.
-/// It allocates for the vertex container. I tried zero-copy (zero-allocation) deserialization
-/// from the JSON string with the [zerovec](https://crates.io/crates/zerovec) crate
-/// (see [video](https://youtu.be/DM2DI3ZI_BQ) for details), but I was getting an error of
-/// "Attempted to build VarZeroVec out of elements that cumulatively are larger than a u32 in size"
-/// from the zerovec crate, and I didn't investigate further.
-#[derive(Deserialize, Debug)]
-pub struct CityJSONFeatureVertices {
-    #[serde(rename = "CityObjects")]
-    pub cityobjects: HashMap<String, CityObject>,
-    pub vertices: Vec<[i64; 3]>,
-}
-
-impl CityJSONMetadata {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let cm_str = read_to_string(path.as_ref())?;
-        let cm: CityJSONMetadata = from_str(&cm_str)?;
-        Ok(cm)
-    }
-}
-
-impl CityJSONFeatureVertices {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let cf_str = read_to_string(path.as_ref())?;
-        let cf: CityJSONFeatureVertices = from_str(&cf_str)?;
-        Ok(cf)
-    }
-
-    /// Return the number of vertices of the feature.
-    /// We assume that the number of vertices in a feature does not exceed 65535 (thus `u16`).
-    fn vertex_count(&self) -> u16 {
-        self.vertices.len() as u16
-    }
-
-    /// Feature centroid (2D) computed as the average coordinate.
-    /// The centroid coordinates are quantized, so they need to be transformed back to real-world
-    /// coordinates.
-    /// It is more efficient to apply the transformation once, when the centroid is computed, than
-    /// applying it to each vertex in the loop of computing the average coordinate.
-    fn centroid_qc(&self) -> [i64; 2] {
-        let mut x_sum: i64 = 0;
-        let mut y_sum: i64 = 0;
-        for [x, y, _z] in self.vertices.iter() {
-            x_sum += *x;
-            y_sum += *y;
-        }
-        // Yes, we divide an integer with an integer and we discard the decimals, but that's ok,
-        // because the quantized coordinates (integers) already include the decimals of the
-        // real-world coordinates. Thus, when the quantized centroid is scaled to the real-world
-        // coordinate with a factor `< 0` (eg. 0.001), we will get accurate-enough coordinates
-        // for the centroid.
-        [
-            (x_sum / self.vertices.len() as i64),
-            (y_sum / self.vertices.len() as i64),
-        ]
-    }
-
-    /// Feature centroid (2D) computed as the average coordinate.
-    /// The centroid coordinates are real-world coordinates (thus they are transformed back to
-    /// real-world coordinates from the quantized coordinates).
-    #[allow(dead_code)]
-    fn centroid(&self, transform: &Transform) -> [f64; 2] {
-        let [ctr_x, ctr_y] = self.centroid_qc();
-        [
-            (ctr_x as f64 * transform.scale[0]) + transform.translate[0],
-            (ctr_y as f64 * transform.scale[1]) + transform.translate[1],
-        ]
-    }
-
-    /// Compute the 3D bounding box of the feature.
-    /// Returns quantized coordinates.
-    #[allow(dead_code)]
-    pub fn bbox_qc(&self) -> crate::spatial_structs::BboxQc {
-        let [mut x_min, mut y_min, mut z_min] = self.vertices[0];
-        let [mut x_max, mut y_max, mut z_max] = self.vertices[0];
-        for [x, y, z] in self.vertices.iter() {
-            if *x < x_min {
-                x_min = *x
-            } else if *x > x_max {
-                x_max = *x
-            }
-            if *y < y_min {
-                y_min = *y
-            } else if *y > y_max {
-                y_max = *y
-            }
-            if *z < z_min {
-                z_min = *z
-            } else if *z > z_max {
-                z_max = *z
-            }
-        }
-        BboxQc([x_min, y_min, z_min, x_max, y_max, z_max])
-    }
-
-    /// Compute the 3D bounding box of only the provided CityObject types in the feature.
-    /// Returns quantized coordinates.
-    pub fn bbox_of_types(&self, cityobject_types: Option<&Vec<CityObjectType>>) -> Option<BboxQc> {
-        let [mut x_min, mut y_min, mut z_min] = self.vertices[0];
-        let [mut x_max, mut y_max, mut z_max] = self.vertices[0];
-        let mut found_co_geometry = false;
-        for (_, co) in self.cityobjects.iter() {
-            // If the object_type argument was not passed, that means that we need all
-            // CityObject types. If it was passed, then we filter with its values.
-            // Doing this condition-tree would be much simpler if Option.is_some_and()
-            // was stable feature already.
-            let mut do_compute = cityobject_types.is_none();
-            if let Some(cotypes) = cityobject_types {
-                do_compute = cotypes.contains(&co.cotype);
-            }
-            if do_compute {
-                if let Some(ref geom) = co.geometry {
-                    for g in geom.iter() {
-                        match g {
-                            Geometry::MultiSurface { boundaries, .. } => {
-                                for srf in boundaries {
-                                    for ring in srf {
-                                        for vtx in ring {
-                                            let [x, y, z] = &self.vertices[*vtx];
-                                            if *x < x_min {
-                                                x_min = *x
-                                            } else if *x > x_max {
-                                                x_max = *x
-                                            }
-                                            if *y < y_min {
-                                                y_min = *y
-                                            } else if *y > y_max {
-                                                y_max = *y
-                                            }
-                                            if *z < z_min {
-                                                z_min = *z
-                                            } else if *z > z_max {
-                                                z_max = *z
-                                            }
-                                        }
-                                    }
-                                }
-                                found_co_geometry = true;
-                            }
-                            Geometry::Solid { boundaries, .. } => {
-                                for shell in boundaries {
-                                    for srf in shell {
-                                        for ring in srf {
-                                            for vtx in ring {
-                                                let [x, y, z] = &self.vertices[*vtx];
-                                                if *x < x_min {
-                                                    x_min = *x
-                                                } else if *x > x_max {
-                                                    x_max = *x
-                                                }
-                                                if *y < y_min {
-                                                    y_min = *y
-                                                } else if *y > y_max {
-                                                    y_max = *y
-                                                }
-                                                if *z < z_min {
-                                                    z_min = *z
-                                                } else if *z > z_max {
-                                                    z_max = *z
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                found_co_geometry = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if found_co_geometry {
-            Some(BboxQc([x_min, y_min, z_min, x_max, y_max, z_max]))
-        } else {
-            None
-        }
-    }
-
-    /// Compute the 2D quantized centroid and the 3D bounding box in one loop.
-    ///
-    /// Combines the [centroid_quantized] and [bbox] methods to compute the values in a single
-    /// loop over the vertices.
-    fn centroid_bbox_qc(&self) -> [i64; 8] {
-        let mut x_sum: i64 = 0;
-        let mut y_sum: i64 = 0;
-        let [mut x_min, mut y_min, mut z_min] = self.vertices[0];
-        let [mut x_max, mut y_max, mut z_max] = self.vertices[0];
-        for [x, y, z] in self.vertices.iter() {
-            x_sum += x;
-            y_sum += y;
-            if *x < x_min {
-                x_min = *x
-            } else if *x > x_max {
-                x_max = *x
-            }
-            if *y < y_min {
-                y_min = *y
-            } else if *y > y_max {
-                y_max = *y
-            }
-            if *z < z_min {
-                z_min = *z
-            } else if *z > z_max {
-                z_max = *z
-            }
-        }
-        let x_ctr = x_sum / self.vertices.len() as i64;
-        let y_ctr = y_sum / self.vertices.len() as i64;
-        [x_ctr, y_ctr, x_min, y_min, z_min, x_max, y_max, z_max]
-    }
-
-    /// Sets the 'path_jsonl' to default.
-    pub fn to_feature<P: AsRef<Path>>(&self, path: P) -> Feature {
-        let ctr_bbox = self.centroid_bbox_qc();
-        Feature {
-            centroid_qc: [ctr_bbox[0], ctr_bbox[1]],
-            nr_vertices: self.vertex_count(),
-            path_jsonl: path.as_ref().to_path_buf(),
-            bbox_qc: BboxQc([
-                ctr_bbox[2],
-                ctr_bbox[3],
-                ctr_bbox[4],
-                ctr_bbox[5],
-                ctr_bbox[6],
-                ctr_bbox[7],
-            ]),
         }
     }
 }
 
-/// Stores the information that is computed from a CityJSONFeature.
-#[derive(Debug, Default, Clone, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Feature {
-    pub(crate) centroid_qc: [i64; 2],
-    pub(crate) nr_vertices: u16,
-    pub path_jsonl: PathBuf,
-    // todo input: need line number in file
-    pub bbox_qc: BboxQc,
+    pub(crate) centroid: [f64; 2],
+    pub reference: FeatureReference,
+    pub bbox: Bbox,
+    #[serde(default = "default_feature_needs_type_filter")]
+    pub needs_type_filter: bool,
 }
 
 impl Feature {
-    pub fn centroid(&self, transform: &Transform) -> [f64; 2] {
-        let [ctr_x, ctr_y] = self.centroid_qc;
-        [
-            (ctr_x as f64 * transform.scale[0]) + transform.translate[0],
-            (ctr_y as f64 * transform.scale[1]) + transform.translate[1],
-        ]
+    pub fn centroid(&self) -> [f64; 2] {
+        self.centroid
+    }
+}
+
+fn default_feature_needs_type_filter() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum FeatureReference {
+    CjIndexRef(cityjson_index::IndexedFeatureRef),
+    CjIndexId(String),
+}
+
+impl Default for FeatureReference {
+    fn default() -> Self {
+        Self::CjIndexId(String::new())
     }
 }
 
@@ -889,6 +821,8 @@ pub enum CityObjectType {
     BuildingRoom,
     BuildingUnit,
     CityFurniture,
+    CityObjectGroup,
+    GenericCityObject,
     LandUse,
     OtherConstruction,
     PlantCover,
@@ -899,8 +833,12 @@ pub enum CityObjectType {
     Railway,
     Waterway,
     TransportSquare,
-    #[serde(rename = "+GenericCityObject")]
-    GenericCityObject,
+    Tunnel,
+    TunnelPart,
+    TunnelInstallation,
+    TunnelConstructiveElement,
+    TunnelHollowSpace,
+    TunnelFurniture,
 }
 
 impl fmt::Display for CityObjectType {
@@ -909,37 +847,484 @@ impl fmt::Display for CityObjectType {
     }
 }
 
-// Indexed geometry
-type Vertex = usize;
-type Ring = Vec<Vertex>;
-type Surface = Vec<Ring>;
-type Shell = Vec<Surface>;
-type MultiSurface = Vec<Surface>;
-type Solid = Vec<Shell>;
+pub type FeatureSet = Vec<Feature>;
 
-#[derive(Deserialize, Debug)]
-#[serde(tag = "type")]
-enum Geometry {
-    MultiSurface { boundaries: MultiSurface },
-    Solid { boundaries: Solid },
+fn selected_geometry_stats(
+    model: &cityjson::v2_0::OwnedCityModel,
+    filter: Option<&Vec<CityObjectType>>,
+) -> SelectedGeometryStats {
+    let vertex_scratch_capacity = model.vertices().len().min(4096);
+    let mut selected_vertices = Vec::with_capacity(vertex_scratch_capacity);
+    let mut geometry_scratch = Vec::with_capacity(vertex_scratch_capacity);
+    let mut bbox: Option<Bbox> = None;
+    let mut x_sum = 0.0;
+    let mut y_sum = 0.0;
+    let mut nr_vertices = 0usize;
+    let mut selected_object_types = Vec::new();
+    let mut ignored_object_types = Vec::new();
+
+    collect_selected_vertex_indices(
+        model,
+        filter,
+        &mut selected_vertices,
+        &mut geometry_scratch,
+        &mut selected_object_types,
+        &mut ignored_object_types,
+    );
+
+    for vertex_ref in &selected_vertices {
+        let Some(vertex) = model.vertices().get(*vertex_ref) else {
+            continue;
+        };
+        let coordinate = vertex.to_array();
+        update_bbox(&mut bbox, coordinate);
+        x_sum += coordinate[0];
+        y_sum += coordinate[1];
+        nr_vertices += 1;
+    }
+
+    SelectedGeometryStats {
+        bbox,
+        centroid: (nr_vertices > 0)
+            .then_some([x_sum / nr_vertices as f64, y_sum / nr_vertices as f64]),
+        selected_vertices,
+        selected_object_types,
+        ignored_object_types,
+    }
 }
 
-#[derive(Deserialize, Debug)]
-pub struct CityObject {
-    #[serde(rename = "type")]
-    pub cotype: CityObjectType,
-    geometry: Option<Vec<Geometry>>,
+fn selected_types_use_unique_assignment(selected_object_types: &[CityObjectType]) -> bool {
+    selected_object_types.iter().any(|cotype| {
+        // Building-like features are assigned once, to the cell with the
+        // highest feature score. Terrain and similar surface features keep
+        // their bbox-spanning duplicate assignment.
+        matches!(
+            cotype,
+            CityObjectType::Building | CityObjectType::BuildingPart
+        )
+    })
+}
+
+fn collect_selected_vertex_indices(
+    model: &cityjson::v2_0::OwnedCityModel,
+    filter: Option<&Vec<CityObjectType>>,
+    selected_vertices: &mut Vec<GeometryVertexIndex<u32>>,
+    geometry_scratch: &mut Vec<GeometryVertexIndex<u32>>,
+    selected_object_types: &mut Vec<CityObjectType>,
+    ignored_object_types: &mut Vec<CityObjectType>,
+) {
+    selected_vertices.clear();
+    selected_object_types.clear();
+    ignored_object_types.clear();
+
+    for (_id, cityobject) in model.cityobjects().iter() {
+        let Some(object_type) = map_cityobject_type(cityobject.type_cityobject()) else {
+            continue;
+        };
+        if is_selected_type(filter, object_type) {
+            if !selected_object_types.contains(&object_type) {
+                selected_object_types.push(object_type);
+            }
+            let geometry_handles = cityobject.geometry().unwrap_or(&[]);
+            for geometry_handle in geometry_handles {
+                let Some(geometry) = model.get_geometry(*geometry_handle) else {
+                    continue;
+                };
+                let Some(indices) = geometry.unique_vertex_indices(geometry_scratch) else {
+                    continue;
+                };
+                selected_vertices.extend_from_slice(indices);
+            }
+        } else if !ignored_object_types.contains(&object_type) {
+            ignored_object_types.push(object_type);
+        }
+    }
+
+    selected_vertices.sort_unstable();
+    selected_vertices.dedup();
+}
+
+fn count_vertices_in_grid(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &GridLayout,
+    bbox: &Bbox,
+) -> CellCounts {
+    if selected_vertices.is_empty() {
+        return CellCounts::default();
+    }
+
+    let vertex_counts = if selected_vertices.len() >= LARGE_FEATURE_VERTEX_COUNT_THRESHOLD {
+        count_vertex_cells_parallel(model, selected_vertices, grid)
+    } else {
+        count_vertex_cells(model, selected_vertices, grid)
+    };
+
+    if vertex_counts.is_empty() {
+        return CellCounts::default();
+    }
+
+    CellCounts::merge_vertex_counts_with_bbox(vertex_counts, grid, bbox)
+}
+
+fn count_unique_assignment_cell(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &GridLayout,
+    bbox: &Bbox,
+) -> Option<(CellId, usize)> {
+    if selected_vertices.is_empty() {
+        return None;
+    }
+
+    if selected_vertices.len() >= LARGE_FEATURE_VERTEX_COUNT_THRESHOLD {
+        let vertex_counts = count_vertex_cells_parallel(model, selected_vertices, grid);
+        if vertex_counts.is_empty() {
+            return None;
+        }
+        return max_merged_vertex_count_with_bbox(&vertex_counts, grid, bbox);
+    }
+
+    UNIQUE_ASSIGNMENT_VERTEX_COUNTS.with_borrow_mut(|vertex_counts| {
+        count_vertex_cells_into(model, selected_vertices, grid, vertex_counts);
+        if vertex_counts.is_empty() {
+            return None;
+        }
+        max_merged_vertex_count_with_bbox(vertex_counts, grid, bbox)
+    })
+}
+
+fn count_vertex_cells(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &GridLayout,
+) -> Vec<(CellId, usize)> {
+    let mut vertex_counts = Vec::with_capacity(selected_vertices.len());
+    count_vertex_cells_into(model, selected_vertices, grid, &mut vertex_counts);
+    vertex_counts
+}
+
+fn count_vertex_cells_into(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &GridLayout,
+    vertex_counts: &mut Vec<(CellId, usize)>,
+) {
+    vertex_counts.clear();
+    let missing_capacity = selected_vertices
+        .len()
+        .saturating_sub(vertex_counts.capacity());
+    if missing_capacity > 0 {
+        vertex_counts.reserve(missing_capacity);
+    }
+
+    let vertices = model.vertices();
+    for vertex_ref in selected_vertices {
+        let Some(vertex) = vertices.get(*vertex_ref) else {
+            continue;
+        };
+        let point = [vertex.x(), vertex.y()];
+        vertex_counts.push((grid.locate_point(&point), 0));
+    }
+    compress_vertex_counts(vertex_counts);
+}
+
+fn compress_vertex_counts(vertex_counts: &mut Vec<(CellId, usize)>) {
+    if vertex_counts.is_empty() {
+        return;
+    }
+
+    vertex_counts.sort_unstable_by_key(|(cellid, _)| *cellid);
+
+    let mut read = 0;
+    let mut write = 0;
+    while read < vertex_counts.len() {
+        let cellid = vertex_counts[read].0;
+        let mut nr_vertices = 1usize;
+        read += 1;
+
+        while read < vertex_counts.len() && vertex_counts[read].0 == cellid {
+            nr_vertices += 1;
+            read += 1;
+        }
+
+        // Keep the historical scoring semantics: the first vertex in a cell
+        // starts from 2, matching BTreeMap::entry(...).or_insert(1) += 1.
+        vertex_counts[write] = (cellid, nr_vertices + 1);
+        write += 1;
+    }
+
+    vertex_counts.truncate(write);
+}
+
+fn count_vertex_cells_parallel(
+    model: &cityjson::v2_0::OwnedCityModel,
+    selected_vertices: &[GeometryVertexIndex<u32>],
+    grid: &GridLayout,
+) -> Vec<(CellId, usize)> {
+    let vertices = model.vertices();
+    selected_vertices
+        .par_iter()
+        .fold(BTreeMap::new, |mut vertex_counts, vertex_ref| {
+            let Some(vertex) = vertices.get(*vertex_ref) else {
+                return vertex_counts;
+            };
+            let point = [vertex.x(), vertex.y()];
+            increment_vertex_count(&mut vertex_counts, grid.locate_point(&point));
+            vertex_counts
+        })
+        .reduce(BTreeMap::new, merge_vertex_count_maps)
+        .into_iter()
+        .collect()
+}
+
+fn max_merged_vertex_count_with_bbox(
+    vertex_counts: &[(CellId, usize)],
+    grid: &GridLayout,
+    bbox: &Bbox,
+) -> Option<(CellId, usize)> {
+    let (columns, rows) = grid.intersect_bbox_ranges(bbox);
+    let min_column = *columns.start();
+    let max_column = *columns.end();
+    let min_row = *rows.start();
+    let max_row = *rows.end();
+    let mut vertex_counts = vertex_counts.iter().copied().peekable();
+    let mut best: Option<(CellId, usize)> = None;
+
+    for row in min_row..=max_row {
+        for column in min_column..=max_column {
+            let bbox_cellid = CellId { row, column };
+            while let Some((cellid, count)) =
+                vertex_counts.next_if(|(cellid, _)| *cellid < bbox_cellid)
+            {
+                update_best_cell(&mut best, cellid, count);
+            }
+
+            if let Some((_, count)) = vertex_counts.next_if(|(cellid, _)| *cellid == bbox_cellid) {
+                update_best_cell(&mut best, bbox_cellid, count + 1);
+            } else {
+                update_best_cell(&mut best, bbox_cellid, 2);
+            }
+        }
+    }
+
+    for (cellid, count) in vertex_counts {
+        update_best_cell(&mut best, cellid, count);
+    }
+
+    best
+}
+
+fn update_best_cell(best: &mut Option<(CellId, usize)>, cellid: CellId, count: usize) {
+    if best.as_ref().is_none_or(|(best_cellid, best_count)| {
+        count > *best_count || (count == *best_count && cellid > *best_cellid)
+    }) {
+        *best = Some((cellid, count));
+    }
+}
+
+fn increment_vertex_count(vertex_counts: &mut BTreeMap<CellId, usize>, cellid: CellId) {
+    *vertex_counts.entry(cellid).or_insert(1) += 1;
+}
+
+fn merge_vertex_count_maps(
+    mut left: BTreeMap<CellId, usize>,
+    right: BTreeMap<CellId, usize>,
+) -> BTreeMap<CellId, usize> {
+    for (cellid, count) in right {
+        match left.get_mut(&cellid) {
+            Some(left_count) => *left_count += count - 1,
+            None => {
+                left.insert(cellid, count);
+            }
+        }
+    }
+    left
+}
+
+#[derive(Default)]
+struct CellCounts {
+    entries: Vec<(CellId, usize)>,
+}
+
+impl CellCounts {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&CellId, &usize)> {
+        self.entries.iter().map(|(cellid, count)| (cellid, count))
+    }
+
+    fn merge_vertex_counts_with_bbox(
+        vertex_counts: Vec<(CellId, usize)>,
+        grid: &GridLayout,
+        bbox: &Bbox,
+    ) -> Self {
+        let (columns, rows) = grid.intersect_bbox_ranges(bbox);
+        let min_column = *columns.start();
+        let max_column = *columns.end();
+        let min_row = *rows.start();
+        let max_row = *rows.end();
+        let bbox_len = (max_column - min_column + 1) * (max_row - min_row + 1);
+        let mut entries = Vec::with_capacity(vertex_counts.len().max(bbox_len));
+        let mut vertex_counts = vertex_counts.into_iter().peekable();
+
+        for row in min_row..=max_row {
+            for column in min_column..=max_column {
+                let bbox_cellid = CellId { row, column };
+                while let Some((cellid, count)) =
+                    vertex_counts.next_if(|(cellid, _)| *cellid < bbox_cellid)
+                {
+                    entries.push((cellid, count));
+                }
+
+                if let Some((_, count)) =
+                    vertex_counts.next_if(|(cellid, _)| *cellid == bbox_cellid)
+                {
+                    entries.push((bbox_cellid, count + 1));
+                } else {
+                    entries.push((bbox_cellid, 2));
+                }
+            }
+        }
+
+        entries.extend(vertex_counts);
+        Self { entries }
+    }
+}
+
+pub(crate) fn is_selected_type(
+    filter: Option<&Vec<CityObjectType>>,
+    object_type: CityObjectType,
+) -> bool {
+    match filter {
+        Some(types) => types.contains(&object_type),
+        None => true,
+    }
+}
+
+pub(crate) fn map_cityobject_type<SS: cityjson::resources::storage::StringStorage>(
+    object_type: &cityjson::v2_0::CityObjectType<SS>,
+) -> Option<CityObjectType> {
+    use cityjson::v2_0::CityObjectType as CjType;
+
+    Some(match object_type {
+        CjType::Bridge => CityObjectType::Bridge,
+        CjType::BridgePart => CityObjectType::BridgePart,
+        CjType::BridgeInstallation => CityObjectType::BridgeInstallation,
+        CjType::BridgeConstructiveElement => CityObjectType::BridgeConstructiveElement,
+        CjType::BridgeRoom => CityObjectType::BridgeRoom,
+        CjType::BridgeFurniture => CityObjectType::BridgeFurniture,
+        CjType::Building => CityObjectType::Building,
+        CjType::BuildingPart => CityObjectType::BuildingPart,
+        CjType::BuildingInstallation => CityObjectType::BuildingInstallation,
+        CjType::BuildingConstructiveElement => CityObjectType::BuildingConstructiveElement,
+        CjType::BuildingFurniture => CityObjectType::BuildingFurniture,
+        CjType::BuildingStorey => CityObjectType::BuildingStorey,
+        CjType::BuildingRoom => CityObjectType::BuildingRoom,
+        CjType::BuildingUnit => CityObjectType::BuildingUnit,
+        CjType::CityFurniture => CityObjectType::CityFurniture,
+        CjType::CityObjectGroup => CityObjectType::CityObjectGroup,
+        CjType::GenericCityObject => CityObjectType::GenericCityObject,
+        CjType::LandUse => CityObjectType::LandUse,
+        CjType::OtherConstruction => CityObjectType::OtherConstruction,
+        CjType::PlantCover => CityObjectType::PlantCover,
+        CjType::SolitaryVegetationObject => CityObjectType::SolitaryVegetationObject,
+        CjType::TINRelief => CityObjectType::TINRelief,
+        CjType::WaterBody => CityObjectType::WaterBody,
+        CjType::Road => CityObjectType::Road,
+        CjType::Railway => CityObjectType::Railway,
+        CjType::Waterway => CityObjectType::Waterway,
+        CjType::TransportSquare => CityObjectType::TransportSquare,
+        CjType::Tunnel => CityObjectType::Tunnel,
+        CjType::TunnelPart => CityObjectType::TunnelPart,
+        CjType::TunnelInstallation => CityObjectType::TunnelInstallation,
+        CjType::TunnelConstructiveElement => CityObjectType::TunnelConstructiveElement,
+        CjType::TunnelHollowSpace => CityObjectType::TunnelHollowSpace,
+        CjType::TunnelFurniture => CityObjectType::TunnelFurniture,
+        CjType::Default | CjType::Extension(_) => return None,
+        _ => return None,
+    })
+}
+
+fn update_bbox(bbox: &mut Option<Bbox>, coordinate: [f64; 3]) {
+    match bbox {
+        Some(current) => {
+            if coordinate[0] < current[0] {
+                current[0] = coordinate[0];
+            }
+            if coordinate[1] < current[1] {
+                current[1] = coordinate[1];
+            }
+            if coordinate[2] < current[2] {
+                current[2] = coordinate[2];
+            }
+            if coordinate[0] > current[3] {
+                current[3] = coordinate[0];
+            }
+            if coordinate[1] > current[4] {
+                current[4] = coordinate[1];
+            }
+            if coordinate[2] > current[5] {
+                current[5] = coordinate[2];
+            }
+        }
+        None => {
+            *bbox = Some([
+                coordinate[0],
+                coordinate[1],
+                coordinate[2],
+                coordinate[0],
+                coordinate[1],
+                coordinate[2],
+            ])
+        }
+    }
+}
+
+fn merge_bbox(target: &mut Bbox, other: &Bbox) {
+    if other[0] < target[0] {
+        target[0] = other[0];
+    }
+    if other[1] < target[1] {
+        target[1] = other[1];
+    }
+    if other[2] < target[2] {
+        target[2] = other[2];
+    }
+    if other[3] > target[3] {
+        target[3] = other[3];
+    }
+    if other[4] > target[4] {
+        target[4] = other[4];
+    }
+    if other[5] > target[5] {
+        target[5] = other[5];
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::from_str;
+    use cityjson_lib::json::staged::from_feature_file_with_base;
 
-    fn test_data_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("data")
+    fn resource_path(name: &str) -> PathBuf {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let direct = manifest.join("resources").join("data").join(name);
+        if direct.exists() {
+            direct
+        } else {
+            manifest
+                .join("..")
+                .join("resources")
+                .join("data")
+                .join(name)
+        }
     }
 
     #[test]
@@ -950,55 +1335,452 @@ mod tests {
     }
 
     #[test]
-    fn test_cityjsonmetadata() -> serde_json::Result<()> {
-        let cityjson_str = r#"{
+    fn test_feature_file_loads_through_cjlib() {
+        let pb = resource_path("3dbag_feature_x71.city.jsonl");
+        let base = std::fs::read(resource_path("3dbag_x00.city.json")).unwrap();
+        let model = from_feature_file_with_base(pb, &base).unwrap();
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        assert!(stats.bbox.is_some());
+        assert!(!stats.selected_vertices.is_empty());
+        let bbox = stats.bbox.unwrap();
+        assert!(bbox[0] > 0.0);
+        assert!(bbox[1] > 0.0);
+    }
+
+    fn parse_feature(feature: serde_json::Value) -> cityjson::v2_0::OwnedCityModel {
+        cityjson_lib::json::from_feature_slice(&serde_json::to_vec(&feature).unwrap()).unwrap()
+    }
+
+    fn unique_assignment_winner_from_full_counts(counts: &CellCounts) -> Option<(CellId, usize)> {
+        counts
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1))
+            .map(|(cellid, count)| (*cellid, *count))
+    }
+
+    fn assert_unique_assignment_matches_full_counts(
+        model: &cityjson::v2_0::OwnedCityModel,
+        object_type: CityObjectType,
+        grid: &crate::spatial_structs::SquareGrid,
+    ) -> (CellId, usize) {
+        let stats = selected_geometry_stats(model, Some(&vec![object_type]));
+        let bbox = stats.bbox.unwrap();
+        let layout = grid.layout();
+        let full_counts = count_vertices_in_grid(model, &stats.selected_vertices, &layout, &bbox);
+        let expected = unique_assignment_winner_from_full_counts(&full_counts);
+        let optimized =
+            count_unique_assignment_cell(model, &stats.selected_vertices, &layout, &bbox);
+
+        assert_eq!(optimized, expected);
+        optimized.expect("unique assignment should produce a winning cell")
+    }
+
+    #[test]
+    fn unique_assignment_single_cell_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 100.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn unique_assignment_multi_cell_counts_match_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3, 4]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [2, 0, 0],
+                [150, 0, 0],
+                [250, 0, 0]
+            ]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn unique_assignment_equal_count_tie_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [150, 0, 0],
+                [151, 0, 0]
+            ]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 200.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[150.0, 0.0]));
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn unique_assignment_large_bbox_keeps_bbox_only_cells_lower_scored() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [250, 250, 0], [0, 250, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) =
+            assert_unique_assignment_matches_full_counts(&model, CityObjectType::Building, &grid);
+
+        assert_eq!(cellid, grid.locate_point(&[250.0, 250.0]));
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn unique_assignment_building_part_matches_full_cell_counts() {
+        let model = parse_feature(serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-part-1",
+            "CityObjects": {
+                "building-part-1": {
+                    "type": "BuildingPart",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                }
+            },
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        }));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 100.0, 100.0, 10.0],
+            100,
+            7415,
+        );
+
+        let (cellid, count) = assert_unique_assignment_matches_full_counts(
+            &model,
+            CityObjectType::BuildingPart,
+            &grid,
+        );
+
+        assert_eq!(cellid, grid.locate_point(&[0.0, 0.0]));
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn count_vertices_in_grid_only_counts_selected_vertices() {
+        let base = serde_json::to_vec(&serde_json::json!({
             "type": "CityJSON",
-            "version": "1.1",
+            "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
             "transform": {
                 "scale": [1.0, 1.0, 1.0],
                 "translate": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let feature = serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2]]]
+                    }]
+                },
+                "road-1": {
+                    "type": "Road",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[3, 4, 5]]]
+                    }]
+                }
             },
-            "metadata": {
-                "referenceSystem": "https://www.opengis.net/def/crs/EPSG/0/7415",
-                "title": "MyTitle"
-            },
-            "CityObjects": {},
-            "vertices": []
-        }"#;
-        let cm: CityJSONMetadata = from_str(cityjson_str)?;
-        println!("{:#?}", cm.metadata.reference_system);
-        println!("{:#?}, {:#?}", cm.transform.scale, cm.transform.translate);
-        Ok(())
-    }
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [100, 100, 0],
+                [101, 100, 0],
+                [100, 101, 0]
+            ]
+        });
+        let feature_path = std::env::temp_dir().join(format!(
+            "tyler-parser-selected-vertices-{}.city.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
 
-    #[test]
-    fn test_cityjsonfeaturevertices() -> serde_json::Result<()> {
-        let cityjsonfeature_str = r#"{"type":"CityJSONFeature","CityObjects":{"b70a1e56f-debe-11e7-8ec4-89be260623ee":{"type":"Road","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2]],[[1,3,4]],[[1,0,3]],[[2,5,0]],[[2,6,5]],[[7,8,6]],[[9,10,11]],[[10,12,13]],[[14,15,16]],[[17,14,16]],[[18,19,20]],[[21,22,23]],[[24,25,26]],[[20,27,25]],[[20,19,27]],[[28,29,30]],[[9,23,10]],[[31,32,28]],[[31,33,32]],[[34,31,28]],[[35,34,28]],[[35,28,30]],[[36,22,37]],[[30,29,18]],[[36,38,39]],[[18,29,19]],[[40,26,41]],[[42,40,41]],[[24,20,25]],[[17,43,42]],[[40,42,43]],[[26,40,24]],[[43,17,16]],[[15,14,39]],[[39,38,15]],[[37,38,36]],[[21,37,22]],[[9,21,23]],[[11,10,44]],[[44,10,13]],[[13,12,7]],[[7,12,8]],[[2,7,6]],[[45,46,4]],[[46,1,4]],[[47,46,45]],[[48,47,45]]]}],"attributes":{"3df_id":"G0200.42b3d391aef50268e0530a0a28492340"}}},"vertices":[[23241731,-6740287,16980],[23243271,-6737886,17050],[23241947,-6737751,17030],[23243688,-6740239,16990],[23244961,-6739729,16990],[23241021,-6740116,16970],[23240334,-6739867,16960],[23240760,-6737152,17020],[23239680,-6739542,16950],[23207572,-6713437,17050],[23206398,-6715354,17010],[23211403,-6716175,17030],[23239066,-6739146,16950],[23224416,-6725473,17000],[23154567,-6713216,17160],[23200871,-6711570,17040],[23153430,-6710683,17210],[23152498,-6713168,17190],[23148683,-6700000,17400],[23145589,-6704251,17390],[23148683,-6706399,17330],[23205998,-6712657,17050],[23204080,-6714161,17010],[23205285,-6714668,17010],[23149399,-6707907,17300],[23146208,-6708310,17330],[23147259,-6710093,17300],[23145640,-6706320,17370],[23146890,-6619484,17810],[23145656,-6700000,17440],[23149034,-6662558,17710],[23140404,-6619323,17890],[23139266,-6623569,17820],[23139266,-6619957,17790],[23149466,-6614336,17770],[23149281,-6634334,17790],[23202811,-6713844,17010],[23204339,-6712080,17050],[23202621,-6711716,17040],[23201509,-6713726,17010],[23150482,-6709178,17270],[23148723,-6711555,17260],[23150508,-6712602,17220],[23151857,-6710125,17240],[23219449,-6721924,17010],[23246174,-6738901,16990],[23244554,-6737539,17080],[23245629,-6736755,17120],[23246913,-6738228,17040]],"id":"b70a1e56f-debe-11e7-8ec4-89be260623ee"}"#;
-        let cf: CityJSONFeatureVertices = from_str(cityjsonfeature_str)?;
-        for v in cf.vertices.iter() {
-            println!("{:#?}", v.first());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_centroid() -> serde_json::Result<()> {
-        let pb: PathBuf = test_data_dir().join("3dbag_feature_x71.city.jsonl");
-        let cf: CityJSONFeatureVertices = CityJSONFeatureVertices::from_file(&pb).unwrap();
-        let ctr_quantized = cf.centroid_qc();
-        println!("quantized centroid: {:#?}", ctr_quantized);
-
-        let pb: PathBuf = test_data_dir().join("3dbag_x00.city.json");
-        let cm: CityJSONMetadata = CityJSONMetadata::from_file(&pb).unwrap();
-
-        let ctr_real_world: (f64, f64) = (
-            (ctr_quantized[0] as f64 * cm.transform.scale[0]) + cm.transform.translate[0],
-            (ctr_quantized[1] as f64 * cm.transform.scale[1]) + cm.transform.translate[1],
+        let model = from_feature_file_with_base(&feature_path, &base).unwrap();
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 200.0, 200.0, 10.0],
+            100,
+            7415,
         );
-        println!("real-world centroid: {:#?}", ctr_real_world);
+        let counts = count_vertices_in_grid(
+            &model,
+            &stats.selected_vertices,
+            &grid.layout(),
+            &stats.bbox.unwrap(),
+        );
 
-        Ok(())
+        let building_cell = grid.locate_point(&[0.0, 0.0]);
+        let road_cell = grid.locate_point(&[100.0, 100.0]);
+
+        assert!(counts.iter().any(|(cellid, _)| *cellid == building_cell));
+        assert!(!counts.iter().any(|(cellid, _)| *cellid == road_cell));
+
+        let _ = std::fs::remove_file(feature_path);
+    }
+
+    #[test]
+    fn count_vertices_in_grid_matches_reference_hashmap_counts() {
+        let base = serde_json::to_vec(&serde_json::json!({
+            "type": "CityJSON",
+            "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
+            "transform": {
+                "scale": [1.0, 1.0, 1.0],
+                "translate": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let feature = serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building",
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "1.0",
+                        "boundaries": [[[0, 1, 2, 3]]]
+                    }]
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [250, 250, 0]
+            ]
+        });
+        let feature_path = std::env::temp_dir().join(format!(
+            "tyler-parser-grid-counts-{}.city.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
+
+        let model = from_feature_file_with_base(&feature_path, &base).unwrap();
+        let stats = selected_geometry_stats(&model, Some(&vec![CityObjectType::Building]));
+        let bbox = stats.bbox.unwrap();
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+
+        let layout = grid.layout();
+        let optimized = count_vertices_in_grid(&model, &stats.selected_vertices, &layout, &bbox);
+        let reference =
+            reference_count_vertices_in_grid(&model, &stats.selected_vertices, &grid, &bbox);
+
+        assert_eq!(
+            optimized
+                .iter()
+                .map(|(cellid, count)| (*cellid, *count))
+                .collect::<Vec<_>>(),
+            reference
+        );
+
+        let optimized = optimized
+            .iter()
+            .map(|(cellid, count)| (*cellid, *count))
+            .collect::<BTreeMap<_, _>>();
+        let same_cell = grid.locate_point(&[0.0, 0.0]);
+        let bbox_only_cell = grid.locate_point(&[200.0, 0.0]);
+        assert_eq!(optimized.get(&same_cell), Some(&5));
+        assert_eq!(optimized.get(&bbox_only_cell), Some(&2));
+
+        let _ = std::fs::remove_file(feature_path);
+    }
+
+    #[test]
+    fn count_vertices_in_grid_large_feature_path_matches_reference_hashmap_counts() {
+        let base = serde_json::to_vec(&serde_json::json!({
+            "type": "CityJSON",
+            "version": "2.0",
+            "CityObjects": {},
+            "vertices": [],
+            "transform": {
+                "scale": [1.0, 1.0, 1.0],
+                "translate": [0.0, 0.0, 0.0]
+            }
+        }))
+        .unwrap();
+        let feature = serde_json::json!({
+            "type": "CityJSONFeature",
+            "id": "building-1",
+            "CityObjects": {
+                "building-1": {
+                    "type": "Building"
+                }
+            },
+            "vertices": [
+                [0, 0, 0],
+                [1, 0, 0],
+                [250, 250, 0]
+            ]
+        });
+        let feature_path = std::env::temp_dir().join(format!(
+            "tyler-parser-large-grid-counts-{}.city.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&feature_path, serde_json::to_vec(&feature).unwrap()).unwrap();
+
+        let model = from_feature_file_with_base(&feature_path, &base).unwrap();
+        let bbox: Bbox = [0.0, 0.0, 0.0, 250.0, 250.0, 0.0];
+        let grid = crate::spatial_structs::SquareGrid::new(
+            &[0.0, 0.0, 0.0, 300.0, 300.0, 10.0],
+            100,
+            7415,
+        );
+        let selected_vertices = (0..LARGE_FEATURE_VERTEX_COUNT_THRESHOLD)
+            .map(|index| {
+                GeometryVertexIndex::new(match index % 4 {
+                    0 | 3 => 0,
+                    1 => 1,
+                    _ => 2,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let layout = grid.layout();
+        let optimized = count_vertices_in_grid(&model, &selected_vertices, &layout, &bbox);
+        let reference = reference_count_vertices_in_grid(&model, &selected_vertices, &grid, &bbox);
+
+        assert_eq!(
+            optimized
+                .iter()
+                .map(|(cellid, count)| (*cellid, *count))
+                .collect::<Vec<_>>(),
+            reference
+        );
+
+        let _ = std::fs::remove_file(feature_path);
+    }
+
+    fn reference_count_vertices_in_grid(
+        model: &cityjson::v2_0::OwnedCityModel,
+        selected_vertices: &[GeometryVertexIndex<u32>],
+        grid: &crate::spatial_structs::SquareGrid,
+        bbox: &Bbox,
+    ) -> Vec<(CellId, usize)> {
+        let mut cell_vtx_cnt = std::collections::BTreeMap::new();
+
+        for vertex_ref in selected_vertices {
+            let Some(vertex) = model.vertices().get(*vertex_ref) else {
+                continue;
+            };
+            let point = [vertex.x(), vertex.y()];
+            let cellid = grid.locate_point(&point);
+            *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+        }
+
+        if !selected_vertices.is_empty() {
+            for cellid in grid.intersect_bbox(bbox) {
+                *cell_vtx_cnt.entry(cellid).or_insert(1) += 1;
+            }
+        }
+
+        cell_vtx_cnt.into_iter().collect()
     }
 }
-
-pub type FeatureSet = Vec<Feature>;

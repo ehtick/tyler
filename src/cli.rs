@@ -18,62 +18,62 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Cli {
-    /// Main CityJSON file (.city.json), containing the coordinate reference system and
-    /// transformation properties.
-    #[arg(short, long, value_parser = existing_canonical_path)]
-    pub metadata: PathBuf,
-    /// Directory of CityJSONFeatures (.city.jsonl). The directory and all its
-    /// subdirectories are searched recursively for feature files.
-    #[arg(short, long, value_parser = existing_canonical_path)]
-    pub features: PathBuf,
+    /// Input dataset root. Must be a cjindex-compatible dataset in NDJSON,
+    /// CityJSON, or feature-files layout.
+    #[arg(value_parser = existing_canonical_path)]
+    pub input: PathBuf,
     /// Directory for the output.
     #[arg(short, long)]
     pub output: PathBuf,
     // /// Output format.
     // #[arg(long, value_enum)]
     // pub format: crate::Formats,
-    /// The CityObject type to use for the 3D Tiles
-    /// (https://www.cityjson.org/specs/1.1.3/#the-different-city-objects).
+    /// The CityObject type to include
+    /// (https://www.cityjson.org/specs/2.0.1/#city-objects).
     /// You can specify it multiple times.
     #[arg(long, value_enum)]
     pub object_type: Option<Vec<crate::parser::CityObjectType>>,
     /// The CityObject attribute name and value type to include as feature attribute when the
-    /// output is 3D Tiles. Format: <attribute_name>:<attribute_type> eg: 'name1:string'.
+    /// output is 3D Tiles. Format: <attribute_name>:<attribute_type>,<attribute_name>:<attribute_type>
+    /// eg: 'name1:string,name2:bool'.
     /// Possible value types are, 'bool', 'int', 'float', 'string'.
-    /// You can specify it multiple times.
-    #[arg(long)]
-    pub object_attribute: Option<Vec<String>>,
-    /// The CityObject attribute
+    #[arg(long, value_delimiter = ',')]
+    pub object_attributes: Option<Vec<String>>,
     /// The metadata class to assign to the property table when the output is
     /// 3D Tiles (https://github.com/CesiumGS/glTF/tree/3d-tiles-next/extensions/2.0/Vendor/EXT_structural_metadata#class).
-    #[arg(long = "3dtiles-metadata-class")]
-    pub cesium3dtiles_metadata_class: Option<String>,
+    #[arg(long = "3dtiles-metadata-class", default_value = "citymodel")]
+    pub cesium3dtiles_metadata_class: String,
     /// Create implicit tiling when the output format is 3D Tiles (https://docs.ogc.org/cs/22-025r4/22-025r4.html#toc31).
     /// By default, explicit tiling is created for the 3D Tiles output.
     #[arg(long = "3dtiles-implicit")]
     pub cesium3dtiles_implicit: bool,
     /// Generate and write the Tileset only, without exporting the glTF tiles, when the output format is 3D Tiles (https://docs.ogc.org/cs/22-025r4/22-025r4.html#toc31).
-    #[arg(long = "3dtiles-tileset-only")]
-    pub cesium3dtiles_tileset_only: bool,
+    #[arg(long = "debug-3dtiles-tileset-only")]
+    pub debug_cesium3dtiles_tileset_only: bool,
     /// Use the tile boundingVolume as the content boundingVolume, instead of calculating the content boundingVolume from the data.
     #[arg(long = "3dtiles-content-bv-from-tile")]
     pub cesium3dtiles_content_bv_from_tile: bool,
+    /// Clip tile content geometry to the tile bounding box before writing the GLB.
+    #[arg(long = "3dtiles-content-clip-to-tile-bounds")]
+    pub cesium3dtiles_content_clip_to_tile_bounds: bool,
     /// Add the boundingVolume of the content for the the tiles that have content.
     #[arg(long = "3dtiles-content-add-bv")]
     pub cesium3dtiles_content_add_bv: bool,
-    /// Set the geometric error (see 3D Tiles specification) on the parent nodes of leafs. This controls at what
-    /// camera distance leaf nodes become visible. Higher values make content visible earlier when zooming in.
-    #[arg(long, short = 'e', default_value = "12")]
-    pub geometric_error_above_leaf: Option<f64>,
+    /// Set the geometric error factor (see 3D Tiles specification) for internal tiles.
+    /// Internal tile geometricError is computed as tile width multiplied by this factor.
+    /// Higher values make detailed content visible earlier when zooming in.
+    #[arg(long = "3dtiles-geometric-error-factor", default_value = "0.024")]
+    pub cesium3dtiles_geometric_error_factor: f64,
     /// Set the 2D cell size for the grid that is used for constructing the quadtree.
     /// In input units (eg. meters). Note that the cell size will be adjusted so that it is
     /// possible to construct a tightly fit square, containing 4^n cells. The final cell size will
     /// larger than this value.
     #[arg(long, default_value = "250")]
     pub grid_cellsize: Option<u32>,
-    /// Generate the quadtree directly from a grid.tsv file, skipping the extent computation and feature indexing. A grid.tsv file is created with the --grid-export option. Used for debugging.
-    #[arg(long)]
-    pub grid_file: Option<String>,
+    /// Load grid.tsv debug output and use it for quadtree construction. If a sibling
+    /// features.tsv exists, it is also loaded.
+    #[arg(long = "debug-load-grid", value_parser = existing_canonical_path)]
+    pub debug_load_grid: Option<PathBuf>,
     /// Limit the minimum z coordinate for the bounding box that is computed from the
     /// features. Useful if the features contain errors with extremely small z
     /// coordinates. In input units (eg. meters).
@@ -84,14 +84,13 @@ pub struct Cli {
     /// coordinates. In input units (eg. meters).
     #[arg(long)]
     pub grid_maxz: Option<i32>,
-    /// Export the grid into .tsv files in the working
-    /// directory. Used for debugging.
-    #[arg(long)]
-    pub grid_export: bool,
+    /// Export the grid into .tsv files in the debug output directory.
+    #[arg(long = "debug-dump-grid")]
+    pub debug_dump_grid: bool,
     /// Export the grid, and also the feature centroids into .tsv files in the working
     /// directory. Used for debugging.
-    #[arg(long)]
-    pub grid_export_features: bool,
+    #[arg(long = "debug-dump-grid-features")]
+    pub debug_dump_grid_features: bool,
     /// Load instances from this directory.
     /// In debug mode, tyler writes the generated world, quadtree etc. instances to .bincode files, which later can be used for debugging.
     /// When this argument is specified, tyler will load the instances from the .bincode files that are available in the directory.
@@ -100,20 +99,17 @@ pub struct Cli {
     /// The maximum number of vertices in a leaf of the quadtree.
     #[arg(long, default_value = "42000")]
     pub qtree_capacity: Option<usize>,
-    /// Path to the geoflow executable for clipping and exporting the gltf files.
-    #[arg(long, value_parser = existing_path)]
-    pub exe_geof: Option<PathBuf>,
+    /// Dump debug data for the current run, including `.bincode` snapshots and
+    /// per-tile intermediary CityJSONFeature streams.
+    #[arg(long = "debug-dump-data")]
+    pub debug_dump_data: bool,
+    /// Copy inherited parent attributes onto geometry-bearing CityObjects before GLB conversion.
+    /// This is useful for 3DBAG/roofer-style parent-child models where attributes live on the parent.
     #[arg(long)]
-    pub verbose_geof: bool,
-    /// Maximum error that is allowed in mesh simplification to reduce the number of vertices. Value should be a float that represents that maximum allowed error in meters. Ignored for building object types.
-    #[arg(long, default_value = "1.0")]
-    pub simplification_max_error: Option<f64>,
+    pub include_parent_attributes: bool,
     /// Compute smooth vertex normals.
     #[arg(long)]
     pub smooth_normals: bool,
-    /// Wait for the tile conversion process to finish, or terminate it if it is not finished after the provided number of seconds.
-    #[arg(long)]
-    pub timeout: Option<u64>,
     /// LoD to use in output for Building features
     #[arg(long)]
     pub lod_building: Option<String>,
@@ -246,12 +242,6 @@ pub struct Cli {
     // /// installed.
     // #[arg(long, value_parser = existing_path)]
     // pub exe_python: Option<PathBuf>,
-    /// Assume 3DBAG Building-BuildingPart structure
-    #[arg(long)]
-    pub bag3d_buildings_mode: bool,
-    /// Push attributes for every BuildingPart (in bag3d_buildings_mode only)
-    #[arg(long)]
-    pub bag3d_attributes_per_part: bool,
 }
 
 fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
@@ -263,19 +253,6 @@ fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
         }
     } else {
         Err(format!("could not resolve the path {:?}", s))
-    }
-}
-
-/// We don't want to canonicalize paths to executables, especially a python exe from a
-/// virtualenv, because the symlink would get resolved and we would end up with a path
-/// to the python interpreter that was used for creating the virtualenv, and not the
-/// interpreter that links to the virtualenv.
-fn existing_path(s: &str) -> Result<PathBuf, String> {
-    let p = Path::new(s).to_path_buf();
-    if p.exists() {
-        Ok(p)
-    } else {
-        Err(format!("path {:?} does not exist", &p))
     }
 }
 
@@ -299,18 +276,59 @@ fn hex_color(s: &str) -> Result<String, String> {
 mod tests {
     use super::Cli;
     use clap::{CommandFactory, Parser};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn required_args() -> Vec<&'static str> {
+    fn resource_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("data")
+            .join(name)
+    }
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tyler-{prefix}-{unique}"));
+        fs::create_dir_all(&path).expect("create test dir");
+        path
+    }
+
+    fn legacy_dataset_dir() -> PathBuf {
+        let dataset_dir = unique_test_dir("cli-legacy");
+        let features_dir = dataset_dir.join("features");
+        fs::create_dir_all(&features_dir).expect("create features dir");
+        fs::copy(
+            resource_path("3dbag_x00.city.json"),
+            dataset_dir.join("metadata.city.json"),
+        )
+        .expect("copy metadata");
+        fs::copy(
+            resource_path("3dbag_feature_x71.city.jsonl"),
+            features_dir.join("sample.city.jsonl"),
+        )
+        .expect("copy feature");
+        dataset_dir
+    }
+
+    fn required_args(input_dir: &Path) -> Vec<String> {
         vec![
-            "tyler",
-            "-m",
-            "metadata.city.json",
-            "-f",
-            env!("CARGO_MANIFEST_DIR"),
-            "-o",
-            env!("CARGO_MANIFEST_DIR"),
-            "--format",
-            "3dtiles",
+            "tyler".to_string(),
+            input_dir.display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+        ]
+    }
+
+    fn dataset_args() -> Vec<String> {
+        vec![
+            "tyler".to_string(),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/data").to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
         ]
     }
 
@@ -319,16 +337,96 @@ mod tests {
         Cli::command().debug_assert()
     }
 
-    /// Can we pass multiple CityObject types?
+    /// CLI arguments review item 7: the CityJSON v2.0 `--object-type` parser
+    /// still accepts repeated occurrences and stores all requested types.
     #[test]
     fn verify_object_types() {
-        let mut types: Vec<&'static str> =
-            vec!["--object-type", "Building", "--object-type", "PlantCover"];
-        let mut args = required_args();
-        args.append(&mut types);
+        let dataset_dir = legacy_dataset_dir();
+        let types: Vec<String> = vec![
+            "--object-type".to_string(),
+            "Building".to_string(),
+            "--object-type".to_string(),
+            "PlantCover".to_string(),
+        ];
+        let mut args = required_args(&dataset_dir);
+        args.extend(types);
         let cli = Cli::try_parse_from(args).unwrap();
         let otypes = &cli.object_type.unwrap();
         assert!(otypes.contains(&crate::parser::CityObjectType::Building));
         assert!(otypes.contains(&crate::parser::CityObjectType::PlantCover));
+    }
+
+    /// CLI arguments review item 10: `--include-parent-attributes` remains the
+    /// supported flag after removing `--bag3d-attributes-per-part`.
+    #[test]
+    fn verify_include_parent_attributes_flag() {
+        let dataset_dir = legacy_dataset_dir();
+        let mut args = required_args(&dataset_dir);
+        args.push("--include-parent-attributes".to_string());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.include_parent_attributes);
+    }
+
+    /// CLI arguments review item 12: `--3dtiles-geometric-error-factor`
+    /// replaces the old flag name and still parses the configured float value.
+    #[test]
+    fn verify_geometric_error_factor() {
+        let dataset_dir = legacy_dataset_dir();
+        let mut args = required_args(&dataset_dir);
+        args.extend([
+            "--3dtiles-geometric-error-factor".to_string(),
+            "0.05".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!((cli.cesium3dtiles_geometric_error_factor - 0.05).abs() < f64::EPSILON);
+    }
+
+    /// CLI arguments review item 8: `--object-attributes` now accepts a
+    /// comma-separated `name:type` mapping list and splits it into entries.
+    #[test]
+    fn verify_object_attributes_csv_mapping() {
+        let dataset_dir = legacy_dataset_dir();
+        let mut args = required_args(&dataset_dir);
+        args.extend([
+            "--object-attributes".to_string(),
+            "name:string,levels:int,occupied:bool".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            cli.object_attributes,
+            Some(vec![
+                "name:string".to_string(),
+                "levels:int".to_string(),
+                "occupied:bool".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn verify_single_input_arg_for_dataset_root() {
+        let cli = Cli::try_parse_from(dataset_args()).unwrap();
+        assert_eq!(
+            cli.input,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("data")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reject_legacy_input_flags() {
+        let dataset_dir = legacy_dataset_dir();
+        let args = vec![
+            "tyler".to_string(),
+            "--metadata".to_string(),
+            dataset_dir.join("metadata.city.json").display().to_string(),
+            "--features".to_string(),
+            dataset_dir.join("features").display().to_string(),
+            "-o".to_string(),
+            env!("CARGO_MANIFEST_DIR").to_string(),
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
     }
 }

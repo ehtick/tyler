@@ -19,6 +19,7 @@ pub mod cesium3dtiles {
     //! Supported version: 1.1.
     //! Not supported: `extras`.
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::collections::VecDeque;
     use std::fmt::{Display, Formatter};
     use std::fs::File;
@@ -31,6 +32,7 @@ pub mod cesium3dtiles {
     use serde::{Deserialize, Serialize};
     use serde_repr::{Deserialize_repr, Serialize_repr};
 
+    use crate::coordinates::RootEnuFrame;
     use crate::proj::Proj;
     use crate::spatial_structs::{Bbox, CellId, QuadTree, QuadTreeNodeId, SquareGrid};
 
@@ -54,6 +56,17 @@ pub mod cesium3dtiles {
     }
 
     impl Tileset {
+        fn normalize_tileset_geometric_error(
+            root: &Tile,
+            geometric_error: GeometricError,
+        ) -> GeometricError {
+            if root.children.is_none() {
+                geometric_error.max(f64::EPSILON)
+            } else {
+                geometric_error
+            }
+        }
+
         /// Write the tileset to a `tileset.json` file
         pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
             let file_out = File::create(path.as_ref())?;
@@ -153,35 +166,44 @@ pub mod cesium3dtiles {
         pub fn from_quadtree(
             quadtree: &QuadTree,
             world: &crate::parser::World,
-            geometric_error_above_leaf: f64,
-            arg_cellsize: u32,
+            geometric_error_factor: f64,
+            _arg_cellsize: u32,
             arg_minz: Option<i32>,
             arg_maxz: Option<i32>,
             content_bv_from_tile: bool,
             content_add_bv: bool,
+            root_enu_frame: &RootEnuFrame,
         ) -> Self {
             let crs_from = format!("EPSG:{}", world.crs.to_epsg().unwrap());
-            // Because we have a boundingVolume.box. For a boundingVolume.region we need 4979.
-            let crs_to = "EPSG:4978";
-            let transformer = Proj::new_known_crs(&crs_from, crs_to, None).unwrap();
-            // y-up to z-up transform needed because we are using gltf assets, which is y-up
-            // https://github.com/CesiumGS/3d-tiles/tree/main/specification#y-up-to-z-up
-            // let y_up_to_z_up = Transform([
-            //     1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-            // ]);
+            let transformer = Proj::new_known_crs(&crs_from, "EPSG:4979", None).unwrap();
+            let root_bbox = quadtree.bbox(&world.grid);
+            let root_geometric_error = ((root_bbox[3] - root_bbox[0])
+                .max(root_bbox[4] - root_bbox[1]))
+                * geometric_error_factor;
 
             let root = Self::generate_tiles(
                 quadtree,
                 world,
                 &transformer,
-                geometric_error_above_leaf,
-                arg_cellsize,
+                geometric_error_factor,
                 arg_minz,
                 arg_maxz,
                 content_bv_from_tile,
                 content_add_bv,
             );
-            // root.transform = Some(y_up_to_z_up);
+            log::info!(
+                "Root ENU frame - input CRS origin: [{:.2}, {:.2}, {:.2}], geodetic: [{:.8}, {:.8}, {:.2}], ECEF: [{:.2}, {:.2}, {:.2}]",
+                root_enu_frame.source_origin[0],
+                root_enu_frame.source_origin[1],
+                root_enu_frame.source_origin[2],
+                root_enu_frame.geodetic_origin[0],
+                root_enu_frame.geodetic_origin[1],
+                root_enu_frame.geodetic_origin[2],
+                root_enu_frame.ecef_origin[0],
+                root_enu_frame.ecef_origin[1],
+                root_enu_frame.ecef_origin[2],
+            );
+            let root_transform = Transform(root_enu_frame.transform());
 
             // Using gltf tile content
             let mut extensions: Extensions = HashMap::new();
@@ -191,14 +213,20 @@ pub mod cesium3dtiles {
             };
             extensions.insert(ExtensionName::ContentGltf, e1);
 
+            // Apply root transform to root tile
+            let mut root_with_transform = root;
+            root_with_transform.transform = Some(root_transform);
+            let geometric_error =
+                Self::normalize_tileset_geometric_error(&root_with_transform, root_geometric_error);
+
             Self {
                 asset: Default::default(),
-                geometric_error: geometric_error_above_leaf + root.geometric_error * 1.5,
-                root,
+                geometric_error,
+                root: root_with_transform,
                 properties: None,
-                extensions_used: None,
-                extensions_required: None,
-                extensions: None,
+                extensions_used: Some(vec![ExtensionName::ContentGltf]),
+                extensions_required: Some(vec![ExtensionName::ContentGltf]),
+                extensions: Some(extensions),
             }
         }
 
@@ -210,8 +238,7 @@ pub mod cesium3dtiles {
             quadtree: &QuadTree,
             world: &crate::parser::World,
             transformer: &Proj,
-            geometric_error_above_leaf: f64,
-            arg_cellsize: u32,
+            geometric_error_factor: f64,
             arg_minz: Option<i32>,
             arg_maxz: Option<i32>,
             content_bv_from_tile: bool,
@@ -230,34 +257,27 @@ pub mod cesium3dtiles {
                 // But it can happen with faulty data, eg. 3D Basisvoorziening,
                 // that maxz is less than minz.
                 if tile_bbox[5] < tile_bbox[2] {
-                    debug!("Internal tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_bbox, tile_bbox[5], tile_bbox[2]);
+                    debug!(
+                        "Internal tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                    );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
-                    BoundingVolume::box_from_bbox(&tile_bbox, transformer).unwrap();
+                    BoundingVolume::region_from_bbox(&tile_bbox, transformer).unwrap();
 
-                // The geometric error of a tile is computed based on the specified error
-                // for the nodes have leafs as children (assuming all leaf nodes are at the same level)
-                let level_multiplier = (tile_bbox[3] - tile_bbox[0]) / (arg_cellsize as f64) - 2.0;
-                let mut d = geometric_error_above_leaf * level_multiplier;
-                let d_string = format!("{d:.2}");
-                if d < 0.0 {
-                    warn!("d is negative in internal tile {tile_id}");
-                } else if d_string == *"0.00" {
-                    // Because, for instance we have a —grid-cellsize 250, then a parent of the deepest level will have an edge length of 2 * 250.
-                    // So for the 'level_multiplier' formula we get:
-                    // 500 / 250 - 2.0 = 0
-                    // Which then results in a 'd' of 0.
-                    d = geometric_error_above_leaf;
-                }
+                // Tyler currently writes full-detail content only at leaves. Internal
+                // tiles are traversal nodes, so their geometric error is a spatial
+                // refinement trigger proportional to the tile footprint.
+                let tile_width = (tile_bbox[3] - tile_bbox[0]).max(tile_bbox[4] - tile_bbox[1]);
+                let geometric_error = tile_width * geometric_error_factor;
                 let mut tile_children: Vec<Tile> = Vec::new();
                 for child in quadtree.children.iter() {
                     tile_children.push(Self::generate_tiles(
                         child,
                         world,
                         transformer,
-                        geometric_error_above_leaf,
-                        arg_cellsize,
+                        geometric_error_factor,
                         arg_minz,
                         arg_maxz,
                         content_bv_from_tile,
@@ -267,7 +287,7 @@ pub mod cesium3dtiles {
                 Tile {
                     id: tile_id,
                     bounding_volume,
-                    geometric_error: d,
+                    geometric_error,
                     viewer_request_volume: None,
                     refine: Some(Refinement::Replace),
                     transform: None,
@@ -282,11 +302,14 @@ pub mod cesium3dtiles {
                 let mut tile_bbox = quadtree.bbox(&world.grid);
                 if tile_bbox[5] < tile_bbox[2] {
                     // See explanation above
-                    debug!("Leaf tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_bbox, tile_bbox[5], tile_bbox[2]);
+                    debug!(
+                        "Leaf tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                    );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
                 let bounding_volume =
-                    BoundingVolume::box_from_bbox(&tile_bbox, transformer).unwrap();
+                    BoundingVolume::region_from_bbox(&tile_bbox, transformer).unwrap();
                 let mut content: Option<Content> = None;
 
                 if quadtree.nr_items > 0 {
@@ -317,12 +340,16 @@ pub mod cesium3dtiles {
 
                     if tile_content_bbox_rw[5] < tile_content_bbox_rw[2] {
                         // See explanation above
-                        debug!("Leaf tile content {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.", &tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]);
+                        debug!(
+                            "Leaf tile content {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
+                            &tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]
+                        );
                         tile_content_bbox_rw[5] =
                             tile_content_bbox_rw[2] + tile_content_bbox_rw[2] * 0.01;
                     }
                     let content_bounding_volume =
-                        BoundingVolume::box_from_bbox(&tile_content_bbox_rw, transformer).unwrap();
+                        BoundingVolume::region_from_bbox(&tile_content_bbox_rw, transformer)
+                            .unwrap();
 
                     content = Some(Content {
                         bounding_volume: if content_add_bv {
@@ -345,137 +372,6 @@ pub mod cesium3dtiles {
                     children: None,
                     implicit_tiling: None,
                 }
-            }
-        }
-
-        #[allow(dead_code)]
-        pub fn from_grid(
-            grid: &SquareGrid,
-            citymodel: &crate::parser::CityJSONMetadata,
-            feature_set: &crate::parser::FeatureSet,
-        ) -> Self {
-            let crs_from = format!(
-                "EPSG:{}",
-                citymodel.metadata.reference_system.to_epsg().unwrap()
-            );
-            // Because we have a boundingVolume.box. For a boundingVolume.region we need 4979.
-            let crs_to = "EPSG:4978";
-            let transformer = Proj::new_known_crs(&crs_from, crs_to, None).unwrap();
-
-            let mut root_children: Vec<Tile> = Vec::with_capacity(grid.length * grid.length);
-            for (cellid, cell) in grid {
-                if cell.feature_ids.is_empty() {
-                    // Empty cell, don't create tiles for it
-                    continue;
-                }
-
-                let mut content_bbox_qc = feature_set[cell.feature_ids[0]].bbox_qc.clone();
-                for fi in cell.feature_ids.iter() {
-                    content_bbox_qc.update_with(&feature_set[*fi].bbox_qc);
-                }
-                let content_bbox_rw = content_bbox_qc.to_bbox(&citymodel.transform, None, None);
-                let content_bounding_voume =
-                    BoundingVolume::box_from_bbox(&content_bbox_rw, &transformer).unwrap();
-
-                let mut cell_bbox = grid.cell_bbox(&cellid);
-                // Set the bounding volume height from the content height
-                cell_bbox[2] = content_bbox_rw[2];
-                cell_bbox[5] = content_bbox_rw[5];
-                let bounding_volume =
-                    BoundingVolume::box_from_bbox(&cell_bbox, &transformer).unwrap();
-
-                // We are adding a child for each LoD.
-                // TODO: but we are cheating here now, because we know that the input data has 3 LoDs...
-
-                // The geometric error of a tile is its 'size'.
-                // Since we have square tiles, we compute its size as the length of
-                // its side on the x-axis.
-                let dz = cell_bbox[5] - cell_bbox[2];
-
-                // this is a leaf node, so the geometric_error is 0
-                // LoD2.2
-                let tile_lod22 = Tile {
-                    id: TileId::new(cellid.column, cellid.row, 3),
-                    bounding_volume,
-                    geometric_error: 0.0,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}-0-0.glb", cellid),
-                    }),
-                    children: None,
-                    implicit_tiling: None,
-                };
-
-                // LoD 1.3
-                let tile_lod13 = Tile {
-                    id: TileId::new(cellid.column, cellid.row, 2),
-                    bounding_volume,
-                    geometric_error: dz * 0.1,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}-0.glb", cellid),
-                    }),
-                    children: Some(vec![tile_lod22]),
-                    implicit_tiling: None,
-                };
-
-                // LoD 1.2
-                root_children.push(Tile {
-                    id: TileId::new(cellid.column, cellid.row, 1),
-                    bounding_volume,
-                    geometric_error: dz * 0.3,
-                    // geometric_error: 10.0,
-                    viewer_request_volume: None,
-                    refine: Some(Refinement::Replace),
-                    transform: None,
-                    content: Some(Content {
-                        bounding_volume: Some(content_bounding_voume),
-                        uri: format!("t/{}.glb", cellid),
-                    }),
-                    children: Some(vec![tile_lod13]),
-                    implicit_tiling: None,
-                });
-            }
-
-            let root_volume = BoundingVolume::box_from_bbox(&grid.bbox, &transformer).unwrap();
-            debug!("root bbox: {:?}", &grid.bbox);
-            debug!("root boundingVolume: {:?}", &root_volume);
-            let root_geometric_error = grid.bbox[3] - grid.bbox[0];
-
-            let root = Tile {
-                id: TileId::new(0, 0, 0),
-                bounding_volume: root_volume,
-                geometric_error: root_geometric_error,
-                viewer_request_volume: None,
-                refine: Some(Refinement::Replace),
-                transform: None,
-                content: None,
-                children: Some(root_children),
-                implicit_tiling: None,
-            };
-
-            // Using gltf tile content
-            let mut extensions: Extensions = HashMap::new();
-            let e1 = Extension::ContentGtlf {
-                extensions_used: None,
-                extensions_required: None,
-            };
-            extensions.insert(ExtensionName::ContentGltf, e1);
-
-            Self {
-                asset: Default::default(),
-                geometric_error: root_geometric_error * 1.5,
-                root,
-                properties: None,
-                extensions_used: None,
-                extensions_required: None,
-                extensions: None,
             }
         }
 
@@ -505,6 +401,7 @@ pub mod cesium3dtiles {
         /// Convert to implicit tiling.
         /// It modifies the tileset and deletes the explicit tiles.
         /// Expects that explicit tiling is already created.
+        #[allow(dead_code)]
         pub fn make_implicit(
             &mut self,
             grid: &SquareGrid,
@@ -681,10 +578,14 @@ pub mod cesium3dtiles {
                             let vc = content_availability_for_level.get(*i_z_curve);
                             let tile_id_subtree = &tileids_contiguous_vec[*i_z_curve];
                             if va.is_none() {
-                                error!("tileAvailability bitstream is inconsistent, there is no value at index {i_z_curve}");
+                                error!(
+                                    "tileAvailability bitstream is inconsistent, there is no value at index {i_z_curve}"
+                                );
                             };
                             if vc.is_none() {
-                                error!("contentAvailability bitstream is inconsistent, there is no value at index {i_z_curve}");
+                                error!(
+                                    "contentAvailability bitstream is inconsistent, there is no value at index {i_z_curve}"
+                                );
                             }
                             let tile_available = va.unwrap();
                             let content_available = vc.unwrap();
@@ -852,8 +753,182 @@ pub mod cesium3dtiles {
                 bounding_volume: None,
                 uri: "t/{level}/{x}/{y}.glb".to_string(),
             });
+            self.root.refine = Some(Refinement::Add);
             self.root.children = None;
             (flat_tiles_with_content, subtrees_vec)
+        }
+
+        /// Convert the root tile to an implicit tileset using content tile IDs
+        /// that already follow the implicit subdivision coordinate system.
+        pub fn make_implicit_from_content_tile_ids(
+            &mut self,
+            content_tile_ids: &[TileId],
+            subtrees_dir: Option<&str>,
+        ) -> Vec<(TileId, Vec<u8>)> {
+            let available_levels = self.available_levels();
+            let subtree_levels = available_levels;
+            let subtrees = match subtrees_dir {
+                None => Subtrees::default(),
+                Some(dirname) => Subtrees::new(dirname),
+            };
+            self.root.implicit_tiling = Some(ImplicitTiling {
+                subdivision_scheme: SubdivisionScheme::Quadtree,
+                subtree_levels,
+                available_levels,
+                subtrees,
+            });
+            self.root.content = Some(Content {
+                bounding_volume: None,
+                uri: "t/{level}/{x}/{y}.glb".to_string(),
+            });
+            self.root.refine = Some(Refinement::Add);
+            self.root.children = None;
+
+            vec![Self::implicit_root_subtree_from_content_tile_ids(
+                available_levels,
+                content_tile_ids,
+            )]
+        }
+
+        fn implicit_root_subtree_from_content_tile_ids(
+            available_levels: u16,
+            content_tile_ids: &[TileId],
+        ) -> (TileId, Vec<u8>) {
+            let mut available_tiles = HashSet::new();
+            let mut content_tiles = HashSet::new();
+
+            for tile_id in content_tile_ids {
+                if tile_id.level >= available_levels {
+                    warn!(
+                        "Skipping implicit content tile {} because availableLevels is {}",
+                        tile_id, available_levels
+                    );
+                    continue;
+                }
+
+                content_tiles.insert(tile_id.clone());
+                for ancestor_level in 0..=tile_id.level {
+                    let shift = tile_id.level - ancestor_level;
+                    available_tiles.insert(TileId::new(
+                        tile_id.x >> shift,
+                        tile_id.y >> shift,
+                        ancestor_level,
+                    ));
+                }
+            }
+
+            let nr_tiles_total_subtree = (4_usize.pow(available_levels as u32) - 1) / 3;
+            let mut tile_availability_bitstream: bv::BitVec<u8, bv::Lsb0> = bv::BitVec::new();
+            tile_availability_bitstream.resize(nr_tiles_total_subtree, false);
+            let mut content_availability_bitstream: bv::BitVec<u8, bv::Lsb0> = bv::BitVec::new();
+            content_availability_bitstream.resize(nr_tiles_total_subtree, false);
+
+            for tile_id in available_tiles {
+                let index = Self::implicit_tile_bit_index(&tile_id);
+                if index < nr_tiles_total_subtree {
+                    tile_availability_bitstream.set(index, true);
+                }
+            }
+            for tile_id in content_tiles {
+                let index = Self::implicit_tile_bit_index(&tile_id);
+                if index < nr_tiles_total_subtree {
+                    content_availability_bitstream.set(index, true);
+                }
+            }
+
+            let nr_tiles_child_level = 4_usize.pow(available_levels as u32);
+            let mut child_subtree_availability_bitstream: bv::BitVec<u8, bv::Lsb0> =
+                bv::BitVec::new();
+            child_subtree_availability_bitstream.resize(nr_tiles_child_level, false);
+
+            let subtree_id = TileId::new(0, 0, 0);
+            (
+                subtree_id,
+                Self::subtree_bytes_from_availability(
+                    &tile_availability_bitstream,
+                    &content_availability_bitstream,
+                    &child_subtree_availability_bitstream,
+                ),
+            )
+        }
+
+        fn implicit_tile_bit_index(tile_id: &TileId) -> usize {
+            let level_offset = (4_usize.pow(tile_id.level as u32) - 1) / 3;
+            let morton_index = morton_encode([tile_id.y as u64, tile_id.x as u64]) as usize;
+            level_offset + morton_index
+        }
+
+        fn subtree_bytes_from_availability(
+            tile_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+            content_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+            child_subtree_availability_bitstream: &bv::BitVec<u8, bv::Lsb0>,
+        ) -> Vec<u8> {
+            let mut buffer_vec: Vec<u8> = Vec::new();
+            let mut bufferviews: Vec<BufferView> = Vec::with_capacity(3);
+            let mut bufferview_idx: usize = 0;
+
+            let mut tile_availability_bits = tile_availability_bitstream.clone();
+            let tile_availability =
+                Self::create_availability(bufferview_idx, &mut tile_availability_bits);
+            if tile_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(&mut buffer_vec, &mut bufferviews, tile_availability_bits);
+                bufferview_idx += 1;
+            }
+
+            let mut content_availability_bits = content_availability_bitstream.clone();
+            let content_availability =
+                Self::create_availability(bufferview_idx, &mut content_availability_bits);
+            if content_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(&mut buffer_vec, &mut bufferviews, content_availability_bits);
+                bufferview_idx += 1;
+            }
+
+            let mut child_subtree_availability_bits = child_subtree_availability_bitstream.clone();
+            let child_subtree_availability =
+                Self::create_availability(bufferview_idx, &mut child_subtree_availability_bits);
+            if child_subtree_availability.constant.is_none() {
+                Self::add_padding(&mut buffer_vec, 8);
+                Self::add_bitstream(
+                    &mut buffer_vec,
+                    &mut bufferviews,
+                    child_subtree_availability_bits,
+                );
+            }
+
+            Self::add_padding(&mut buffer_vec, 8);
+
+            let buffer = Buffer {
+                name: None,
+                byte_length: buffer_vec.len(),
+            };
+            let subtree = Subtree {
+                buffers: Some(vec![buffer]),
+                buffer_views: Some(bufferviews),
+                tile_availability,
+                content_availability: Some(vec![content_availability]),
+                child_subtree_availability,
+            };
+            let mut subtree_json =
+                serde_json::to_string(&subtree).expect("failed to serialize the subtree to json");
+            let remainder = subtree_json.as_bytes().len() % 8;
+            if remainder > 0 {
+                let padding = 8 - remainder;
+                for _i in 0..padding {
+                    subtree_json += " ";
+                }
+            }
+            let subtree_json_bytes = subtree_json.as_bytes();
+
+            let mut subtree_bytes: Vec<u8> = Vec::new();
+            subtree_bytes.extend(0x74627573u32.to_le_bytes());
+            subtree_bytes.extend(1_u32.to_le_bytes());
+            subtree_bytes.extend((subtree_json_bytes.len() as u64).to_le_bytes());
+            subtree_bytes.extend((buffer_vec.len() as u64).to_le_bytes());
+            subtree_bytes.extend(subtree_json_bytes);
+            subtree_bytes.extend(buffer_vec);
+            subtree_bytes
         }
 
         fn add_padding(buffer_vec: &mut Vec<u8>, align_by: usize) {
@@ -904,6 +979,7 @@ pub mod cesium3dtiles {
             }
         }
 
+        #[allow(dead_code)]
         fn tile_corner_coordinate(grid: &SquareGrid, qtree: &QuadTree, tile: &Tile) -> String {
             let tileid = &tile.id;
             let qtree_nodeid: QuadTreeNodeId = tileid.into();
@@ -915,6 +991,7 @@ pub mod cesium3dtiles {
         /// Build a map of grid-cell-corner-coorinates and cell ID-s.
         /// It is used for matching the "theoretical grid" to the quadtree nodes, based
         /// on the coordinates.
+        #[allow(dead_code)]
         fn grid_coordinate_map(
             level_current: u32,
             extent_width: f64,
@@ -1012,12 +1089,15 @@ pub mod cesium3dtiles {
                     let filename =
                         format!("tileset-{}-{}-{}.json", tile.id.level, tile.id.x, tile.id.y);
                     // Create the new tileset
+                    let root = tile.clone();
+                    let geometric_error =
+                        Self::normalize_tileset_geometric_error(&root, root.geometric_error);
                     child_tilesets.push((
                         filename.clone(),
                         Tileset {
                             asset: Default::default(),
-                            geometric_error: tile.geometric_error,
-                            root: tile.clone(),
+                            geometric_error,
+                            root,
                             properties: None,
                             extensions_used: None,
                             extensions_required: None,
@@ -1270,7 +1350,9 @@ pub mod cesium3dtiles {
         }
     }
 
-    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    #[derive(
+        Serialize, Deserialize, Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd,
+    )]
     pub struct TileId {
         pub(crate) x: usize,
         pub(crate) y: usize,
@@ -1314,9 +1396,10 @@ pub mod cesium3dtiles {
         }
     }
 
-    /// Format the BoundingVolume coordinates to 2 decimal places in the JSON output.
-    /// 2 decimal places, because we have Cartesian ECEF coordinates.
-    /// If we had lat/long, we would need 6 decimal places, because that gives 0.11112m precision.
+    /// Format the BoundingVolume coordinates with appropriate precision in the JSON output.
+    /// For Region bounding volumes (lat/lon in radians), we need 6+ decimal places for precision.
+    /// 2 decimal places for radians gives ~0.01 rad = ~0.57° = ~63km precision (way too coarse!).
+    /// 6 decimal places gives ~0.000001 rad = ~0.000057° = ~6.3m precision (appropriate).
     /// See https://wiki.openstreetmap.org/wiki/Precision_of_coordinates
     struct BoundingVolumeFormatter;
 
@@ -1325,7 +1408,9 @@ pub mod cesium3dtiles {
         where
             W: ?Sized + Write,
         {
-            write!(writer, "{:.2}", value)
+            // Use 6 decimal places for sufficient precision in Region bounding volumes (radians)
+            // This ensures lat/lon coordinates have ~6.3m precision instead of ~63km
+            write!(writer, "{:.6}", value)
         }
     }
 
@@ -1469,15 +1554,30 @@ pub mod cesium3dtiles {
             bbox: &Bbox,
             transformer: &Proj,
         ) -> Result<Self, Box<dyn std::error::Error>> {
-            let (west, south, minh) = transformer.convert((bbox[0], bbox[1], bbox[2]))?;
-            let (east, north, maxh) = transformer.convert((bbox[3], bbox[4], bbox[5]))?;
+            let mut west = f64::INFINITY;
+            let mut south = f64::INFINITY;
+            let mut min_h = f64::INFINITY;
+            let mut east = f64::NEG_INFINITY;
+            let mut north = f64::NEG_INFINITY;
+            let mut max_h = f64::NEG_INFINITY;
+
+            for [x, y, z] in bbox_corners(bbox) {
+                let (lon, lat, height) = transformer.convert((x, y, z))?;
+                west = west.min(lon);
+                south = south.min(lat);
+                min_h = min_h.min(height);
+                east = east.max(lon);
+                north = north.max(lat);
+                max_h = max_h.max(height);
+            }
+
             Ok(BoundingVolume::Region([
                 west.to_radians(),
                 south.to_radians(),
                 east.to_radians(),
                 north.to_radians(),
-                minh,
-                maxh,
+                min_h,
+                max_h,
             ]))
         }
 
@@ -1543,6 +1643,19 @@ pub mod cesium3dtiles {
                 maxy = maxy
             )
         }
+    }
+
+    fn bbox_corners(bbox: &Bbox) -> [[f64; 3]; 8] {
+        [
+            [bbox[0], bbox[1], bbox[2]],
+            [bbox[0], bbox[1], bbox[5]],
+            [bbox[0], bbox[4], bbox[2]],
+            [bbox[0], bbox[4], bbox[5]],
+            [bbox[3], bbox[1], bbox[2]],
+            [bbox[3], bbox[1], bbox[5]],
+            [bbox[3], bbox[4], bbox[2]],
+            [bbox[3], bbox[4], bbox[5]],
+        ]
     }
 
     /// [Tile.refine](https://github.com/CesiumGS/3d-tiles/tree/main/specification#tilerefine).
@@ -1687,8 +1800,11 @@ pub mod cesium3dtiles {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use cityjson_index;
         use serde_json::to_string_pretty;
+        use std::fs;
         use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         fn test_data_dir() -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1696,30 +1812,113 @@ pub mod cesium3dtiles {
                 .join("data")
         }
 
+        fn resource_path(name: &str) -> PathBuf {
+            test_data_dir().join(name)
+        }
+
+        fn unique_test_dir(prefix: &str) -> PathBuf {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("tyler-{prefix}-{unique}"));
+            fs::create_dir_all(&path).expect("create test dir");
+            path
+        }
+
+        fn assert_tile_bounding_volumes_are_regions(tile: &Tile) {
+            assert!(
+                matches!(tile.bounding_volume, BoundingVolume::Region(_)),
+                "tile {} bounding volume should be a region",
+                tile.id
+            );
+            if let Some(content) = &tile.content {
+                if let Some(bounding_volume) = &content.bounding_volume {
+                    assert!(
+                        matches!(bounding_volume, BoundingVolume::Region(_)),
+                        "tile {} content bounding volume should be a region",
+                        tile.id
+                    );
+                }
+            }
+            if let Some(children) = &tile.children {
+                for child in children {
+                    assert_tile_bounding_volumes_are_regions(child);
+                }
+            }
+        }
+
+        fn assert_geometric_error_decreases_to_zero(tile: &Tile) {
+            if let Some(children) = &tile.children {
+                for child in children {
+                    assert!(
+                        tile.geometric_error >= child.geometric_error,
+                        "tile {} geometricError {} should be >= child {} geometricError {}",
+                        tile.id,
+                        tile.geometric_error,
+                        child.id,
+                        child.geometric_error
+                    );
+                    assert_geometric_error_decreases_to_zero(child);
+                }
+            } else {
+                assert!(
+                    tile.geometric_error.abs() <= f64::EPSILON,
+                    "leaf tile {} should have zero geometricError",
+                    tile.id
+                );
+            }
+        }
+
         #[test]
         fn test_implicittiling() {
-            // 85162.9 447106.8 85562.9 447706.8
-            // let bbox: crate::spatial_structs::Bbox =
-            //     [85162.9, 447106.8, -10.7, 85962.9, 447906.8, 320.5];
-            // let grid = crate::spatial_structs::SquareGrid::new(&bbox, 200, 7415, Some(10.0));
+            let dataset_dir = unique_test_dir("implicittiling");
+            let metadata =
+                fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
+            let feature = fs::read_to_string(resource_path("3dbag_feature_x71.city.jsonl"))
+                .expect("read feature");
+            let ndjson_source = dataset_dir.join("source.city.jsonl");
+            fs::write(&ndjson_source, format!("{metadata}\n{feature}\n"))
+                .expect("write ndjson source");
 
-            let mut world = crate::parser::World::new(
-                test_data_dir()
-                    .join("features_3dbag_5909")
-                    .join("metadata.city.json"),
-                test_data_dir()
-                    .join("features_3dbag_5909")
-                    .join("3dbag_v21031_7425c21b_5909_subset"),
+            let resolved = cityjson_index::resolve_dataset(&dataset_dir, None)
+                .expect("resolve cjindex dataset");
+            let mut city_index =
+                cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
+                    .expect("open index");
+            city_index.reindex().expect("reindex");
+            let metadata_doc = city_index
+                .metadata()
+                .expect("load metadata")
+                .first()
+                .expect("metadata exists")
+                .as_ref()
+                .clone();
+            let feature_base_document =
+                serde_json::to_vec(&metadata_doc).expect("serialize metadata");
+            let metadata_path = dataset_dir.join("metadata.city.json");
+            fs::write(&metadata_path, &feature_base_document).expect("write metadata");
+
+            let cityobject_types = Some(vec![
+                crate::parser::CityObjectType::Building,
+                crate::parser::CityObjectType::BuildingPart,
+            ]);
+            let feature_filter = crate::build_feature_filter(
+                cityobject_types.as_ref(),
+                &std::collections::BTreeMap::new(),
+            );
+            let mut world = crate::parser::World::from_cjindex(
+                crate::parser::InputSource::from_cjindex_resolved(&resolved),
+                metadata_path,
+                feature_base_document,
                 200,
-                Some(vec![
-                    crate::parser::CityObjectType::Building,
-                    crate::parser::CityObjectType::BuildingPart,
-                ]),
+                cityobject_types,
+                feature_filter,
                 None,
                 None,
             )
             .unwrap();
-            world.index_with_grid();
+            world.index_with_grid().unwrap();
 
             world.export_grid(false, None).unwrap();
 
@@ -1729,8 +1928,38 @@ pub mod cesium3dtiles {
             );
             quadtree.export(&world, None).unwrap();
 
-            let _tileset =
-                Tileset::from_quadtree(&quadtree, &world, 16_f64, 200, None, None, true, true);
+            let source_crs = format!("EPSG:{}", world.crs.to_epsg().unwrap());
+            let root_bbox = quadtree.bbox(&world.grid);
+            let root_enu_frame =
+                RootEnuFrame::from_bbox(&source_crs, &root_bbox).expect("root ENU frame");
+            let tileset = Tileset::from_quadtree(
+                &quadtree,
+                &world,
+                0.024,
+                200,
+                None,
+                None,
+                true,
+                true,
+                &root_enu_frame,
+            );
+            assert_tile_bounding_volumes_are_regions(&tileset.root);
+            assert_geometric_error_decreases_to_zero(&tileset.root);
+            if tileset.root.children.is_some() {
+                assert!(
+                    (tileset.geometric_error - tileset.root.geometric_error).abs() <= f64::EPSILON
+                );
+            } else {
+                assert!(tileset.root.geometric_error.abs() <= f64::EPSILON);
+                assert!(tileset.geometric_error > f64::EPSILON);
+            }
+            let root_transform = tileset
+                .root
+                .transform
+                .as_ref()
+                .expect("root tile should have ENU-to-ECEF transform");
+            assert!((root_transform.0[0] - 1.0).abs() > 1.0e-6);
+            assert!(root_transform.0[12].abs() > 1.0);
 
             // tileset.make_implicit(&world.grid, &quadtree, );
 
@@ -1755,7 +1984,6 @@ pub mod cesium3dtiles {
         fn test_boundingvolume_from_bbox() {
             let crs_to = "EPSG:4978";
             let transformer = Proj::new_known_crs("EPSG:7415", crs_to, None).unwrap();
-            let _bbox: Bbox = [171790.0, 472690.0, -15.0, 274190.0, 575090.0, 400.0];
             let bbox: Bbox = [
                 84362.90299999999,
                 446306.814,
@@ -1773,8 +2001,56 @@ pub mod cesium3dtiles {
             let crs_to = "EPSG:4979";
             let transformer = Proj::new_known_crs("EPSG:7415", crs_to, None).unwrap();
             let bbox: Bbox = [84995.279, 446316.813, -5.333, 85644.748, 446996.132, 52.881];
-            let bounding_volume = BoundingVolume::region_from_bbox(&bbox, &transformer);
-            println!("{:?}", bounding_volume);
+            let bounding_volume = BoundingVolume::region_from_bbox(&bbox, &transformer)
+                .expect("bbox should transform to EPSG:4979 region");
+            let BoundingVolume::Region(region) = bounding_volume else {
+                panic!("region_from_bbox should return a region");
+            };
+
+            let mut expected = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for [x, y, z] in bbox_corners(&bbox) {
+                let (lon, lat, height) = transformer.convert((x, y, z)).unwrap();
+                expected[0] = expected[0].min(lon.to_radians());
+                expected[1] = expected[1].min(lat.to_radians());
+                expected[2] = expected[2].max(lon.to_radians());
+                expected[3] = expected[3].max(lat.to_radians());
+                expected[4] = expected[4].min(height);
+                expected[5] = expected[5].max(height);
+            }
+
+            for (actual, expected) in region.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 1.0e-12,
+                    "expected {expected}, got {actual}"
+                );
+            }
+            assert!(region[0].abs() < std::f64::consts::PI);
+            assert!(region[1].abs() < std::f64::consts::FRAC_PI_2);
+            assert!(region[0] < region[2]);
+            assert!(region[1] < region[3]);
+            assert!(region[4] <= region[5]);
+        }
+
+        #[test]
+        fn test_bbox_corners_returns_all_eight_corners() {
+            let bbox: Bbox = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+            let corners = bbox_corners(&bbox);
+            assert_eq!(corners.len(), 8);
+            assert!(corners.contains(&[1.0, 2.0, 3.0]));
+            assert!(corners.contains(&[1.0, 2.0, 6.0]));
+            assert!(corners.contains(&[1.0, 5.0, 3.0]));
+            assert!(corners.contains(&[1.0, 5.0, 6.0]));
+            assert!(corners.contains(&[4.0, 2.0, 3.0]));
+            assert!(corners.contains(&[4.0, 2.0, 6.0]));
+            assert!(corners.contains(&[4.0, 5.0, 3.0]));
+            assert!(corners.contains(&[4.0, 5.0, 6.0]));
         }
 
         #[test]

@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use crate::parser::FeatureSet;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
@@ -185,26 +185,34 @@ impl QuadTree {
         arg_minz: Option<i32>,
         arg_maxz: Option<i32>,
     ) -> Bbox {
-        let mut tile_content_bbox_qc = BboxQc([0, 0, 0, 0, 0, 0]);
+        let mut tile_content_bbox: Option<Bbox> = None;
         for cellid in self.cells() {
             let cell = world.grid.cell(cellid);
             if !cell.feature_ids.is_empty() {
-                tile_content_bbox_qc = world.features[cell.feature_ids[0]].bbox_qc.clone();
+                tile_content_bbox = Some(world.features[cell.feature_ids[0]].bbox);
                 break;
             }
         }
         for cellid in self.cells() {
             let cell = world.grid.cell(cellid);
             for fi in cell.feature_ids.iter() {
-                tile_content_bbox_qc.update_with(&world.features[*fi].bbox_qc);
+                if let Some(bbox) = tile_content_bbox.as_mut() {
+                    update_bbox(bbox, &world.features[*fi].bbox);
+                }
             }
         }
-        // If the limit-minz/maxz arguments are set, also limit the z of the
-        // bounding volume. We could also just use the grid.bbox values to limit the z,
-        // however at this point we don't know if that was computed from the data or set by
-        // the argument. Setting the argument signals intent, so only then do we override
-        // the values.
-        tile_content_bbox_qc.to_bbox(&world.transform, arg_minz, arg_maxz)
+        let mut bbox = tile_content_bbox.unwrap_or(world.grid.bbox);
+        if let Some(minz) = arg_minz {
+            if bbox[2] < minz as f64 {
+                bbox[2] = minz as f64;
+            }
+        }
+        if let Some(maxz) = arg_maxz {
+            if bbox[5] > maxz as f64 {
+                bbox[5] = maxz as f64;
+            }
+        }
+        bbox
     }
 
     /// Breadth-first search for a node.
@@ -453,7 +461,9 @@ pub fn deinterleave(mortoncode: &u64) -> [u64; 2] {
 ///
 /// ## Examples
 ///
-/// ```
+/// ```ignore
+/// use crate::spatial_structs::SquareGrid;
+///
 /// let grid = SquareGrid::new(&[0.0, 0.0, 0.0, 4.0, 4.0, 4.0], 1);
 /// let grid_idx = grid.locate_point(&[2.5, 1.5]);
 /// assert_eq!(grid_idx, [3_u64, 2_u64]);
@@ -467,6 +477,60 @@ pub struct SquareGrid {
     cellsize: u32,
     pub data: Vec<Vec<Cell>>,
     pub epsg: u16,
+}
+
+/// Lightweight, copyable view of a [`SquareGrid`]'s metadata that exposes the
+/// read-only spatial queries (`locate_point`, `intersect_bbox_ranges`). Letting
+/// workers hold a `GridLayout` by value lets the integrator hold `&mut SquareGrid`
+/// concurrently without violating Rust's borrowing rules.
+#[derive(Debug, Clone, Copy)]
+pub struct GridLayout {
+    origin: [f64; 3],
+    pub bbox: Bbox,
+    pub length: usize,
+    cellsize: u32,
+    pub epsg: u16,
+}
+
+impl GridLayout {
+    pub fn locate_point(&self, point: &[f64; 2]) -> CellId {
+        let dx = point[0] - self.origin[0];
+        let dy = point[1] - self.origin[1];
+        let max_index = self.length.saturating_sub(1);
+        let col_i = ((dx / self.cellsize as f64).floor() as isize).clamp(0, max_index as isize);
+        let row_i = ((dy / self.cellsize as f64).floor() as isize).clamp(0, max_index as isize);
+        CellId {
+            row: row_i as usize,
+            column: col_i as usize,
+        }
+    }
+
+    pub fn intersect_bbox_ranges(
+        &self,
+        bbox: &Bbox,
+    ) -> (
+        std::ops::RangeInclusive<usize>,
+        std::ops::RangeInclusive<usize>,
+    ) {
+        let [minx, miny, _, maxx, maxy, _] = *bbox;
+        let min_cellid = self.locate_point(&[minx, miny]);
+        let max_cellid = self.locate_point(&[maxx, maxy]);
+        (
+            min_cellid.column..=max_cellid.column,
+            min_cellid.row..=max_cellid.row,
+        )
+    }
+
+    pub fn intersect_bbox(&self, bbox: &Bbox) -> Vec<CellId> {
+        let mut cellids: Vec<CellId> = Vec::new();
+        let (columns, rows) = self.intersect_bbox_ranges(bbox);
+        for column in columns {
+            for row in rows.clone() {
+                cellids.push(CellId { row, column });
+            }
+        }
+        cellids
+    }
 }
 
 impl Display for SquareGrid {
@@ -512,6 +576,19 @@ impl SquareGrid {
         }
         let d_cells = (d / cellsize_new).ceil() as usize;
         let cellsize = cellsize_new.ceil() as u32;
+        let estimated_cells = d_cells.saturating_mul(d_cells);
+        let estimated_bytes = estimated_cells.saturating_mul(std::mem::size_of::<Cell>());
+        let estimated_mib = estimated_bytes as f64 / (1024.0 * 1024.0);
+        info!(
+            "Allocating dense square grid: {}x{} cells (~{:.1} MiB base cell storage)",
+            d_cells, d_cells, estimated_mib
+        );
+        if estimated_mib > 1024.0 {
+            warn!(
+                "Dense square grid allocation is large: {}x{} cells (~{:.1} MiB). This usually means the computed extent or cell size is off.",
+                d_cells, d_cells, estimated_mib
+            );
+        }
         // Compute new dimension from the calculated length
         d = d_cells as f64 * cellsize as f64;
         let origin = [
@@ -552,15 +629,152 @@ impl SquareGrid {
         }
     }
 
+    /// A snapshot of the grid metadata needed for read-only spatial queries.
+    /// Pass this to worker threads instead of `&self` so the integrator can keep
+    /// exclusive access to the cell data.
+    pub fn layout(&self) -> GridLayout {
+        GridLayout {
+            origin: self.origin,
+            bbox: self.bbox,
+            length: self.length,
+            cellsize: self.cellsize,
+            epsg: self.epsg,
+        }
+    }
+
+    pub fn from_debug_tsv(
+        grid_path: &Path,
+        features_path: Option<&Path>,
+        epsg: u16,
+        fallback_grid: Option<&Self>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let grid_tsv = fs::read_to_string(grid_path)?;
+        let mut lines = grid_tsv.lines();
+        let _header = lines.next();
+        let root = lines.next().ok_or_else(|| {
+            format!(
+                "debug grid file {} is missing its root row",
+                grid_path.display()
+            )
+        })?;
+        let mut root_parts = root.splitn(3, '\t');
+        let root_id = root_parts.next().unwrap_or_default();
+        if root_id != "x-x" {
+            return Err(format!(
+                "debug grid file {} has invalid root row id {root_id:?}",
+                grid_path.display()
+            )
+            .into());
+        }
+        let _root_count = root_parts.next();
+        let root_wkt = root_parts.next().ok_or_else(|| {
+            format!(
+                "debug grid file {} is missing root WKT",
+                grid_path.display()
+            )
+        })?;
+        let [minx, miny, maxx, maxy] = parse_grid_polygon_wkt(root_wkt)?;
+
+        let mut cells = Vec::new();
+        let mut max_column = 0usize;
+        let mut max_row = 0usize;
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(3, '\t');
+            let cell_id = parse_cell_id(parts.next().unwrap_or_default())?;
+            let nr_vertices = parts
+                .next()
+                .ok_or_else(|| {
+                    format!(
+                        "debug grid file {} is missing nr_items",
+                        grid_path.display()
+                    )
+                })?
+                .parse::<usize>()?;
+            max_column = max_column.max(cell_id.column);
+            max_row = max_row.max(cell_id.row);
+            cells.push((cell_id, nr_vertices));
+        }
+
+        let length = max_column.max(max_row) + 1;
+        let cellsize = ((maxx - minx) / length as f64).round() as u32;
+        let fallback_bbox = fallback_grid.map_or([0.0; 6], |grid| grid.bbox);
+        let bbox = [minx, miny, fallback_bbox[2], maxx, maxy, fallback_bbox[5]];
+
+        let mut data = vec![
+            vec![
+                Cell {
+                    feature_ids: Vec::new(),
+                    nr_vertices: 0,
+                };
+                length
+            ];
+            length
+        ];
+        for (cell_id, nr_vertices) in cells {
+            data[cell_id.column][cell_id.row].nr_vertices = nr_vertices;
+        }
+
+        if let Some(grid) = fallback_grid {
+            let limit = length.min(grid.length);
+            for (column_index, column) in data.iter_mut().enumerate().take(limit) {
+                for (row_index, cell) in column.iter_mut().enumerate().take(limit) {
+                    cell.feature_ids = grid.data[column_index][row_index].feature_ids.clone();
+                }
+            }
+        }
+
+        if let Some(features_path) = features_path.filter(|path| path.exists()) {
+            for column in &mut data {
+                for cell in column {
+                    cell.feature_ids.clear();
+                }
+            }
+
+            let features_tsv = fs::read_to_string(features_path)?;
+            for line in features_tsv.lines().skip(1) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let mut parts = line.splitn(3, '\t');
+                let feature_id = parts
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "debug features file {} is missing feature id",
+                            features_path.display()
+                        )
+                    })?
+                    .parse::<usize>()?;
+                let cell_id = parse_cell_id(parts.next().unwrap_or_default())?;
+                data[cell_id.column][cell_id.row]
+                    .feature_ids
+                    .push(feature_id);
+            }
+        }
+
+        Ok(Self {
+            origin: [minx, miny, bbox[2]],
+            bbox,
+            length,
+            cellsize,
+            data,
+            epsg,
+        })
+    }
+
     /// Returns the cell index (x, y) where the point is located.
     pub fn locate_point(&self, point: &[f64; 2]) -> CellId {
         let dx = point[0] - self.origin[0];
         let dy = point[1] - self.origin[1];
-        let col_i = (dx / self.cellsize as f64).floor() as usize;
-        let row_i = (dy / self.cellsize as f64).floor() as usize;
+        let max_index = self.length.saturating_sub(1);
+        let col_i = ((dx / self.cellsize as f64).floor() as isize).clamp(0, max_index as isize);
+        let row_i = ((dy / self.cellsize as f64).floor() as isize).clamp(0, max_index as isize);
         CellId {
-            row: row_i,
-            column: col_i,
+            row: row_i as usize,
+            column: col_i as usize,
         }
     }
 
@@ -575,28 +789,40 @@ impl SquareGrid {
     /// Return the Cells that intersect the Bounding Box.
     pub fn intersect_bbox(&self, bbox: &Bbox) -> Vec<CellId> {
         let mut cellids: Vec<CellId> = Vec::new();
-        let [minx, miny, _, maxx, maxy, _] = *bbox;
-        let min_cellid = self.locate_point(&[minx, miny]);
-        let max_cellid = self.locate_point(&[maxx, maxy]);
-        for column in min_cellid.column..=max_cellid.column {
-            for row in min_cellid.row..=max_cellid.row {
+        let (columns, rows) = self.intersect_bbox_ranges(bbox);
+        for column in columns {
+            for row in rows.clone() {
                 cellids.push(CellId { row, column });
             }
         }
         cellids
     }
 
+    pub fn intersect_bbox_ranges(
+        &self,
+        bbox: &Bbox,
+    ) -> (
+        std::ops::RangeInclusive<usize>,
+        std::ops::RangeInclusive<usize>,
+    ) {
+        let [minx, miny, _, maxx, maxy, _] = *bbox;
+        let min_cellid = self.locate_point(&[minx, miny]);
+        let max_cellid = self.locate_point(&[maxx, maxy]);
+        (
+            min_cellid.column..=max_cellid.column,
+            min_cellid.row..=max_cellid.row,
+        )
+    }
+
     /// Exports the grid and the feature centroids into TSV files into the working directory.
     /// The grid is written to `grid.tsv`.
     /// If `feature_set` is provided, then the feature centroids are written to
     /// `features.tsv`.
-    /// If `feature_set` is provided, `transform` must be provided too (and vica-versa).
     /// If `output_dir` is provided, the files are written there. Else they are written to the
     /// working directory.
     pub fn export(
         &self,
         feature_set: Option<&FeatureSet>,
-        transform: Option<&crate::parser::Transform>,
         output_dir: Option<&Path>,
     ) -> std::io::Result<()> {
         let [file_grid_path, file_features_path] = match output_dir {
@@ -630,7 +856,7 @@ impl SquareGrid {
             if let Some(fset) = feature_set {
                 for fid in cell.feature_ids.iter() {
                     let f = &fset[*fid];
-                    let centroid = f.centroid(transform.unwrap());
+                    let centroid = f.centroid();
                     cellbuffer += format!(
                         "{}\t{}\tPOINT({} {})\n",
                         fid, &cellid, centroid[0], centroid[1]
@@ -685,7 +911,7 @@ impl SquareGrid {
     /// Compute the vertex distribution in the cells of the grid.
     pub fn compute_statistics(&self) -> SquareGridStats {
         // nr. of vertices in the cells that are not empty
-        let mut nr_vertices_not_empty: Vec<usize> = Vec::with_capacity(self.length * self.length);
+        let mut nr_vertices_not_empty: Vec<usize> = Vec::new();
         let mut nr_cells_not_empty: usize = 0;
         for (_, cell) in self {
             if cell.nr_vertices > 0 {
@@ -731,6 +957,46 @@ impl SquareGrid {
             nr_vertices_median: median,
         }
     }
+}
+
+fn parse_cell_id(value: &str) -> Result<CellId, Box<dyn std::error::Error>> {
+    let (column, row) = value
+        .split_once('-')
+        .ok_or_else(|| format!("invalid cell id {value:?}"))?;
+    Ok(CellId {
+        column: column.parse::<usize>()?,
+        row: row.parse::<usize>()?,
+    })
+}
+
+fn parse_grid_polygon_wkt(value: &str) -> Result<[f64; 4], Box<dyn std::error::Error>> {
+    let coordinates = value
+        .strip_prefix("POLYGON((")
+        .and_then(|value| value.strip_suffix("))"))
+        .ok_or_else(|| format!("invalid grid polygon WKT {value:?}"))?;
+    let mut points = coordinates.split(',');
+    let first = points
+        .next()
+        .ok_or_else(|| format!("grid polygon WKT is missing its first point: {value:?}"))?;
+    let third = points
+        .nth(1)
+        .ok_or_else(|| format!("grid polygon WKT is missing its third point: {value:?}"))?;
+    let [minx, miny] = parse_wkt_point(first)?;
+    let [maxx, maxy] = parse_wkt_point(third)?;
+    Ok([minx, miny, maxx, maxy])
+}
+
+fn parse_wkt_point(value: &str) -> Result<[f64; 2], Box<dyn std::error::Error>> {
+    let mut parts = value.split_whitespace();
+    let x = parts
+        .next()
+        .ok_or_else(|| format!("invalid WKT point {value:?}"))?
+        .parse::<f64>()?;
+    let y = parts
+        .next()
+        .ok_or_else(|| format!("invalid WKT point {value:?}"))?
+        .parse::<f64>()?;
+    Ok([x, y])
 }
 
 /// Returns a tuple of `(CellId, &Cell)` for each cell in column-major order.
@@ -792,10 +1058,16 @@ pub struct SquareGridStats {
 
 impl Display for SquareGridStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Nr. cells with vertices: {nr_cells}; Nr. vertices: {nr_vertices}, min.: {min}, max.: {max}, median: {median}, mean: {mean}",
-               nr_vertices = self.nr_vertices, nr_cells = self.nr_cells_with_content,
-               min = self.nr_vertices_min, max = self.nr_vertices_max,
-               median = self.nr_vertices_median, mean = self.nr_vertices_mean)
+        write!(
+            f,
+            "Nr. cells with vertices: {nr_cells}; Nr. vertices: {nr_vertices}, min.: {min}, max.: {max}, median: {median}, mean: {mean}",
+            nr_vertices = self.nr_vertices,
+            nr_cells = self.nr_cells_with_content,
+            min = self.nr_vertices_min,
+            max = self.nr_vertices_max,
+            median = self.nr_vertices_median,
+            mean = self.nr_vertices_mean
+        )
     }
 }
 
@@ -850,121 +1122,40 @@ pub fn bbox_to_wkt(bbox: &Bbox) -> String {
     )
 }
 
-/// 3D bounding box with quantized coordinates.
-///
-/// [min x, min y, min z, max x, max y, max z]
-#[derive(Debug, Default, Clone, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BboxQc(pub [i64; 6]); // This `pub [i64; 6]` makes the BboxQc constructor public
-
-impl BboxQc {
-    /// Compute the real-world coordinates from the quantized coordinates and the
-    /// transformation properties.
-    ///
-    /// Optionally, the z-coordinate limits can be overriden by the `arg_minz` and
-    /// `arg_maxz` arguments.
-    pub fn to_bbox(
-        &self,
-        transform: &crate::parser::Transform,
-        arg_minz: Option<i32>,
-        arg_maxz: Option<i32>,
-    ) -> Bbox {
-        // Get the real-world coordinates for the extent
-        let extent_rw_min = self.0[0..3]
-            .iter()
-            .enumerate()
-            .map(|(i, qc)| (*qc as f64 * transform.scale[i]) + transform.translate[i]);
-        let extent_rw_max = self.0[3..6]
-            .iter()
-            .enumerate()
-            .map(|(i, qc)| (*qc as f64 * transform.scale[i]) + transform.translate[i]);
-        let mut extent_rw: [f64; 6] = extent_rw_min
-            .chain(extent_rw_max)
-            .collect::<Vec<f64>>()
-            .try_into()
-            .expect("should be able to create an [f64; 6] from the extent_rw vector");
-        if let Some(minz) = arg_minz {
-            if extent_rw[2] < minz as f64 {
-                debug!(
-                "Setting min. z for the grid extent from provided value {}, instead of the computed value {}",
-                minz, extent_rw[2]
-            );
-                extent_rw[2] = minz as f64
-            }
-        }
-        if let Some(maxz) = arg_maxz {
-            if extent_rw[5] > maxz as f64 {
-                debug!(
-                "Setting max. z for the grid extent from provided value {}, instead of the computed value {}",
-                maxz, extent_rw[5]
-            );
-                extent_rw[5] = maxz as f64
-            }
-        }
-        extent_rw
+fn update_bbox(target: &mut Bbox, other: &Bbox) {
+    if other[0] < target[0] {
+        target[0] = other[0];
     }
-
-    // Update with another bounding box, if the other is larger.
-    pub fn update_with(&mut self, bbox_qc: &Self) {
-        if bbox_qc.0[0] < self.0[0] {
-            self.0[0] = bbox_qc.0[0]
-        }
-        if bbox_qc.0[3] > self.0[3] {
-            self.0[3] = bbox_qc.0[3]
-        }
-        if bbox_qc.0[1] < self.0[1] {
-            self.0[1] = bbox_qc.0[1]
-        }
-        if bbox_qc.0[4] > self.0[4] {
-            self.0[4] = bbox_qc.0[4]
-        }
-        if bbox_qc.0[2] < self.0[2] {
-            self.0[2] = bbox_qc.0[2]
-        }
-        if bbox_qc.0[5] > self.0[5] {
-            self.0[5] = bbox_qc.0[5]
-        }
+    if other[1] < target[1] {
+        target[1] = other[1];
+    }
+    if other[2] < target[2] {
+        target[2] = other[2];
+    }
+    if other[3] > target[3] {
+        target[3] = other[3];
+    }
+    if other[4] > target[4] {
+        target[4] = other[4];
+    }
+    if other[5] > target[5] {
+        target[5] = other[5];
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use morton_encoding::morton_encode;
 
     #[test]
     fn test_intersect_bbox() {
-        let extent = [195548.0, 538909.0, 0.0, 264268.0, 590410.0, 0.0];
-        let grid = SquareGrid::new(&extent, 400, 7415);
-        grid.export(None, None, None).unwrap();
-
-        // Polygon ((248923.44474360189633444 601084.25658657902386039, 249381.04931766359368339 601093.95845033996738493, 249369.73047660905285738 601954.19037048425525427, 248923.44474360189633444 601084.25658657902386039))
-        let bbox: Bbox = [248923.4, 601084.2, 0.0, 249381.0, 601954.1, 0.0];
-        // 133-155, 133-156, 133-157, 134-155, 134-156, 134-157
+        let grid = SquareGrid::new(&[0.0, 0.0, 0.0, 4.0, 4.0, 0.0], 1, 7415);
+        let bbox: Bbox = [1.2, 1.2, 0.0, 2.8, 2.8, 0.0];
         let expected = vec![
-            CellId {
-                row: 157,
-                column: 133,
-            },
-            CellId {
-                row: 157,
-                column: 134,
-            },
-            CellId {
-                row: 156,
-                column: 133,
-            },
-            CellId {
-                row: 156,
-                column: 134,
-            },
-            CellId {
-                row: 155,
-                column: 133,
-            },
-            CellId {
-                row: 155,
-                column: 134,
-            },
+            CellId { row: 1, column: 1 },
+            CellId { row: 2, column: 1 },
+            CellId { row: 1, column: 2 },
+            CellId { row: 2, column: 2 },
         ];
         let res = grid.intersect_bbox(&bbox);
         assert_eq!(expected.len(), res.len());
@@ -972,8 +1163,22 @@ mod tests {
     }
 
     #[test]
+    fn test_intersect_bbox_ranges_matches_intersect_bbox() {
+        let grid = SquareGrid::new(&[0.0, 0.0, 0.0, 4.0, 4.0, 0.0], 1, 7415);
+        let bbox: Bbox = [1.2, 1.2, 0.0, 2.8, 2.8, 0.0];
+        let (columns, rows) = grid.intersect_bbox_ranges(&bbox);
+        let mut from_ranges = Vec::new();
+        for column in columns {
+            for row in rows.clone() {
+                from_ranges.push(CellId { row, column });
+            }
+        }
+
+        assert_eq!(grid.intersect_bbox(&bbox), from_ranges);
+    }
+
+    #[test]
     fn test_create_grid() {
-        let extent = [84372.91, 446316.814, -10.66, 171800.0, 472700.0, 52.882];
         let extent = [13603.33, 314127.708, -15.0, 268943.608, 612658.036, 400.0];
         println!("extent: {}", bbox_to_wkt(&extent));
         let grid = SquareGrid::new(&extent, 500, 7415);
@@ -992,122 +1197,6 @@ mod tests {
                 column: 2_usize,
             }
         );
-    }
-
-    #[test]
-    fn test_morton_encode_rd() {
-        let coords = vec![
-            [84362.9, 446306.814],
-            [84362.9, 446706.814],
-            [84362.9, 447106.814],
-            [84362.9, 447506.814],
-            [84762.9, 446306.814],
-            [84762.9, 446706.814],
-            [84762.9, 447106.814],
-            [84762.9, 447506.814],
-            [85162.9, 446306.814],
-            [85162.9, 446706.814],
-            [85162.9, 447106.814],
-            [85162.9, 447506.814],
-            [85562.9, 446306.814],
-            [85562.9, 446706.814],
-            [85562.9, 447106.814],
-            [85562.9, 447506.814],
-        ];
-        let row_col = vec![
-            [0, 0],
-            [0, 1],
-            [0, 2],
-            [0, 3],
-            [1, 0],
-            [1, 1],
-            [1, 2],
-            [1, 3],
-            [2, 0],
-            [2, 1],
-            [2, 2],
-            [2, 3],
-            [3, 0],
-            [3, 1],
-            [3, 2],
-            [3, 3],
-        ];
-        let grid = coords.iter().zip(row_col.iter());
-
-        let mut morton: Vec<(u128, CellId)> = grid
-            .map(|(coord, idx)| {
-                let x: f64 = coord[0];
-                let y: f64 = coord[1];
-                let xu64 = x.floor() as u64;
-                let yu64 = y.floor() as u64;
-                let mc = morton_encode([xu64, yu64]);
-                (
-                    // interleave(&xu64, &yu64),
-                    mc,
-                    CellId {
-                        row: idx[0],
-                        column: idx[1],
-                    },
-                )
-            })
-            .collect();
-        morton.sort_by_key(|k| k.0);
-
-        let res_col_row_morton = [
-            [0, 0],
-            [1, 0],
-            [0, 1],
-            [1, 1],
-            [2, 0],
-            [3, 0],
-            [2, 1],
-            [3, 1],
-            [0, 2],
-            [1, 2],
-            [0, 3],
-            [1, 3],
-            [2, 2],
-            [3, 2],
-            [2, 3],
-            [3, 3],
-        ];
-        let _res_coords_morton = [
-            [84362.9, 446306.814],
-            [84762.9, 446306.814],
-            [84362.9, 446706.814],
-            [84762.9, 446706.814],
-            [85162.9, 446306.814],
-            [85562.9, 446306.814],
-            [85162.9, 446706.814],
-            [85562.9, 446706.814],
-            [84362.9, 447106.814],
-            [84762.9, 447106.814],
-            [84362.9, 447506.814],
-            [84762.9, 447506.814],
-            [85162.9, 447106.814],
-            [85562.9, 447106.814],
-            [85162.9, 447506.814],
-            [85562.9, 447506.814],
-        ];
-
-        for (i, (mc, cellid)) in morton.iter().enumerate() {
-            let res_cellid = CellId {
-                column: res_col_row_morton[i][0],
-                row: res_col_row_morton[i][1],
-            };
-            println!(
-                "correct: {} computed: {} morton: {}",
-                res_cellid, cellid, mc
-            );
-        }
-
-        for (i, (_mc, cellid)) in morton.iter().enumerate() {
-            let res_cellid = CellId {
-                column: res_col_row_morton[i][0],
-                row: res_col_row_morton[i][1],
-            };
-            assert_eq!(*cellid, res_cellid);
-        }
     }
 
     #[test]
@@ -1155,10 +1244,10 @@ mod tests {
             for y in 0..4u64 {
                 for f in 0..5 {
                     feature_set.push(crate::parser::Feature {
-                        centroid_qc: [0, 0],
-                        nr_vertices: 0,
-                        path_jsonl: Default::default(),
-                        bbox_qc: BboxQc([0, 0, 0, 0, 0, 0]),
+                        centroid: [0.0, 0.0],
+                        reference: Default::default(),
+                        bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
@@ -1176,10 +1265,10 @@ mod tests {
             for y in 0..4u64 {
                 for f in 0..5 {
                     feature_set.push(crate::parser::Feature {
-                        centroid_qc: [0, 0],
-                        nr_vertices: 0,
-                        path_jsonl: Default::default(),
-                        bbox_qc: BboxQc([0, 0, 0, 0, 0, 0]),
+                        centroid: [0.0, 0.0],
+                        reference: Default::default(),
+                        bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
@@ -1201,10 +1290,10 @@ mod tests {
             for y in 0..16u64 {
                 for f in 0..5 {
                     feature_set.push(crate::parser::Feature {
-                        centroid_qc: [0, 0],
-                        nr_vertices: 0,
-                        path_jsonl: Default::default(),
-                        bbox_qc: BboxQc([0, 0, 0, 0, 0, 0]),
+                        centroid: [0.0, 0.0],
+                        reference: Default::default(),
+                        bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        needs_type_filter: false,
                     });
                     let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);

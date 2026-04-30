@@ -10,8 +10,15 @@
 
 # misc
 /tmp
+.env
+
+# Test data
+/tests/output*
+/cityjson-convert/tests/output/
+.geodepot.bak
 
 # Debug data
 *.tsv
 *.bincode
 *.log
+/docs/plans/
