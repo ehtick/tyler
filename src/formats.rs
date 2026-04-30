@@ -1879,15 +1879,21 @@ pub mod cesium3dtiles {
             let metadata_path = dataset_dir.join("metadata.city.json");
             fs::write(&metadata_path, &feature_base_document).expect("write metadata");
 
+            let cityobject_types = Some(vec![
+                crate::parser::CityObjectType::Building,
+                crate::parser::CityObjectType::BuildingPart,
+            ]);
+            let feature_filter = crate::build_feature_filter(
+                cityobject_types.as_ref(),
+                &std::collections::BTreeMap::new(),
+            );
             let mut world = crate::parser::World::from_cjindex(
                 crate::parser::InputSource::from_cjindex_resolved(&resolved),
                 metadata_path,
                 feature_base_document,
                 200,
-                Some(vec![
-                    crate::parser::CityObjectType::Building,
-                    crate::parser::CityObjectType::BuildingPart,
-                ]),
+                cityobject_types,
+                feature_filter,
                 None,
                 None,
             )

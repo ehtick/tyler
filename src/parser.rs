@@ -41,6 +41,7 @@ thread_local! {
 #[derive(Serialize, Deserialize)]
 pub struct World {
     pub cityobject_types: Option<Vec<CityObjectType>>,
+    pub feature_filter: cityjson_index::FeatureFilter,
     pub crs: Crs,
     pub features: FeatureSet,
     pub feature_base_document: Vec<u8>,
@@ -69,10 +70,16 @@ struct ExtentStats {
     nr_features: usize,
     nr_features_ignored: usize,
     cityobject_types_ignored: Vec<CityObjectType>,
+    filter_summary: cityjson_index::FeatureFilterSummary,
 }
 
 impl ExtentStats {
-    fn add_selected_geometry_stats(&mut self, stats: SelectedGeometryStats) {
+    fn add_selected_geometry_stats(
+        &mut self,
+        stats: SelectedGeometryStats,
+        diagnostics: &cityjson_index::FeatureFilterDiagnostics,
+    ) {
+        self.filter_summary.add(diagnostics);
         if let Some(model_bbox) = stats.bbox {
             if let Some(current) = self.extent.as_mut() {
                 merge_bbox(current, &model_bbox);
@@ -97,6 +104,7 @@ impl ExtentStats {
         self.nr_features += other.nr_features;
         self.nr_features_ignored += other.nr_features_ignored;
         self.extend_ignored_types(other.cityobject_types_ignored);
+        merge_filter_summary(&mut self.filter_summary, other.filter_summary);
     }
 
     fn extend_ignored_types(&mut self, ignored_types: Vec<CityObjectType>) {
@@ -105,6 +113,29 @@ impl ExtentStats {
                 self.cityobject_types_ignored.push(cotype);
             }
         }
+    }
+}
+
+fn merge_filter_summary(
+    target: &mut cityjson_index::FeatureFilterSummary,
+    source: cityjson_index::FeatureFilterSummary,
+) {
+    target.available_types.extend(source.available_types);
+    target.retained_types.extend(source.retained_types);
+    target.ignored_types.extend(source.ignored_types);
+    merge_lod_summary(&mut target.available_lods, source.available_lods);
+    merge_lod_summary(&mut target.retained_lods, source.retained_lods);
+    target.missing_lods.extend(source.missing_lods);
+    target.retained_feature_count += source.retained_feature_count;
+    target.ignored_feature_count += source.ignored_feature_count;
+}
+
+fn merge_lod_summary(
+    target: &mut BTreeMap<String, std::collections::BTreeSet<String>>,
+    source: BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (cityobject_type, lods) in source {
+        target.entry(cityobject_type).or_default().extend(lods);
     }
 }
 
@@ -169,6 +200,7 @@ impl World {
         feature_base_document: Vec<u8>,
         cellsize: u32,
         cityobject_types: Option<Vec<CityObjectType>>,
+        feature_filter: cityjson_index::FeatureFilter,
         arg_minz: Option<i32>,
         arg_maxz: Option<i32>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -176,22 +208,27 @@ impl World {
         let crs = Crs::from_model(&metadata)?;
 
         info!(
-            "Computing extent from the features of type {:?}",
-            cityobject_types
+            "Computing extent from features with CityObject types {:?} and LoD filter {:?}",
+            cityobject_types, feature_filter
         );
 
-        let (extent, nr_features, nr_features_ignored, cityobject_types_ignored) =
-            if cityobject_types.is_none() {
+        let (extent, nr_features, nr_features_ignored, cityobject_types_ignored, filter_summary) =
+            if feature_filter.is_active() {
+                Self::extent_from_cjindex_features(
+                    &input_source,
+                    cityobject_types.as_ref(),
+                    &feature_filter,
+                )?
+            } else {
                 let city_index = input_source.open_index()?;
                 Self::extent_from_cjindex_bbox_pages(&city_index)?
-            } else {
-                Self::extent_from_cjindex_features(&input_source, cityobject_types.as_ref())?
             };
+        filter_summary.ensure_requested_lods_available(&feature_filter)?;
 
         let mut extent = extent.ok_or_else(|| {
             format!(
-                "Did not find any CityJSONFeatures of type {:?} in cjindex dataset",
-                cityobject_types
+                "Did not find any CityJSONFeatures matching CityObject types {:?} and LoD filter {:?} in cjindex dataset",
+                cityobject_types, feature_filter
             )
         })?;
 
@@ -214,6 +251,22 @@ impl World {
             "Ignored {} features of type {:?}",
             nr_features_ignored, &cityobject_types_ignored
         );
+        info!(
+            "Available CityObject types after scan: {:?}",
+            filter_summary.available_types
+        );
+        info!(
+            "Retained CityObject types after filtering: {:?}",
+            filter_summary.retained_types
+        );
+        info!(
+            "Available LoDs by CityObject type after filtering: {:?}",
+            filter_summary.available_lods
+        );
+        info!(
+            "Retained LoDs by CityObject type after filtering: {:?}",
+            filter_summary.retained_lods
+        );
         debug!("extent: {:?}", &extent);
         info!(
             "Computed extent from features: {}",
@@ -227,6 +280,7 @@ impl World {
             features: Vec::with_capacity(nr_features),
             crs,
             feature_base_document,
+            feature_filter,
             grid,
             cityobject_types,
             path_metadata,
@@ -234,24 +288,20 @@ impl World {
         })
     }
 
-    fn extent_from_cjindex_bbox_pages(
-        city_index: &CityIndex,
-    ) -> Result<(Option<Bbox>, usize, usize, Vec<CityObjectType>), Box<dyn std::error::Error>> {
-        let Some(summary) = city_index.feature_bounds_summary()? else {
-            return Ok((None, 0, 0, Vec::new()));
-        };
-        Ok((
-            Some(Self::cjindex_bounds_to_world_bbox(&summary.bounds)),
-            summary.feature_count,
-            0,
-            Vec::new(),
-        ))
-    }
-
     fn extent_from_cjindex_features(
         input_source: &InputSource,
         cityobject_types: Option<&Vec<CityObjectType>>,
-    ) -> Result<(Option<Bbox>, usize, usize, Vec<CityObjectType>), Box<dyn std::error::Error>> {
+        feature_filter: &cityjson_index::FeatureFilter,
+    ) -> Result<
+        (
+            Option<Bbox>,
+            usize,
+            usize,
+            Vec<CityObjectType>,
+            cityjson_index::FeatureFilterSummary,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let city_index = input_source.open_index()?;
         let (chunk_tx, chunk_rx) =
             std::sync::mpsc::sync_channel::<Vec<cityjson_index::IndexedFeatureRef>>(64);
@@ -283,6 +333,7 @@ impl World {
                         input_source,
                         &chunk,
                         cityobject_types,
+                        feature_filter,
                     )
                 })
                 .try_reduce(ExtentStats::default, |mut a, b| {
@@ -299,21 +350,38 @@ impl World {
             total.nr_features,
             total.nr_features_ignored,
             total.cityobject_types_ignored,
+            total.filter_summary,
         ))
     }
 
-    fn extent_from_cjindex_feature_refs_chunk(
-        input_source: &InputSource,
-        feature_refs: &[cityjson_index::IndexedFeatureRef],
-        cityobject_types: Option<&Vec<CityObjectType>>,
-    ) -> Result<ExtentStats, std::io::Error> {
-        let models = Self::read_cjindex_features_thread_local(input_source, feature_refs)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let mut chunk = ExtentStats::default();
-        for model in models {
-            chunk.add_selected_geometry_stats(selected_geometry_stats(&model, cityobject_types));
-        }
-        Ok(chunk)
+    fn extent_from_cjindex_bbox_pages(
+        city_index: &CityIndex,
+    ) -> Result<
+        (
+            Option<Bbox>,
+            usize,
+            usize,
+            Vec<CityObjectType>,
+            cityjson_index::FeatureFilterSummary,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let Some(summary) = city_index.feature_bounds_summary()? else {
+            return Ok((
+                None,
+                0,
+                0,
+                Vec::new(),
+                cityjson_index::FeatureFilterSummary::default(),
+            ));
+        };
+        Ok((
+            Some(Self::cjindex_bounds_to_world_bbox(&summary.bounds)),
+            summary.feature_count,
+            0,
+            Vec::new(),
+            cityjson_index::FeatureFilterSummary::default(),
+        ))
     }
 
     fn cjindex_bounds_to_world_bbox(bounds: &cityjson_index::FeatureBounds) -> Bbox {
@@ -325,6 +393,28 @@ impl World {
             bounds.max_y,
             bounds.max_z,
         ]
+    }
+
+    fn extent_from_cjindex_feature_refs_chunk(
+        input_source: &InputSource,
+        feature_refs: &[cityjson_index::IndexedFeatureRef],
+        _cityobject_types: Option<&Vec<CityObjectType>>,
+        feature_filter: &cityjson_index::FeatureFilter,
+    ) -> Result<ExtentStats, std::io::Error> {
+        let filtered_features = Self::read_filtered_cjindex_features_thread_local(
+            input_source,
+            feature_refs,
+            feature_filter,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut chunk = ExtentStats::default();
+        for filtered in filtered_features {
+            chunk.add_selected_geometry_stats(
+                selected_geometry_stats(&filtered.model, None),
+                &filtered.diagnostics,
+            );
+        }
+        Ok(chunk)
     }
 
     pub(crate) fn read_cjindex_features_thread_local(
@@ -359,6 +449,39 @@ impl World {
         })
     }
 
+    fn read_filtered_cjindex_features_thread_local(
+        input_source: &InputSource,
+        features: &[cityjson_index::IndexedFeatureRef],
+        filter: &cityjson_index::FeatureFilter,
+    ) -> cityjson_lib::Result<Vec<cityjson_index::FilteredFeature>> {
+        let index_path = &input_source.index_path;
+
+        CJINDEX_THREAD_LOCAL.with(|cell| {
+            let needs_open = {
+                let slot = cell.borrow();
+                match slot.as_ref() {
+                    Some((cached_index_path, _)) => cached_index_path != index_path,
+                    None => true,
+                }
+            };
+
+            if needs_open {
+                let city_index = input_source.open_index().map_err(|error| {
+                    cityjson_lib::Error::Io(std::io::Error::other(error.to_string()))
+                })?;
+                *cell.borrow_mut() = Some((index_path.clone(), city_index));
+            }
+
+            let slot = cell.borrow();
+            let Some((_, city_index)) = slot.as_ref() else {
+                return Err(cityjson_lib::Error::Io(std::io::Error::other(
+                    "cjindex thread-local index cache was not initialized",
+                )));
+            };
+            city_index.read_filtered_features(features, filter)
+        })
+    }
+
     pub fn index_with_grid(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Counting vertices in grid cells");
 
@@ -373,6 +496,7 @@ impl World {
         let grid: &mut crate::spatial_structs::SquareGrid = &mut self.grid;
         let input_source: &InputSource = &self.input_source;
         let cityobject_types: Option<&Vec<CityObjectType>> = self.cityobject_types.as_ref();
+        let feature_filter: &cityjson_index::FeatureFilter = &self.feature_filter;
         let grid_layout = grid.layout();
 
         let (chunk_tx, chunk_rx) =
@@ -422,6 +546,7 @@ impl World {
                             input_source,
                             &grid_layout,
                             cityobject_types,
+                            feature_filter,
                             &chunk,
                         );
                         let _ = tx.send(result);
@@ -466,34 +591,43 @@ impl World {
         input_source: &InputSource,
         grid_layout: &GridLayout,
         cityobject_types: Option<&Vec<CityObjectType>>,
+        feature_filter: &cityjson_index::FeatureFilter,
         feature_refs: &[cityjson_index::IndexedFeatureRef],
     ) -> Result<Vec<Option<FeatureInGridCells>>, std::io::Error> {
-        let models = Self::read_cjindex_features_thread_local(input_source, feature_refs)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(feature_refs
+        let filtered_features = Self::read_filtered_cjindex_features_thread_local(
+            input_source,
+            feature_refs,
+            feature_filter,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        feature_refs
             .iter()
             .cloned()
-            .zip(models.iter())
-            .map(|(feature_ref, model)| {
+            .zip(filtered_features.iter())
+            .map(|(feature_ref, filtered)| {
                 Self::index_feature_model(
                     grid_layout,
                     cityobject_types,
                     FeatureReference::CjIndexRef(feature_ref),
-                    model,
+                    &filtered.model,
                 )
             })
-            .collect())
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn index_feature_model(
         grid_layout: &GridLayout,
-        cityobject_types: Option<&Vec<CityObjectType>>,
+        _cityobject_types: Option<&Vec<CityObjectType>>,
         feature_reference: FeatureReference,
         model: &cityjson_lib::CityModel,
-    ) -> Option<FeatureInGridCells> {
-        let stats = selected_geometry_stats(model, cityobject_types);
-        let bbox = stats.bbox?;
-        let centroid = stats.centroid?;
+    ) -> Result<Option<FeatureInGridCells>, std::io::Error> {
+        let stats = selected_geometry_stats(model, None);
+        let Some(bbox) = stats.bbox else {
+            return Ok(None);
+        };
+        let Some(centroid) = stats.centroid else {
+            return Ok(None);
+        };
 
         let uses_unique_assignment =
             selected_types_use_unique_assignment(&stats.selected_object_types);
@@ -501,21 +635,28 @@ impl World {
             centroid,
             reference: feature_reference,
             bbox,
-            needs_type_filter: !stats.ignored_object_types.is_empty(),
+            needs_type_filter: false,
         };
 
         if uses_unique_assignment {
-            let (cellid, nr_vertices) =
-                count_unique_assignment_cell(model, &stats.selected_vertices, grid_layout, &bbox)?;
-            return Some(Self::feature_to_unique_cell(feature, cellid, nr_vertices));
+            let Some((cellid, nr_vertices)) =
+                count_unique_assignment_cell(model, &stats.selected_vertices, grid_layout, &bbox)
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Self::feature_to_unique_cell(
+                feature,
+                cellid,
+                nr_vertices,
+            )));
         }
 
         let cell_vtx_cnt =
             count_vertices_in_grid(model, &stats.selected_vertices, grid_layout, &bbox);
         if cell_vtx_cnt.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Self::feature_to_cells(feature, cell_vtx_cnt)
+        Ok(Self::feature_to_cells(feature, cell_vtx_cnt))
     }
 
     fn feature_to_cells(feature: Feature, cell_vtx_cnt: CellCounts) -> Option<FeatureInGridCells> {
@@ -1057,14 +1198,17 @@ impl CellCounts {
     }
 }
 
-fn is_selected_type(filter: Option<&Vec<CityObjectType>>, object_type: CityObjectType) -> bool {
+pub(crate) fn is_selected_type(
+    filter: Option<&Vec<CityObjectType>>,
+    object_type: CityObjectType,
+) -> bool {
     match filter {
         Some(types) => types.contains(&object_type),
         None => true,
     }
 }
 
-fn map_cityobject_type<SS: cityjson::resources::storage::StringStorage>(
+pub(crate) fn map_cityobject_type<SS: cityjson::resources::storage::StringStorage>(
     object_type: &cityjson::v2_0::CityObjectType<SS>,
 ) -> Option<CityObjectType> {
     use cityjson::v2_0::CityObjectType as CjType;
