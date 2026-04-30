@@ -834,7 +834,6 @@ fn prepare_feature_model(
     cleanup_feature: bool,
 ) -> Result<Option<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let mut model = model;
-    let prepare_started = Instant::now();
     let lods_pruned = prune_lod_geometries(&mut model, feature_type_lods)?;
     if include_parent_attributes {
         inherit_parent_attributes(&mut model)?;
@@ -869,23 +868,9 @@ fn prepare_feature_model(
         return Ok(None);
     }
     if cleanup_feature {
-        let cleanup_started = Instant::now();
         let cleaned = cleanup_and_update_extents(model)?;
-        debug!(
-            "Cleaned debug tile feature {} in {:?} (total prepare {:?})",
-            feature_id,
-            cleanup_started.elapsed(),
-            prepare_started.elapsed()
-        );
         Ok(Some(cleaned))
     } else {
-        debug!(
-            "Prepared tile feature {} in {:?} (type_filter={}, remove_empty={}, cleanup=false)",
-            feature_id,
-            prepare_started.elapsed(),
-            needs_type_filter,
-            remove_empty_geometry
-        );
         Ok(Some(model))
     }
 }

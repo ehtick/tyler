@@ -491,14 +491,7 @@ impl World {
         feature_reference: FeatureReference,
         model: &cityjson_lib::CityModel,
     ) -> Option<FeatureInGridCells> {
-        let stats_started = Instant::now();
         let stats = selected_geometry_stats(model, cityobject_types);
-        debug!(
-            "selected_geometry_stats collected {} vertices for {:?} in {:?}",
-            stats.selected_vertices.len(),
-            feature_reference,
-            stats_started.elapsed()
-        );
         let bbox = stats.bbox?;
         let centroid = stats.centroid?;
 
@@ -512,27 +505,13 @@ impl World {
         };
 
         if uses_unique_assignment {
-            let count_started = Instant::now();
             let (cellid, nr_vertices) =
                 count_unique_assignment_cell(model, &stats.selected_vertices, grid_layout, &bbox)?;
-            debug!(
-                "Selected unique assignment grid cell {:?} with {} vertices in {:?}",
-                cellid,
-                nr_vertices,
-                count_started.elapsed()
-            );
             return Some(Self::feature_to_unique_cell(feature, cellid, nr_vertices));
         }
 
-        let count_started = Instant::now();
         let cell_vtx_cnt =
             count_vertices_in_grid(model, &stats.selected_vertices, grid_layout, &bbox);
-        debug!(
-            "Counted {} grid cells for {:?} in {:?}",
-            cell_vtx_cnt.len(),
-            feature.reference,
-            count_started.elapsed()
-        );
         if cell_vtx_cnt.is_empty() {
             return None;
         }
