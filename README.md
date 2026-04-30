@@ -28,7 +28,7 @@ Additional information about the internals of *tyler* you will find in the [desi
 
 ## Installation
 
-Pull the docker image with `docker pull 3dgi/tyler:<version>`, e.g. `docker pull 3dgi/tyler:0.4.1`.
+Pull the docker image with `docker pull 3dgi/tyler:<version>`, e.g. `docker pull 3dgi/tyler:0.4.1-beta1`.
 
 ### Compiling from source
 
@@ -139,10 +139,23 @@ For example:
 
 `tyler /some/dataset-root --output /some/output`
 
-In case you have old files in the legacy layout and old CityJSON version, you can upgrade like this:
-`./script/concat_city_jsonl.sh metadata.city.jsonl FolderWithFeatures combined.city.jsonl
+In case you have the legacy `feature-files` layout and the current CityJSON version (v2.0), you need to rename the CityJSON file(s) that contain the `transform` property to `metadata.json`, so the
+`cityjson-index` can discover them.
+For example:
+
+```
+metadata.json # incldues the transform property
+feature1.city.jsonl
+feature2.city.jsonl
+```
+
+In case you have the legacy `feature-files` layout and old CityJSON version, you can upgrade like this:
+
+```
+./script/concat_city_jsonl.sh metadata.city.jsonl FolderWithFeatures combined.city.jsonl
 cat combined.city.jsonl | cjseq collect > combined.city.json
-cjio combined.city.json upgrade save combined/combined_upg.city.json`
+cjio combined.city.json upgrade save combined/combined_upg.city.json
+```
 
 #### Output
 
