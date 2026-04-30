@@ -54,7 +54,7 @@
 
           tyler = pkgs.rustPlatform.buildRustPackage {
             pname = "tyler";
-            version = "0.4.1-alpha1";
+            version = "0.4.1";
 
             src = self;
             cargoLock = {

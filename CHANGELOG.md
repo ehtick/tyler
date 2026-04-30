@@ -1,6 +1,14 @@
 # Changelog
 
-## tyler 0.4.1 (unreleased)
+## tyler 0.4.1 (2026-04-30)
+
+The main features of the new version:
+
+- The dependency on geoflow is completely removed, and the glTF conversion was ported to Rust.
+- Tyler can now read regular CityJSON files, CityJSONSeq files, and the legacy feature-files as input.
+- Improved parallelism so Tyler scales better with the available CPU cores.
+- Several existing bugs have been fixed in the glTF conversion and tileset generation, so implicit tilesets are fully functional.
+- Performance improvements throughout the codebase, resulting in significant speedups.
 
 ### Added
 
@@ -41,7 +49,8 @@
 - `--include-parent-attributes` now copies inherited parent attributes even when the parent object type itself is not selected.
 - `--3dtiles-metadata-class` now defaults to `citymodel`.
 - When no `--lod-*` override is supplied, Tyler now keeps the highest available LoD per CityObject by default.
-- CityObject type and LoD filtering now run once through the shared `cjindex` filtering path before extent, grid, tile, and export decisions, so tile bounds and output content use the same retained geometry.
+- CityObject type and LoD filtering now run once through the shared `cjindex` filtering path before extent, grid, tile, and export decisions, so tile bounds and output content use the same retained
+  geometry.
 - README, Dockerfiles, Nix, and bundled resources were updated for the new pipeline.
 
 ### Fixed
