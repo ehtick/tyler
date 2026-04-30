@@ -139,6 +139,11 @@ For example:
 
 `tyler /some/dataset-root --output /some/output`
 
+In case you have old files in the legacy layout and old CityJSON version, you can upgrade like this:
+`./script/concat_city_jsonl.sh metadata.city.jsonl FolderWithFeatures combined.city.jsonl
+cat combined.city.jsonl | cjseq collect > combined.city.json
+cjio combined.city.json upgrade save combined/combined_upg.city.json`
+
 #### Output
 
 `--output`
