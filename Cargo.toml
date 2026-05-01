@@ -19,8 +19,8 @@ name = "tyler"
 path = "src/main.rs"
 
 [dependencies]
-cityjson-lib = { git = "https://github.com/3DGI/cityjson", branch = "main", features = ["json"] }
-cityjson-index = { git = "https://github.com/3DGI/cityjson", branch = "main" }
+cityjson-lib = { git = "https://github.com/3DGI/cityjson-rs", branch = "main", features = ["json"] }
+cityjson-index = { git = "https://github.com/3DGI/cityjson-rs", branch = "main" }
 cityjson-convert = { path = "cityjson-convert" }
 log = "0.4.17"
 env_logger = "0.10.0"

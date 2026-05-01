@@ -20,9 +20,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use cityjson::v2_0::vertex::VertexIndex as GeometryVertexIndex;
 use cityjson_index::{CityIndex, StorageLayout};
-use cityjson_lib::{cityjson, json};
+use cityjson_lib::{cityjson_types as cityjson, json};
+use cityjson_lib::cityjson_types::v2_0::vertex::VertexIndex as GeometryVertexIndex;
 use log::{debug, info};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};

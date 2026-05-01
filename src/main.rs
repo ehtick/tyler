@@ -74,7 +74,7 @@ use std::time::Instant;
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use crate::proj::Proj;
-use cityjson_lib::cityjson::prelude::CityObjectHandle;
+use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
 use clap::Parser;
 use log::{debug, info, log_enabled, warn, Level};
 use rayon::prelude::*;
@@ -945,7 +945,7 @@ fn collect_parent_attributes(
     parent_handles: &[CityObjectHandle],
     visited: &mut HashSet<CityObjectHandle>,
     inherited_keys: &mut HashSet<String>,
-    inherited_attributes: &mut Vec<(String, cityjson_lib::cityjson::v2_0::OwnedAttributeValue)>,
+    inherited_attributes: &mut Vec<(String, cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for parent_handle in parent_handles {
         if !visited.insert(*parent_handle) {
@@ -1100,10 +1100,10 @@ fn apply_object_attribute_types(
 }
 
 fn coerce_object_attribute_value(
-    value: &cityjson_lib::cityjson::v2_0::OwnedAttributeValue,
+    value: &cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue,
     attribute_type: ObjectAttributeType,
-) -> Option<cityjson_lib::cityjson::v2_0::OwnedAttributeValue> {
-    use cityjson_lib::cityjson::v2_0::OwnedAttributeValue as AttributeValue;
+) -> Option<cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue> {
+    use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue as AttributeValue;
 
     match attribute_type {
         ObjectAttributeType::String => match value {

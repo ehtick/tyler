@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::proj::Proj;
 use crate::{ExportOptions, GeographicClipRegion, GeometryPlacement};
 use anyhow::{bail, Context, Result};
-use cityjson_lib::cityjson::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
+use cityjson_lib::cityjson_types::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
 use cityjson_lib::CityModel;
 use earcutr::earcut;
 use gltf::json;
@@ -1049,7 +1049,7 @@ impl MeshCollector {
 
     fn collect_feature_attributes(
         model: &CityModel,
-        cityobject: &CityObject<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+        cityobject: &CityObject<cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage>,
     ) -> BTreeMap<String, MetadataValue> {
         let mut attributes = Self::extract_attributes(cityobject);
         if !attributes.is_empty() {
@@ -1071,7 +1071,7 @@ impl MeshCollector {
     }
 
     fn extract_attributes(
-        cityobject: &CityObject<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+        cityobject: &CityObject<cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage>,
     ) -> BTreeMap<String, MetadataValue> {
         let mut attributes = BTreeMap::new();
         let Some(cityjson_attributes) = cityobject.attributes() else {
@@ -1089,7 +1089,7 @@ impl MeshCollector {
     }
 
     fn convert_attribute_value(
-        value: &AttributeValue<cityjson_lib::cityjson::resources::storage::OwnedStringStorage>,
+        value: &AttributeValue<cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage>,
     ) -> Option<MetadataValue> {
         match value {
             AttributeValue::Bool(value) => Some(MetadataValue::Bool(*value)),

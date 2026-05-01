@@ -287,14 +287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "cityjson"
-version = "0.8.0"
-source = "git+https://github.com/3DGI/cityjson?branch=main#ec724d3c3755552a5db8557cdc0025db6cb8c25d"
-dependencies = [
- "num 0.4.3",
-]
-
-[[package]]
 name = "cityjson-convert"
 version = "0.1.0"
 dependencies = [
@@ -315,10 +307,11 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.8.0"
-source = "git+https://github.com/3DGI/cityjson?branch=main#ec724d3c3755552a5db8557cdc0025db6cb8c25d"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
 dependencies = [
  "cityjson-lib",
+ "cityjson-types",
  "clap",
  "flate2",
  "flatgeobuf",
@@ -336,11 +329,11 @@ dependencies = [
 
 [[package]]
 name = "cityjson-json"
-version = "0.8.0"
-source = "git+https://github.com/3DGI/cityjson?branch=main#ec724d3c3755552a5db8557cdc0025db6cb8c25d"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
 dependencies = [
  "ahash",
- "cityjson",
+ "cityjson-types",
  "derive_more",
  "serde",
  "serde_json",
@@ -348,12 +341,20 @@ dependencies = [
 
 [[package]]
 name = "cityjson-lib"
-version = "0.8.0"
-source = "git+https://github.com/3DGI/cityjson?branch=main#ec724d3c3755552a5db8557cdc0025db6cb8c25d"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
 dependencies = [
- "cityjson",
  "cityjson-json",
+ "cityjson-types",
  "serde_json",
+]
+
+[[package]]
+name = "cityjson-types"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
+dependencies = [
+ "num 0.4.3",
 ]
 
 [[package]]
