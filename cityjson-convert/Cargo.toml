@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Balázs Dukai <balazs.dukai@3dgi.nl>", "Ravi Peters <ravi.peters@3dgi.nl>"]
 description = "CityJSON format converter"
+repository = "https://github.com/3DGI/tyler"
+homepage = "https://github.com/3DGI/tyler"
+documentation = "https://docs.rs/cityjson-convert/"
+readme = "README.md"
 license = "Apache-2.0"
+keywords = ["cityjson", "gltf", "conversion", "geospatial"]
+categories = ["command-line-utilities", "science::geo"]
 
 [[bin]]
 name = "cjconvert"
@@ -12,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
-cityjson-lib = { git = "https://github.com/3DGI/cityjson-rs", branch = "main", features = ["json"] }
+cityjson-lib = { version = "0.9.0", features = ["json"] }
 clap = { version = "4.6", features = ["cargo", "derive"] }
 earcutr = "0.5.0"
 env_logger = "0.11.0"

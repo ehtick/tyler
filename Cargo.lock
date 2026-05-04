@@ -308,7 +308,8 @@ dependencies = [
 [[package]]
 name = "cityjson-index"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "943ec7f34564c8b7d494adce7e47290d83bc1c1dedd9b7016aea855fb814062d"
 dependencies = [
  "cityjson-lib",
  "cityjson-types",
@@ -330,7 +331,8 @@ dependencies = [
 [[package]]
 name = "cityjson-json"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52306b4b068add8ed00668bf6ced5c48765733a514d46075653119cd1bc701d6"
 dependencies = [
  "ahash",
  "cityjson-types",
@@ -342,7 +344,8 @@ dependencies = [
 [[package]]
 name = "cityjson-lib"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0a7d0dde424ae64b868649a45c95e464d9964cd4ada9a805cc7c7c137e733b"
 dependencies = [
  "cityjson-json",
  "cityjson-types",
@@ -352,7 +355,8 @@ dependencies = [
 [[package]]
 name = "cityjson-types"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs?branch=main#89f33771073a2dd6909b20272e83a24e24608b01"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cc5eff170b19635c72992c52a03a549421a7f0e910e5473568aa63b8fadd84"
 dependencies = [
  "num 0.4.3",
 ]
