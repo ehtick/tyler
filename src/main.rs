@@ -57,6 +57,7 @@
     clippy::stable_sort_primitive,
     clippy::useless_vec
 )]
+mod cityjson_edit;
 mod cli;
 mod coordinates;
 mod formats;
@@ -70,9 +71,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::cityjson_edit::apply_cityobject_colors;
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
+use cityjson_lib::cityjson_types::v2_0::appearance::RGB;
 use cityjson_lib::ops::Transformer;
 use clap::{Parser, ValueEnum};
 use log::{debug, info, log_enabled, warn, Level};
@@ -231,6 +234,56 @@ fn build_glb_export_options(
         quantize_geometry: true,
         meshopt_compression: true,
     }
+}
+
+fn build_cityjson_object_colors(cli: &crate::cli::Cli) -> BTreeMap<String, RGB> {
+    let mut object_colors = BTreeMap::new();
+
+    for (feature_type, color) in [
+        ("Building", cli.color_building.as_ref()),
+        ("BuildingPart", cli.color_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.color_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.color_tin_relief.as_ref()),
+        ("Road", cli.color_road.as_ref()),
+        ("Railway", cli.color_railway.as_ref()),
+        ("TransportSquare", cli.color_transport_square.as_ref()),
+        ("WaterBody", cli.color_water_body.as_ref()),
+        ("PlantCover", cli.color_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.color_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.color_land_use.as_ref()),
+        ("CityFurniture", cli.color_city_furniture.as_ref()),
+        ("Bridge", cli.color_bridge.as_ref()),
+        ("BridgePart", cli.color_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.color_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.color_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.color_tunnel.as_ref()),
+        ("TunnelPart", cli.color_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.color_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.color_generic_city_object.as_ref()),
+    ] {
+        if let Some(color) = color {
+            object_colors.insert(feature_type.to_string(), parse_cityjson_rgb(color));
+        }
+    }
+
+    object_colors
+}
+
+fn parse_cityjson_rgb(color: &str) -> RGB {
+    debug_assert!(color.len() == 7 && color.starts_with('#'));
+    let red = u8::from_str_radix(&color[1..3], 16).expect("validated hex color") as f32 / 255.0;
+    let green = u8::from_str_radix(&color[3..5], 16).expect("validated hex color") as f32 / 255.0;
+    let blue = u8::from_str_radix(&color[5..7], 16).expect("validated hex color") as f32 / 255.0;
+    RGB::new(red, green, blue)
 }
 
 fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
@@ -849,6 +902,7 @@ fn build_tile_debug_cityjsonseq(
     feature_ids: &[usize],
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
+    cityjson_colors: &BTreeMap<String, RGB>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
     let models = prepare_tile_feature_models(
@@ -859,6 +913,10 @@ fn build_tile_debug_cityjsonseq(
         true,
     )?;
     let base_root = cityjson_lib::json::from_slice(&world.feature_base_document)?;
+    let mut models = models;
+    for model in &mut models {
+        apply_cityobject_colors(model, cityjson_colors)?;
+    }
     let mut feature_output = Vec::new();
     cityjson_convert::write_cityjsonseq(
         &mut feature_output,
@@ -1316,6 +1374,7 @@ struct TileWriteContext<'a> {
     quadtree: &'a spatial_structs::QuadTree,
     object_attribute_types: BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
+    cityjson_colors: BTreeMap<String, RGB>,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1661,8 +1720,10 @@ impl OutputFormatBackend for CityjsonBackend {
             .output_tiles_dir
             .join(job.content_tile_coord.to_string())
             .with_extension("city.json");
+        let mut model = model.clone();
+        apply_cityobject_colors(&mut model, &context.cityjson_colors)?;
         cityjson_convert::convert_to_cityjson(
-            model,
+            &model,
             &output_file,
             &cityjson_convert::JsonExportOptions::default(),
         )?;
@@ -1725,7 +1786,7 @@ impl OutputFormatBackend for CityjsonseqBackend {
             .output_tiles_dir
             .join(job.content_tile_coord.to_string())
             .with_extension("city.jsonl");
-        let models = build_tile_cityjsonseq_models(
+        let mut models = build_tile_cityjsonseq_models(
             context.world,
             &job.feature_ids,
             &context.object_attribute_types,
@@ -1733,6 +1794,9 @@ impl OutputFormatBackend for CityjsonseqBackend {
         )?;
         if models.is_empty() {
             return Err("tile CityJSONSeq preparation removed all CityObjects".into());
+        }
+        for model in &mut models {
+            apply_cityobject_colors(model, &context.cityjson_colors)?;
         }
         let base_root = cityjson_lib::json::from_slice(&context.world.feature_base_document)?;
         cityjson_convert::convert_to_cityjsonseq(
@@ -2064,6 +2128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quadtree: &quadtree,
             object_attribute_types: object_attribute_types.clone(),
             include_parent_attributes: cli.include_parent_attributes,
+            cityjson_colors: build_cityjson_object_colors(&cli),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
@@ -2097,6 +2162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &job.feature_ids,
                     &object_attribute_types,
                     cli.include_parent_attributes,
+                    &tile_write_context.cityjson_colors,
                 ) {
                     Ok(bytes) => bytes,
                     Err(error) => {

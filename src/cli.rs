@@ -254,14 +254,6 @@ struct NoEffectInfoRule {
 
 const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
     NoEffectInfoRule {
-        flag: "--color-*",
-        n_a_formats: &[
-            crate::OutputFormatKind::Cityjson,
-            crate::OutputFormatKind::Cityjsonseq,
-        ],
-        is_present: cli_has_color_selector,
-    },
-    NoEffectInfoRule {
         flag: "--grid-minz",
         n_a_formats: &[
             crate::OutputFormatKind::Cityjson,
@@ -333,33 +325,6 @@ fn cli_has_grid_minz(cli: &Cli) -> bool {
 
 fn cli_has_grid_maxz(cli: &Cli) -> bool {
     cli.grid_maxz.is_some()
-}
-
-fn cli_has_color_selector(cli: &Cli) -> bool {
-    [
-        cli.color_building.as_ref(),
-        cli.color_building_part.as_ref(),
-        cli.color_building_installation.as_ref(),
-        cli.color_tin_relief.as_ref(),
-        cli.color_road.as_ref(),
-        cli.color_railway.as_ref(),
-        cli.color_transport_square.as_ref(),
-        cli.color_water_body.as_ref(),
-        cli.color_plant_cover.as_ref(),
-        cli.color_solitary_vegetation_object.as_ref(),
-        cli.color_land_use.as_ref(),
-        cli.color_city_furniture.as_ref(),
-        cli.color_bridge.as_ref(),
-        cli.color_bridge_part.as_ref(),
-        cli.color_bridge_installation.as_ref(),
-        cli.color_bridge_construction_element.as_ref(),
-        cli.color_tunnel.as_ref(),
-        cli.color_tunnel_part.as_ref(),
-        cli.color_tunnel_installation.as_ref(),
-        cli.color_generic_city_object.as_ref(),
-    ]
-    .iter()
-    .any(|color| color.is_some())
 }
 
 fn unique_output_formats(formats: &[crate::OutputFormatKind]) -> Vec<crate::OutputFormatKind> {
@@ -619,17 +584,6 @@ mod tests {
                 &[OutputFormatKind::Cesium3dTiles, OutputFormatKind::Cityjson,]
             )
             .is_empty());
-    }
-
-    #[test]
-    fn cityjson_formats_report_color_selectors_as_no_effect() {
-        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
-        cli.color_building = Some("#FF0000".to_string());
-
-        assert_eq!(
-            cli.no_effect_info_messages(&[OutputFormatKind::Cityjson]),
-            vec!["--color-* has no effect for selected output formats: cityjson".to_string(),]
-        );
     }
 
     #[test]
