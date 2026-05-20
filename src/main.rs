@@ -945,7 +945,10 @@ fn collect_parent_attributes(
     parent_handles: &[CityObjectHandle],
     visited: &mut HashSet<CityObjectHandle>,
     inherited_keys: &mut HashSet<String>,
-    inherited_attributes: &mut Vec<(String, cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue)>,
+    inherited_attributes: &mut Vec<(
+        String,
+        cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue,
+    )>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for parent_handle in parent_handles {
         if !visited.insert(*parent_handle) {
