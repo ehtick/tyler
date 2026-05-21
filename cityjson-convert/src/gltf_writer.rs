@@ -81,6 +81,51 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
     })
 }
 
+/// Strip consecutive bit-identical vertices from each ring
+/// before triangulation. earcutr 0.5.0 can spin forever on polygons that
+/// contain inner rings whose vertices repeat
+#[allow(clippy::float_cmp)]
+fn dedupe_polygon_rings(
+    flat_coords: &[f64],
+    hole_indices: &[usize],
+) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    let mut ring_offsets: Vec<usize> = std::iter::once(0)
+        .chain(hole_indices.iter().copied())
+        .collect();
+    ring_offsets.push(flat_coords.len() / 2);
+
+    let mut new_flat: Vec<f64> = Vec::with_capacity(flat_coords.len());
+    let mut new_holes: Vec<usize> = Vec::with_capacity(hole_indices.len());
+    let mut index_map: Vec<usize> = Vec::with_capacity(flat_coords.len() / 2);
+
+    for ring_idx in 0..ring_offsets.len() - 1 {
+        let start_vertex = ring_offsets[ring_idx];
+        let end_vertex = ring_offsets[ring_idx + 1];
+        if ring_idx > 0 {
+            new_holes.push(new_flat.len() / 2);
+        }
+
+        let ring_start_in_new_flat = new_flat.len();
+        for orig_idx in start_vertex..end_vertex {
+            let x = flat_coords[orig_idx * 2];
+            let y = flat_coords[orig_idx * 2 + 1];
+            if new_flat.len() >= ring_start_in_new_flat + 2 {
+                if let Some(&[px, py]) = new_flat.last_chunk::<2>() {
+                    if px == x && py == y {
+                        continue;
+                    }
+                }
+            }
+
+            new_flat.push(x);
+            new_flat.push(y);
+            index_map.push(orig_idx);
+        }
+    }
+
+    (new_flat, new_holes, index_map)
+}
+
 /// Writes a `CityJSON` model as a binary glTF file.
 ///
 /// # Errors
@@ -1001,6 +1046,8 @@ impl MeshCollector {
             }
         }
 
+        let (flat_coords, hole_indices, source_index_map) =
+            dedupe_polygon_rings(&flat_coords, &hole_indices);
         let triangulated =
             earcut(&flat_coords, &hole_indices, 2).context("Failed to triangulate surface")?;
         if triangulated.len() < 3 {
@@ -1009,15 +1056,18 @@ impl MeshCollector {
 
         let primitive = self.primitives.entry(feature_type.to_string()).or_default();
         for tri in triangulated.chunks_exact(3) {
+            let orig0 = source_index_map[tri[0]];
+            let orig1 = source_index_map[tri[1]];
+            let orig2 = source_index_map[tri[2]];
             let source_triangle = [
-                source_positions[tri[0]],
-                source_positions[tri[1]],
-                source_positions[tri[2]],
+                source_positions[orig0],
+                source_positions[orig1],
+                source_positions[orig2],
             ];
             let local_triangle = [
-                local_positions[tri[0]],
-                local_positions[tri[1]],
-                local_positions[tri[2]],
+                local_positions[orig0],
+                local_positions[orig1],
+                local_positions[orig2],
             ];
             primitive.add_triangle(
                 feature_id,
