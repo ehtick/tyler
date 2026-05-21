@@ -3,11 +3,16 @@
 	"build": {
 		"dockerfile": "Dockerfile"
 	},
+	"workspaceFolder": "/IdeaProjects/${localWorkspaceFolderBasename}",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/IdeaProjects/${localWorkspaceFolderBasename},type=bind,relabel=shared",
 	"features": {
 		"ghcr.io/balazsdukai/devcontainer-tools/tools:1": {}
 	},
 	"remoteUser": "vscode",
 	"containerUser": "vscode",
+	"runArgs": [
+		"--userns=keep-id"
+	],
 	"containerEnv": {
 		"TOOLS_CONTAINER_HOME": "/home/vscode",
 		"SSH_AUTH_SOCK": "/ssh-agent"
