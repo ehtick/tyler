@@ -334,9 +334,12 @@ fn debug_load_grid_uses_loaded_grid_for_quadtree_computation() {
 
 #[test]
 fn debug_3dtiles_tileset_only_skips_glb_conversion() {
-    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
-    let features = read_fixture("cityjson-convert/tests/data/multi_feature_types.city.jsonl");
-    let dataset = write_ndjson_dataset("debug-tileset-only", &metadata, &[features]);
+    let dataset = unique_test_dir("debug-3dtiles-tileset");
+    fs::copy(
+        "cityjson-convert/tests/data/multi_feature_types.city.jsonl",
+        dataset.join("multi_feature_types.city.jsonl"),
+    )
+    .unwrap();
     let output_dir = unique_test_dir("debug-tileset-only-output");
 
     let output = run_tyler(
