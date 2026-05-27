@@ -68,25 +68,32 @@ fn convert_to_cityjson_writes_parseable_cityjson() {
 
 #[test]
 fn convert_to_cityjsonseq_writes_header_and_features() {
-    let feature_a = json::from_feature_slice(
+    let base = json::from_slice(
         include_bytes!("data/multi_feature_types.city.jsonl")
             .split(|b| *b == b'\n')
             .next()
+            .unwrap(),
+    )
+    .expect("cityjson base should parse");
+    let feature_a = json::from_feature_slice(
+        include_bytes!("data/multi_feature_types.city.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(1)
             .unwrap(),
     )
     .expect("first feature should parse");
     let feature_b = json::from_feature_slice(
         include_bytes!("data/multi_feature_types.city.jsonl")
             .split(|b| *b == b'\n')
-            .nth(1)
+            .nth(2)
             .unwrap(),
     )
     .expect("second feature should parse");
-    let features = vec![feature_a.clone(), feature_b];
+    let features = vec![feature_a, feature_b];
     let output_path = stable_output_path_with_suffix("convert_to_cityjsonseq", "city.jsonl");
 
     convert_to_cityjsonseq(
-        &feature_a,
+        &base,
         &features,
         &output_path,
         &CityJsonSeqExportOptions::default(),
