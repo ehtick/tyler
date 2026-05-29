@@ -16,6 +16,7 @@
 /tests/output*
 /cityjson-convert/tests/output/
 .geodepot.bak
+**/*.sqlite
 
 # Debug data
 *.tsv

@@ -45,6 +45,16 @@ fn run_tyler(dataset: &Path, output: &Path, args: &[&str]) -> Output {
     command.output().expect("run tyler")
 }
 
+fn run_tyler_with_rust_log(dataset: &Path, output: &Path, rust_log: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tyler"));
+    command.env("RUST_LOG", rust_log);
+    command.arg(dataset).arg("--output").arg(output);
+    for arg in args {
+        command.arg(arg);
+    }
+    command.output().expect("run tyler")
+}
+
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read json file")).expect("parse json file")
 }
@@ -181,6 +191,50 @@ fn format_cityjson_writes_cityjson_tiles() {
     let root = read_json(&cityjson_tiles[0]);
     assert_eq!(root["type"], "CityJSON");
     assert!(!output_dir.join("tileset.json").exists());
+}
+
+/// Issue https://github.com/3DGI/tyler/issues/137
+#[test]
+fn cityjsonfeature_buildingpart_filter_does_not_duplicate_cityobjects() {
+    let dataset = unique_test_dir("cityjsonfeature-buildingpart-filter");
+    fs::copy(
+        repo_path("tests/data/cjindex_cityjsonfeature_alias/source.city.jsonl"),
+        dataset.join("source.city.jsonl"),
+    )
+    .expect("copy CityJSONFeature alias fixture");
+    let output_dir = unique_test_dir("cityjsonfeature-buildingpart-filter-output");
+
+    let output = run_tyler_with_rust_log(
+        &dataset,
+        &output_dir,
+        "debug",
+        &[
+            "--format",
+            "cityjson",
+            "--color-building-part",
+            "#ff0000",
+            "--object-type",
+            "BuildingPart",
+        ],
+    );
+    assert_success(&output, "CityJSON BuildingPart fixture run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("duplicate CityObject id") && !stdout.contains("duplicate CityObject id"),
+        "Tyler should not duplicate CityObjects while filtering the fixture\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let mut cityjson_tiles = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".city.json", &mut cityjson_tiles);
+    assert!(
+        !cityjson_tiles.is_empty(),
+        "expected CityJSON tiles under {}\nstdout:\n{}\nstderr:\n{}",
+        output_dir.join("t").display(),
+        stdout,
+        stderr
+    );
 }
 
 #[test]
