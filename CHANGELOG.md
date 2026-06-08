@@ -12,17 +12,33 @@
 - Tyler and `cityjson-convert` now expose explicit `proj-system` and
   `proj-bundled` build modes, with system builds using native PROJ networking
   capability and bundled builds kept separate from it.
+- Tyler now relies on upstream `cityjson-index` freshness reporting and
+  rebuilds stale cjindex sidecars before reading them.
+- Tyler was updated for the newer `cityjson-index` package API, including
+  package-based filtering and package references.
 - The build documentation now distinguishes reproducible/offline packaged
   grids from opt-in native PROJ network fetching and documents the local cache
   behavior used for downloaded grid chunks.
 - Linux, macOS, and Windows CI now validate both PROJ build modes, and the
   devcontainer installs the native PROJ toolchain used for repeatable local
   validation.
+- The devcontainer now supports rootless Podman, uses `GH_TOKEN` for GitHub
+  auth, installs Debian packages noninteractively, and includes the `tools`
+  feature.
 
 ### Added
 
 - Feature-resolution checks that verify system mode does not activate bundled
   PROJ and bundled mode does not imply native PROJ networking.
+- CityJSON color editing support, including `--color-*` selectors for CityJSON
+  and CityJSONSeq output.
+
+### Fixed
+
+- CityJSON color selectors now report as no-op for CityJSON and CityJSONSeq
+  output formats.
+- CityJSONFeature filtering no longer duplicates CityObjects when aliased
+  cjindex rows resolve to the same physical package.
 
 ### Removed
 
