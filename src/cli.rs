@@ -564,6 +564,16 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_cityjsonseq_format() {
+        let mut args = dataset_args();
+        args.extend(["--format".to_string(), "cityjsonseq".to_string()]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Cityjsonseq);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
     fn validation_accepts_obj_format() {
         let mut args = dataset_args();
         args.extend(["--format".to_string(), "obj".to_string()]);

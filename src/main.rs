@@ -57,6 +57,7 @@
     clippy::stable_sort_primitive,
     clippy::useless_vec
 )]
+mod cityjson_edit;
 mod cli;
 mod coordinates;
 mod formats;
@@ -70,9 +71,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::cityjson_edit::apply_cityobject_colors;
 use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
+use cityjson_lib::cityjson_types::v2_0::appearance::RGB;
 use cityjson_lib::ops::Transformer;
 use clap::{Parser, ValueEnum};
 use log::{debug, info, log_enabled, warn, Level};
@@ -234,6 +237,56 @@ fn build_glb_export_options(
     }
 }
 
+fn build_cityjson_object_colors(cli: &crate::cli::Cli) -> BTreeMap<String, RGB> {
+    let mut object_colors = BTreeMap::new();
+
+    for (feature_type, color) in [
+        ("Building", cli.color_building.as_ref()),
+        ("BuildingPart", cli.color_building_part.as_ref()),
+        (
+            "BuildingInstallation",
+            cli.color_building_installation.as_ref(),
+        ),
+        ("TINRelief", cli.color_tin_relief.as_ref()),
+        ("Road", cli.color_road.as_ref()),
+        ("Railway", cli.color_railway.as_ref()),
+        ("TransportSquare", cli.color_transport_square.as_ref()),
+        ("WaterBody", cli.color_water_body.as_ref()),
+        ("PlantCover", cli.color_plant_cover.as_ref()),
+        (
+            "SolitaryVegetationObject",
+            cli.color_solitary_vegetation_object.as_ref(),
+        ),
+        ("LandUse", cli.color_land_use.as_ref()),
+        ("CityFurniture", cli.color_city_furniture.as_ref()),
+        ("Bridge", cli.color_bridge.as_ref()),
+        ("BridgePart", cli.color_bridge_part.as_ref()),
+        ("BridgeInstallation", cli.color_bridge_installation.as_ref()),
+        (
+            "BridgeConstructiveElement",
+            cli.color_bridge_construction_element.as_ref(),
+        ),
+        ("Tunnel", cli.color_tunnel.as_ref()),
+        ("TunnelPart", cli.color_tunnel_part.as_ref()),
+        ("TunnelInstallation", cli.color_tunnel_installation.as_ref()),
+        ("GenericCityObject", cli.color_generic_city_object.as_ref()),
+    ] {
+        if let Some(color) = color {
+            object_colors.insert(feature_type.to_string(), parse_cityjson_rgb(color));
+        }
+    }
+
+    object_colors
+}
+
+fn parse_cityjson_rgb(color: &str) -> RGB {
+    debug_assert!(color.len() == 7 && color.starts_with('#'));
+    let red = u8::from_str_radix(&color[1..3], 16).expect("validated hex color") as f32 / 255.0;
+    let green = u8::from_str_radix(&color[3..5], 16).expect("validated hex color") as f32 / 255.0;
+    let blue = u8::from_str_radix(&color[5..7], 16).expect("validated hex color") as f32 / 255.0;
+    RGB::new(red, green, blue)
+}
+
 fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
     let mut feature_type_lods = BTreeMap::new();
 
@@ -279,8 +332,8 @@ fn build_feature_type_lods(cli: &crate::cli::Cli) -> BTreeMap<String, String> {
 fn build_feature_filter(
     cityobject_types: Option<&Vec<parser::CityObjectType>>,
     feature_type_lods: &BTreeMap<String, String>,
-) -> cityjson_index::FeatureFilter {
-    cityjson_index::FeatureFilter {
+) -> cityjson_index::PackageFilter {
+    cityjson_index::PackageFilter {
         cityobject_types: cityobject_types.map(|types| {
             types
                 .iter()
@@ -699,31 +752,14 @@ fn read_tile_feature_models(
     feature_ids: &[usize],
 ) -> Result<Vec<cityjson_lib::CityModel>, Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let mut models = Vec::with_capacity(feature_ids.len());
-    let mut cjindex_refs = Vec::with_capacity(feature_ids.len());
-    for fid in feature_ids {
-        match &world.features[*fid].reference {
-            parser::FeatureReference::CjIndexRef(feature) => {
-                cjindex_refs.push(feature.clone());
-            }
-            parser::FeatureReference::CjIndexId(_) => {
-                let city_index = world.input_source.open_index()?;
-                for fid in feature_ids {
-                    let parser::FeatureReference::CjIndexId(feature_id) =
-                        &world.features[*fid].reference
-                    else {
-                        return Err("cjindex input mixed row references with feature ids".into());
-                    };
-                    let model = city_index.get(feature_id)?.ok_or_else(|| {
-                        format!("feature {feature_id} could not be resolved from cjindex")
-                    })?;
-                    models.push(model);
-                }
-                return Ok(models);
-            }
-        }
-    }
-    models = parser::World::read_cjindex_features_thread_local(&world.input_source, &cjindex_refs)?;
+    let cjindex_refs = feature_ids
+        .iter()
+        .map(|fid| match &world.features[*fid].reference {
+            parser::FeatureReference::CjIndexRef(package) => package.clone(),
+        })
+        .collect::<Vec<_>>();
+    let models =
+        parser::World::read_cjindex_features_thread_local(&world.input_source, &cjindex_refs)?;
     debug!(
         "Read {} tile features from cjindex in {:?}",
         models.len(),
@@ -775,8 +811,7 @@ fn deduplicate_feature_ids_by_reference(
 
 fn feature_reference_public_id(reference: &parser::FeatureReference) -> String {
     match reference {
-        parser::FeatureReference::CjIndexRef(feature) => feature.feature_id.clone(),
-        parser::FeatureReference::CjIndexId(feature_id) => feature_id.clone(),
+        parser::FeatureReference::CjIndexRef(package) => package.model_id.clone(),
     }
 }
 
@@ -786,24 +821,7 @@ fn feature_reference_precedes(
 ) -> bool {
     match (lhs, rhs) {
         (parser::FeatureReference::CjIndexRef(lhs), parser::FeatureReference::CjIndexRef(rhs)) => {
-            (
-                lhs.source_id,
-                lhs.row_id,
-                lhs.offset,
-                lhs.length,
-                &lhs.source_path,
-            ) < (
-                rhs.source_id,
-                rhs.row_id,
-                rhs.offset,
-                rhs.length,
-                &rhs.source_path,
-            )
-        }
-        (parser::FeatureReference::CjIndexRef(_), parser::FeatureReference::CjIndexId(_)) => true,
-        (parser::FeatureReference::CjIndexId(_), parser::FeatureReference::CjIndexRef(_)) => false,
-        (parser::FeatureReference::CjIndexId(lhs), parser::FeatureReference::CjIndexId(rhs)) => {
-            lhs < rhs
+            lhs.record_id < rhs.record_id
         }
     }
 }
@@ -850,6 +868,7 @@ fn build_tile_debug_cityjsonseq(
     feature_ids: &[usize],
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
+    cityjson_colors: &BTreeMap<String, RGB>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let deduplicated_feature_ids = deduplicate_tile_feature_ids(world, feature_ids);
     let models = prepare_tile_feature_models(
@@ -860,6 +879,10 @@ fn build_tile_debug_cityjsonseq(
         true,
     )?;
     let base_root = cityjson_lib::json::from_slice(&world.feature_base_document)?;
+    let mut models = models;
+    for model in &mut models {
+        apply_cityobject_colors(model, cityjson_colors)?;
+    }
     let mut feature_output = Vec::new();
     cityjson_convert::write_cityjsonseq(
         &mut feature_output,
@@ -919,7 +942,7 @@ fn prepare_feature_model(
     model: cityjson_lib::CityModel,
     _feature_id: usize,
     _cityobject_types: Option<&Vec<parser::CityObjectType>>,
-    feature_filter: &cityjson_index::FeatureFilter,
+    feature_filter: &cityjson_index::PackageFilter,
     object_attribute_types: &BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cleanup_feature: bool,
@@ -932,7 +955,10 @@ fn prepare_feature_model(
         apply_object_attribute_types(&mut model, object_attribute_types)?;
     }
     let filtered = feature_filter.apply(&model)?;
-    model = filtered.model;
+    let Some(filtered_model) = filtered.model else {
+        return Ok(None);
+    };
+    model = filtered_model;
     let remove_empty_geometry =
         cleanup_feature || include_parent_attributes || !object_attribute_types.is_empty();
     let model = if remove_empty_geometry {
@@ -1104,7 +1130,7 @@ pub(crate) fn filter_cityjsonfeature_preserving_root_with_policy(
     feature_type_lods: &BTreeMap<String, String>,
     default_highest_lod: bool,
 ) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
-    let filter = cityjson_index::FeatureFilter {
+    let filter = cityjson_index::PackageFilter {
         cityobject_types: cityobject_types.map(|types| {
             types
                 .iter()
@@ -1126,7 +1152,12 @@ pub(crate) fn filter_cityjsonfeature_preserving_root_with_policy(
             })
             .collect(),
     };
-    Ok(filter.apply(model)?.model)
+    Ok(filter.apply(model)?.model.unwrap_or_else(|| {
+        let mut empty = model.clone();
+        empty.clear_cityobjects();
+        empty.set_id(None);
+        empty
+    }))
 }
 
 fn parentless_cityobject_handle(model: &cityjson_lib::CityModel) -> Option<CityObjectHandle> {
@@ -1317,6 +1348,7 @@ struct TileWriteContext<'a> {
     quadtree: &'a spatial_structs::QuadTree,
     object_attribute_types: BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
+    cityjson_colors: BTreeMap<String, RGB>,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1729,8 +1761,10 @@ impl OutputFormatBackend for CityjsonBackend {
             .output_tiles_dir
             .join(job.content_tile_coord.to_string())
             .with_extension("city.json");
+        let mut model = model.clone();
+        apply_cityobject_colors(&mut model, &context.cityjson_colors)?;
         cityjson_convert::convert_to_cityjson(
-            model,
+            &model,
             &output_file,
             &cityjson_convert::JsonExportOptions::default(),
         )?;
@@ -1793,7 +1827,7 @@ impl OutputFormatBackend for CityjsonseqBackend {
             .output_tiles_dir
             .join(job.content_tile_coord.to_string())
             .with_extension("city.jsonl");
-        let models = build_tile_cityjsonseq_models(
+        let mut models = build_tile_cityjsonseq_models(
             context.world,
             &job.feature_ids,
             &context.object_attribute_types,
@@ -1801,6 +1835,9 @@ impl OutputFormatBackend for CityjsonseqBackend {
         )?;
         if models.is_empty() {
             return Err("tile CityJSONSeq preparation removed all CityObjects".into());
+        }
+        for model in &mut models {
+            apply_cityobject_colors(model, &context.cityjson_colors)?;
         }
         let base_root = cityjson_lib::json::from_slice(&context.world.feature_base_document)?;
         cityjson_convert::convert_to_cityjsonseq(
@@ -2133,6 +2170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             quadtree: &quadtree,
             object_attribute_types: object_attribute_types.clone(),
             include_parent_attributes: cli.include_parent_attributes,
+            cityjson_colors: build_cityjson_object_colors(&cli),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
@@ -2166,6 +2204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &job.feature_ids,
                     &object_attribute_types,
                     cli.include_parent_attributes,
+                    &tile_write_context.cityjson_colors,
                 ) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -2522,27 +2561,21 @@ mod tests {
         .expect("multi type lod fixture should parse")
     }
 
-    fn indexed_feature_ref(feature_id: &str, source_id: i64, row_id: i64) -> parser::Feature {
+    fn indexed_feature_ref(feature_id: &str, _source_id: i64, row_id: i64) -> parser::Feature {
         parser::Feature {
             centroid: [0.0, 0.0],
-            reference: parser::FeatureReference::CjIndexRef(cityjson_index::IndexedFeatureRef {
-                row_id,
-                feature_id: feature_id.to_string(),
-                source_id,
-                source_path: PathBuf::from(format!("source-{source_id}.city.json")),
-                offset: row_id as u64,
-                length: 1,
-                vertices_offset: None,
-                vertices_length: None,
-                member_ranges_json: None,
-                bounds: cityjson_index::FeatureBounds {
+            reference: parser::FeatureReference::CjIndexRef(cityjson_index::IndexedPackageRef {
+                record_id: row_id,
+                model_id: feature_id.to_string(),
+                package_type: cityjson_index::PackageType::CityJsonSeq,
+                bounds: Some(cityjson_index::Bounds3D {
                     min_x: 0.0,
                     max_x: 1.0,
                     min_y: 0.0,
                     max_y: 1.0,
                     min_z: 0.0,
                     max_z: 1.0,
-                },
+                }),
             }),
             bbox: [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             needs_type_filter: false,
@@ -2609,7 +2642,7 @@ mod tests {
             model.clone(),
             0,
             None,
-            &cityjson_index::FeatureFilter::default(),
+            &cityjson_index::PackageFilter::default(),
             &BTreeMap::new(),
             false,
             false,
@@ -3463,15 +3496,12 @@ mod tests {
                 .expect("open index");
         city_index.reindex().expect("reindex ndjson dataset");
         let indexed_bounds = city_index
-            .iter_all_bbox_pages(1)
-            .expect("build bbox page iterator")
-            .next()
-            .expect("bbox page should exist")
-            .expect("bbox page should load")
+            .package_ref_page_after_record_id(None, 1)
+            .expect("package page should load")
             .into_iter()
             .next()
-            .expect("indexed feature should exist")
-            .bounds;
+            .and_then(|package| package.bounds)
+            .expect("indexed package should have bounds");
         let feature_base_document = derive_base_document(&city_index).expect("derive base doc");
         let metadata_path = dataset_dir.join("metadata.city.json");
         fs::write(&metadata_path, &feature_base_document).expect("write metadata");
@@ -3488,11 +3518,8 @@ mod tests {
             None,
         )
         .expect("build cjindex ndjson world");
-        #[allow(clippy::float_cmp)]
-        {
-            assert_eq!(world.grid.bbox[2], indexed_bounds.min_z);
-            assert_eq!(world.grid.bbox[5], indexed_bounds.max_z);
-        }
+        assert!((world.grid.bbox[2] - indexed_bounds.min_z).abs() < 1e-6);
+        assert!((world.grid.bbox[5] - indexed_bounds.max_z).abs() < 1e-6);
         world.index_with_grid().expect("index cjindex ndjson world");
         assert!(world
             .features

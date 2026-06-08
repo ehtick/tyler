@@ -28,8 +28,8 @@ fmt-check:
     cargo fmt --package tyler --package cityjson-convert --check
 
 # Run the workspace tests with system-preferred PROJ enabled.
-test:
-    cargo test --workspace --all-targets --no-default-features --features proj-system
+test *args:
+    cargo test --workspace --all-targets --no-default-features --features proj-system {{args}}
 
 # Collect test coverage with cargo-tarpaulin.
 coverage:
