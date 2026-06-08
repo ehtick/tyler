@@ -42,7 +42,18 @@ fn run_tyler(dataset: &Path, output: &Path, args: &[&str]) -> Output {
     for arg in args {
         command.arg(arg);
     }
-    command.output().expect("run tyler")
+    let result = command.output().expect("run tyler");
+
+    // Re-emit subprocess stdout/stderr to test process
+    // This makes it controlled by cargo test's --show-output / --nocapture
+    if !result.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&result.stdout));
+    }
+    if !result.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    result
 }
 
 fn run_tyler_with_rust_log(dataset: &Path, output: &Path, rust_log: &str, args: &[&str]) -> Output {
@@ -52,7 +63,18 @@ fn run_tyler_with_rust_log(dataset: &Path, output: &Path, rust_log: &str, args: 
     for arg in args {
         command.arg(arg);
     }
-    command.output().expect("run tyler")
+    let result = command.output().expect("run tyler");
+
+    // Re-emit subprocess stdout/stderr to test process
+    // This makes it controlled by cargo test's --show-output / --nocapture
+    if !result.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&result.stdout));
+    }
+    if !result.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    result
 }
 
 fn read_json(path: &Path) -> Value {

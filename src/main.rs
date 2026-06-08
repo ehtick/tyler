@@ -405,8 +405,7 @@ fn prepare_input(
     let inspection = resolved.inspect()?;
     let mut city_index =
         cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)?;
-    let needs_reindex = cjindex_sidecar_needs_reindex(&resolved.index_path)?;
-    if !inspection.index.exists || inspection.index.fresh != Some(true) || needs_reindex {
+    if !inspection.index.exists || inspection.index.fresh != Some(true) {
         info!(
             "Rebuilding cjindex sidecar at {}",
             resolved.index_path.display()
@@ -423,49 +422,6 @@ fn prepare_input(
         metadata_path,
         feature_base_document,
     })
-}
-
-fn cjindex_sidecar_needs_reindex(index_path: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    if !index_path.exists() {
-        return Ok(false);
-    }
-
-    let conn = rusqlite::Connection::open(index_path)?;
-    let schema_state_exists = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'schema_state'
-        )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !schema_state_exists {
-        return Ok(false);
-    }
-    let needs_reindex_column_exists = conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1
-            FROM pragma_table_info('schema_state')
-            WHERE name = 'needs_reindex'
-        )",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !needs_reindex_column_exists {
-        return Ok(false);
-    }
-
-    let needs_reindex = conn.query_row(
-        "SELECT COALESCE(needs_reindex, 0) FROM schema_state WHERE id = 1",
-        [],
-        |row| row.get::<_, i64>(0),
-    );
-    match needs_reindex {
-        Ok(value) => Ok(value != 0),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-        Err(error) => Err(Box::new(error)),
-    }
 }
 
 fn derive_base_document(
@@ -2323,131 +2279,6 @@ mod tests {
         world.index_with_grid().expect("index cjindex ndjson world");
         let quadtree = build_quadtree(&world);
         (world, quadtree)
-    }
-
-    fn write_indexed_building_part_dataset(
-        prefix: &str,
-    ) -> (PathBuf, cityjson_index::ResolvedDataset) {
-        let dataset_dir = unique_test_dir(prefix);
-        let metadata =
-            fs::read_to_string(resource_path("3dbag_x00.city.json")).expect("read metadata");
-        let feature = String::from_utf8(parent_attribute_remapping_fixture_bytes(
-            serde_json::json!({}),
-        ))
-        .expect("fixture should be utf8");
-        let ndjson_source = dataset_dir.join("source.city.jsonl");
-        fs::write(&ndjson_source, format!("{metadata}\n{feature}\n")).expect("write ndjson source");
-
-        let resolved =
-            cityjson_index::resolve_dataset(&dataset_dir, None).expect("resolve ndjson dataset");
-        let mut city_index =
-            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
-                .expect("open index");
-        city_index.reindex().expect("reindex ndjson dataset");
-        assert!(
-            city_index.package_count().expect("package count") > 0,
-            "fixture should build a normalized package index"
-        );
-        (dataset_dir, resolved)
-    }
-
-    fn mark_cjindex_sidecar_as_stale_with_empty_packages(index_path: &Path) {
-        let conn = rusqlite::Connection::open(index_path).expect("open sidecar sqlite");
-        conn.execute_batch(
-            r"
-            DELETE FROM cityobject_relationships;
-            DELETE FROM package_cityobjects;
-            DELETE FROM cityobject_bbox;
-            DELETE FROM package_bbox;
-            DELETE FROM cityobjects;
-            DELETE FROM packages;
-            UPDATE schema_state SET needs_reindex = 1 WHERE id = 1;
-            ",
-        )
-        .expect("mark cjindex sidecar stale");
-        let package_count = conn
-            .query_row("SELECT COUNT(*) FROM packages", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("count packages");
-        assert_eq!(package_count, 0);
-    }
-
-    #[test]
-    fn cjindex_sidecar_needs_reindex_reads_schema_state_flag() {
-        let dir = unique_test_dir("cjindex-needs-reindex-flag");
-        let index_path = dir.join(".cityjson-index.sqlite");
-
-        assert!(!cjindex_sidecar_needs_reindex(&index_path).expect("missing file probe"));
-
-        let conn = rusqlite::Connection::open(&index_path).expect("open sqlite");
-        conn.execute_batch(
-            r"
-            CREATE TABLE schema_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                schema_version INTEGER NOT NULL,
-                needs_reindex INTEGER NOT NULL DEFAULT 0
-            );
-            INSERT INTO schema_state (id, schema_version, needs_reindex) VALUES (1, 2, 0);
-            ",
-        )
-        .expect("create schema_state");
-        assert!(!cjindex_sidecar_needs_reindex(&index_path).expect("clean flag probe"));
-
-        conn.execute("UPDATE schema_state SET needs_reindex = 1 WHERE id = 1", [])
-            .expect("set needs_reindex");
-        assert!(cjindex_sidecar_needs_reindex(&index_path).expect("stale flag probe"));
-    }
-
-    #[test]
-    fn prepare_input_rebuilds_cjindex_sidecar_marked_needs_reindex() {
-        let (dataset_dir, resolved) = write_indexed_building_part_dataset("stale-cjindex-sidecar");
-        mark_cjindex_sidecar_as_stale_with_empty_packages(&resolved.index_path);
-        assert!(cjindex_sidecar_needs_reindex(&resolved.index_path).expect("stale sidecar probe"));
-
-        let output_dir = unique_test_dir("stale-cjindex-output");
-        let dataset_arg = dataset_dir.to_string_lossy().to_string();
-        let output_arg = output_dir.to_string_lossy().to_string();
-        let cli = crate::cli::Cli::try_parse_from([
-            "tyler",
-            dataset_arg.as_str(),
-            "--output",
-            output_arg.as_str(),
-            "--format",
-            "cityjson",
-            "--object-type",
-            "BuildingPart",
-        ])
-        .expect("parse cli");
-
-        let prepared =
-            prepare_input(&cli, &output_dir).expect("prepare input rebuilds stale sidecar");
-        assert!(
-            !cjindex_sidecar_needs_reindex(&resolved.index_path).expect("rebuilt sidecar probe")
-        );
-        let city_index =
-            cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)
-                .expect("open rebuilt index");
-        assert!(
-            city_index.package_count().expect("rebuilt package count") > 0,
-            "reindex should repopulate normalized package rows"
-        );
-
-        let cityobject_types = Some(vec![parser::CityObjectType::BuildingPart]);
-        let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
-        let mut world = parser::World::from_cjindex(
-            prepared.source,
-            prepared.metadata_path,
-            prepared.feature_base_document,
-            250,
-            cityobject_types,
-            feature_filter,
-            None,
-            None,
-        )
-        .expect("build BuildingPart world from rebuilt cjindex");
-        world.index_with_grid().expect("index BuildingPart world");
-        assert!(!world.features.is_empty());
     }
 
     fn resource_tileset(
