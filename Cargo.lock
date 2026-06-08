@@ -2492,6 +2492,7 @@ dependencies = [
  "log",
  "morton-encoding",
  "rayon",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_repr",
