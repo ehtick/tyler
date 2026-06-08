@@ -272,7 +272,7 @@ dependencies = [
 [[package]]
 name = "cityjson-index"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#79d2ae4817e1a416108863a02e175b126e7450b6"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#b068e367d129a36187e1f9368b3ca2103969a2ad"
 dependencies = [
  "cityjson-lib",
  "cityjson-types",
@@ -294,7 +294,7 @@ dependencies = [
 [[package]]
 name = "cityjson-json"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#79d2ae4817e1a416108863a02e175b126e7450b6"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#b068e367d129a36187e1f9368b3ca2103969a2ad"
 dependencies = [
  "ahash",
  "cityjson-types",
@@ -306,7 +306,7 @@ dependencies = [
 [[package]]
 name = "cityjson-lib"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#79d2ae4817e1a416108863a02e175b126e7450b6"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#b068e367d129a36187e1f9368b3ca2103969a2ad"
 dependencies = [
  "cityjson-json",
  "cityjson-types",
@@ -321,7 +321,7 @@ dependencies = [
 [[package]]
 name = "cityjson-types"
 version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#79d2ae4817e1a416108863a02e175b126e7450b6"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#b068e367d129a36187e1f9368b3ca2103969a2ad"
 dependencies = [
  "num 0.4.3",
 ]

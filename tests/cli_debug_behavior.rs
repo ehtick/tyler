@@ -193,7 +193,7 @@ fn format_cityjson_writes_cityjson_tiles() {
     assert!(!output_dir.join("tileset.json").exists());
 }
 
-/// Issue https://github.com/3DGI/tyler/issues/137
+/// Issue <https://github.com/3DGI/tyler/issues/137>
 #[test]
 fn cityjsonfeature_buildingpart_filter_does_not_duplicate_cityobjects() {
     let dataset = unique_test_dir("cityjsonfeature-buildingpart-filter");
