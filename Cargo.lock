@@ -259,6 +259,7 @@ name = "cityjson-convert"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cityjson-index",
  "cityjson-lib",
  "clap",
  "earcutr",
