@@ -28,6 +28,9 @@
 
 ### Added
 
+- `cjconvert` can now read dataset directories, including the legacy
+  `metadata.json` plus per-feature `*.city.jsonl` layout, through
+  `cityjson-index`.
 - Feature-resolution checks that verify system mode does not activate bundled
   PROJ and bundled mode does not imply native PROJ networking.
 - CityJSON color editing support, including `--color-*` selectors for CityJSON
