@@ -256,7 +256,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cityjson-convert"
-version = "0.1.0"
+version = "1.0.0-alpha1"
 dependencies = [
  "anyhow",
  "cityjson-lib",
@@ -271,8 +271,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-index"
-version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "985782dc4047f7ee59b838571d1a3821222c099cc6db025fd2de4d57cb33c4ed"
 dependencies = [
  "cityjson-lib",
  "cityjson-types",
@@ -293,8 +294,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-json"
-version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ee0ebede0835de54b28cebb13c38b39c0d28d0a0d687e817641b9b436d5c67"
 dependencies = [
  "ahash",
  "cityjson-types",
@@ -305,8 +307,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-lib"
-version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "937093ebc73996b8a8e6a47ed47adee1a0bec2250384f9975d047607d84e1888"
 dependencies = [
  "cityjson-json",
  "cityjson-types",
@@ -320,8 +323,9 @@ dependencies = [
 
 [[package]]
 name = "cityjson-types"
-version = "0.9.0"
-source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ce18ce2d234e7a3cf5c3bff138692c36ed984f3e4f89a63b666304fbbebd347"
 dependencies = [
  "num 0.4.3",
 ]
@@ -2480,7 +2484,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tyler"
-version = "0.4.1"
+version = "1.0.0-alpha1"
 dependencies = [
  "bincode",
  "bitvec",
@@ -3143,3 +3147,23 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "cityjson-index"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+
+[[patch.unused]]
+name = "cityjson-json"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+
+[[patch.unused]]
+name = "cityjson-lib"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
+
+[[patch.unused]]
+name = "cityjson-types"
+version = "0.9.0"
+source = "git+https://github.com/3DGI/cityjson-rs.git?branch=main#de151a3c1015afa78690af2cacd521e76a053f63"
