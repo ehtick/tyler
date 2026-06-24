@@ -29,7 +29,7 @@ fmt-check:
 
 # Run the workspace tests with system-preferred PROJ enabled.
 test *args:
-    cargo test --workspace --all-targets --no-default-features --features proj-system {{args}}
+    cargo test --workspace --all-targets --no-fail-fast --no-default-features --features proj-system {{args}}
 
 # Collect test coverage with cargo-tarpaulin.
 coverage:

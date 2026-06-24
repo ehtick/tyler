@@ -12,8 +12,14 @@
 
 pub mod gltf_writer;
 pub mod obj_writer;
+pub mod tabular;
 #[path = "triangle-mesh.rs"]
 mod triangle_mesh;
+
+pub use tabular::{
+    build_cityobject_table, Cell, CityObjectRow, CityObjectTable, Column, ColumnNamespace,
+    DataType, TableSchema,
+};
 
 use std::collections::BTreeMap;
 use std::fs;
