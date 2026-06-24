@@ -307,7 +307,7 @@ fn infer_attribute_schema(rows: &[Option<&OwnedAttributes>]) -> Result<StructSpe
 }
 
 fn escape_path_segment(_segment: &str) -> String {
-    todo!("implement path escaping")
+    _segment.replace('%', "%25").replace("__", "%5F%5F")
 }
 
 #[derive(Default)]
@@ -316,13 +316,87 @@ struct ColumnNamer {
 }
 
 impl ColumnNamer {
-    fn unique(&mut self, _base: &str) -> String {
-        todo!("implement column-name conflict resolution")
+    fn unique(&mut self, base: &str) -> String {
+        let mut candidate = base.to_string();
+        let mut suffix = 2;
+
+        while !self.used.insert(candidate.clone()) {
+            candidate = format!("{base}__{suffix}");
+            suffix += 1;
+        }
+
+        candidate
     }
 }
 
-fn flatten_struct_schema(_namespace: ColumnNamespace, _spec: &StructSpec) -> Vec<Column> {
-    todo!("implement nested schema flattening")
+fn flatten_struct_schema(namespace: ColumnNamespace, spec: &StructSpec) -> Vec<Column> {
+    fn namespace_name(namespace: ColumnNamespace) -> &'static str {
+        match namespace {
+            ColumnNamespace::Attributes => "attributes",
+            ColumnNamespace::Extra => "extra",
+        }
+    }
+
+    fn visit(
+        namespace: ColumnNamespace,
+        fields: &[FieldSpec],
+        path: &mut Vec<String>,
+        inherited_nullable: bool,
+        namer: &mut ColumnNamer,
+        columns: &mut Vec<Column>,
+    ) {
+        let mut ordered_fields: Vec<&FieldSpec> = fields.iter().collect();
+        ordered_fields.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for field in ordered_fields {
+            path.push(field.name.clone());
+            let nullable = inherited_nullable || field.nullable;
+
+            match &field.value {
+                DataType::Null => {}
+                DataType::Struct(struct_spec) => {
+                    visit(
+                        namespace,
+                        &struct_spec.fields,
+                        path,
+                        nullable,
+                        namer,
+                        columns,
+                    );
+                }
+                data_type => {
+                    let mut name_parts = Vec::with_capacity(path.len() + 1);
+                    name_parts.push(namespace_name(namespace).to_string());
+                    name_parts.extend(path.iter().map(|segment| escape_path_segment(segment)));
+
+                    columns.push(Column {
+                        namespace,
+                        path: path.clone(),
+                        name: namer.unique(&name_parts.join("__")),
+                        data_type: data_type.clone(),
+                        nullable,
+                    });
+                }
+            }
+
+            path.pop();
+        }
+    }
+
+    let mut columns = Vec::new();
+    let mut path = Vec::new();
+    let mut namer = ColumnNamer::default();
+
+    visit(
+        namespace,
+        &spec.fields,
+        &mut path,
+        false,
+        &mut namer,
+        &mut columns,
+    );
+
+    columns
 }
 
 fn build_cell(
