@@ -137,13 +137,73 @@ pub struct CityObjectTable {
     pub rows: Vec<CityObjectRow>,
 }
 
+/// Borrowed source data collected from a `CityModel` before table materialization.
+struct CityObjectSourceRow<'a> {
+    /// CityJSON object identifier.
+    cityobject_id: &'a str,
+    /// Zero-based ordinal in model CityObject order.
+    cityobject_ix: u64,
+    /// CityJSON CityObject type name.
+    cityobject_type: String,
+    /// Source `geographicalExtent`, when present.
+    bbox: Option<[f64; 6]>,
+    /// Borrowed CityObject `attributes`, if present.
+    attributes: Option<&'a OwnedAttributes>,
+    /// Borrowed CityObject `extra`, if present.
+    extra: Option<&'a OwnedAttributes>,
+}
+
 /// Builds the shared CityObject table for a model.
 ///
 /// # Errors
 ///
 /// Returns an error when values cannot be represented by the inferred schema.
-pub fn build_cityobject_table(_model: &CityModel) -> Result<CityObjectTable> {
+pub fn build_cityobject_table(model: &CityModel) -> Result<CityObjectTable> {
+    // 1. Walk CityObjects in model order and collect borrowed source rows.
+    // 2. Infer nested schemas independently for `attributes` and `extra`.
+    // 3. Flatten both schemas into one stable output column list.
+    // 4. Materialize each CityObject row against the shared schema.
+    // 5. Return the assembled table or a path-bearing error on invalid data.
+    let _ = model;
     todo!("implement CityObject table construction")
+}
+
+fn infer_cityobject_rows<'a>(model: &'a CityModel) -> Result<Vec<CityObjectSourceRow<'a>>> {
+    // Walk the model's CityObjects in iteration order.
+    // Borrow each object's identifier, type, bbox, attributes, and extra fields.
+    // Keep the source data borrowed here so schema inference can happen before cloning.
+    let _ = model;
+    todo!("collect source rows from the model")
+}
+
+fn infer_attribute_schema_from_model<'a>(
+    rows: &[CityObjectSourceRow<'a>],
+    namespace: ColumnNamespace,
+) -> Result<StructSpec> {
+    // Filter the borrowed source rows down to the requested namespace.
+    // Treat missing maps as participating rows so nullable columns are inferred correctly.
+    // Reuse the existing nested schema inference helpers for the actual merge logic.
+    let _ = (rows, namespace);
+    todo!("infer the nested schema for one namespace")
+}
+
+fn build_column_schema(attributes: &StructSpec, extra: &StructSpec) -> Result<TableSchema> {
+    // Flatten `attributes` first, then `extra`.
+    // Seed name conflict resolution with reserved fixed columns before flattening dynamic fields.
+    // Combine both flattened schemas into the final ordered tabular schema.
+    let _ = (attributes, extra);
+    todo!("flatten nested schemas into one ordered column list")
+}
+
+fn build_cityobject_row<'a>(
+    source: &CityObjectSourceRow<'a>,
+    schema: &TableSchema,
+) -> Result<CityObjectRow> {
+    // Copy the fixed row fields directly from the borrowed source row.
+    // Then resolve each schema column from the relevant namespace and path in order.
+    // Build one cell per column, preserving nullability and path-bearing errors.
+    let _ = (source, schema);
+    todo!("materialize one tabular row from one CityObject")
 }
 
 fn infer_data_type(value: &OwnedAttributeValue) -> Result<DataType> {
@@ -400,11 +460,16 @@ fn flatten_struct_schema(namespace: ColumnNamespace, spec: &StructSpec) -> Vec<C
 }
 
 fn build_cell(
-    _value: Option<&OwnedAttributeValue>,
-    _data_type: &DataType,
-    _nullable: bool,
-    _path: &str,
+    value: Option<&OwnedAttributeValue>,
+    data_type: &DataType,
+    nullable: bool,
+    path: &str,
 ) -> Result<Cell> {
+    // Convert a borrowed CityObject value into the schema's logical cell type.
+    // Use checked numeric widening and recursive list/struct conversion.
+    // Preserve `Json` fallback values by cloning the original owned attribute value.
+    // Return a path-bearing error when the value is incompatible or non-nullable null.
+    let _ = (value, data_type, nullable, path);
     todo!("implement typed cell construction")
 }
 
