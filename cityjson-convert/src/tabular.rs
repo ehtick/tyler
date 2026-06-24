@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use cityjson_lib::cityjson_types::resources::handles::GeometryHandle;
 use cityjson_lib::cityjson_types::v2_0::{OwnedAttributeValue, OwnedAttributes};
 use cityjson_lib::CityModel;
@@ -147,12 +147,122 @@ pub fn build_cityobject_table(_model: &CityModel) -> Result<CityObjectTable> {
     todo!("implement CityObject table construction")
 }
 
-fn infer_data_type(_value: &OwnedAttributeValue) -> Result<DataType> {
-    todo!("implement tabular data type inference")
+fn infer_data_type(value: &OwnedAttributeValue) -> Result<DataType> {
+    Ok(match value {
+        OwnedAttributeValue::Null => DataType::Null,
+        OwnedAttributeValue::Bool(_) => DataType::Boolean,
+        OwnedAttributeValue::Unsigned(_) => DataType::UInt64,
+        OwnedAttributeValue::Integer(_) => DataType::Int64,
+        OwnedAttributeValue::Float(_) => DataType::Float64,
+        OwnedAttributeValue::String(_) => DataType::Utf8,
+        OwnedAttributeValue::Geometry(_) => DataType::GeometryRef,
+        OwnedAttributeValue::Vec(values) => {
+            let mut item_nullable = false;
+            let mut item_type = DataType::Null;
+
+            for item in values {
+                if matches!(item, OwnedAttributeValue::Null) {
+                    item_nullable = true;
+                    continue;
+                }
+                item_type = merge_data_types(item_type, infer_data_type(item)?)?;
+            }
+
+            if matches!(item_type, DataType::Json) {
+                DataType::Json
+            } else {
+                DataType::List {
+                    item_nullable,
+                    item: Box::new(item_type),
+                }
+            }
+        }
+        OwnedAttributeValue::Map(values) => {
+            let mut fields = values
+                .iter()
+                .map(|(name, value)| {
+                    Ok(cityjson_arrow::schema::ProjectedFieldSpec::new(
+                        name.clone(),
+                        infer_data_type(value)?,
+                        matches!(value, OwnedAttributeValue::Null),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            fields.sort_by(|left, right| left.name.cmp(&right.name));
+            DataType::Struct(StructSpec::new(fields))
+        }
+        unsupported => bail!("unsupported attribute value variant {unsupported}"),
+    })
 }
 
-fn merge_data_types(_left: DataType, _right: DataType) -> Result<DataType> {
-    todo!("implement tabular data type merging")
+fn merge_data_types(left: DataType, right: DataType) -> Result<DataType> {
+    Ok(match (left, right) {
+        (DataType::Null, other) | (other, DataType::Null) => other,
+        (DataType::Boolean, DataType::Boolean) => DataType::Boolean,
+        (DataType::UInt64, DataType::UInt64) => DataType::UInt64,
+        (DataType::Int64 | DataType::UInt64, DataType::Int64)
+        | (DataType::Int64, DataType::UInt64) => DataType::Int64,
+        (DataType::Float64 | DataType::UInt64 | DataType::Int64, DataType::Float64)
+        | (DataType::Float64, DataType::UInt64 | DataType::Int64) => DataType::Float64,
+        (DataType::Utf8, DataType::Utf8) => DataType::Utf8,
+        (DataType::GeometryRef, DataType::GeometryRef) => DataType::GeometryRef,
+        (DataType::Json, _) | (_, DataType::Json) => DataType::Json,
+        (
+            DataType::List {
+                item_nullable: left_nullable,
+                item: left_item,
+            },
+            DataType::List {
+                item_nullable: right_nullable,
+                item: right_item,
+            },
+        ) => {
+            let item = merge_data_types(*left_item, *right_item)?;
+            if matches!(item, DataType::Json) {
+                DataType::Json
+            } else {
+                DataType::List {
+                    item_nullable: left_nullable || right_nullable,
+                    item: Box::new(item),
+                }
+            }
+        }
+        (DataType::Struct(left), DataType::Struct(right)) => {
+            DataType::Struct(merge_struct_data_types(left, right)?)
+        }
+        _ => DataType::Json,
+    })
+}
+
+fn merge_struct_data_types(left: StructSpec, right: StructSpec) -> Result<StructSpec> {
+    let mut fields = left
+        .fields
+        .into_iter()
+        .map(|field| (field.name.clone(), field))
+        .collect::<BTreeMap<_, _>>();
+    let right_names = right
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<HashSet<_>>();
+
+    for (name, field) in &mut fields {
+        if !right_names.contains(name.as_str()) {
+            field.nullable = true;
+        }
+    }
+
+    for mut incoming in right.fields {
+        if let Some(existing) = fields.get_mut(&incoming.name) {
+            existing.nullable |= incoming.nullable;
+            existing.value = merge_data_types(existing.value.clone(), incoming.value)?;
+        } else {
+            incoming.nullable = true;
+            fields.insert(incoming.name.clone(), incoming);
+        }
+    }
+
+    Ok(StructSpec::new(fields.into_values().collect()))
 }
 
 fn infer_attribute_schema(_rows: &[Option<&OwnedAttributes>]) -> Result<StructSpec> {
@@ -210,12 +320,10 @@ mod tests {
         )
     }
 
-    /// Verifies type inference rules not exercised by the corpus acceptance
-    /// test.
+    /// Verifies value type inference and type merging rules.
     ///
-    /// Assertions cover numeric widening, list item nullability,
-    /// heterogeneous fallback to `Json`, recursive struct merging,
-    /// deterministic field order, and nullable fields omitted by some rows.
+    /// Assertions cover numeric widening, list item nullability and
+    /// heterogeneous fallback to `Json`.
     #[test]
     fn infers_and_merges_data_types() {
         let inference_cases = vec![
@@ -286,7 +394,14 @@ mod tests {
                 "{description}"
             );
         }
+    }
 
+    /// Verifies attribute schema inference across multiple rows.
+    ///
+    /// Assertions cover recursive struct merging, deterministic field order,
+    /// and nullable fields omitted by some rows.
+    #[test]
+    fn infers_attribute_schema() {
         let first = OwnedAttributes::from(HashMap::from([(
             "metrics".to_string(),
             map([
