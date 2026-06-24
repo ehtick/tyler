@@ -52,7 +52,6 @@ use cityjson_lib::cityjson_types::resources::handles::GeometryHandle;
 use cityjson_lib::cityjson_types::v2_0::{OwnedAttributeValue, OwnedAttributes};
 use cityjson_lib::CityModel;
 
-#[cfg(test)]
 use cityjson_arrow::schema::ProjectedFieldSpec as FieldSpec;
 use cityjson_arrow::schema::ProjectedStructSpec as StructSpec;
 /// Logical data type inferred for a tabular column or nested value.
@@ -265,8 +264,46 @@ fn merge_struct_data_types(left: StructSpec, right: StructSpec) -> Result<Struct
     Ok(StructSpec::new(fields.into_values().collect()))
 }
 
-fn infer_attribute_schema(_rows: &[Option<&OwnedAttributes>]) -> Result<StructSpec> {
-    todo!("implement attribute schema inference")
+/// Infers the shared struct schema for a sequence of attribute rows.
+///
+/// Missing rows make already-seen fields nullable, and null values make the
+/// corresponding field nullable at the field level.
+fn infer_attribute_schema(rows: &[Option<&OwnedAttributes>]) -> Result<StructSpec> {
+    let mut schema: Option<StructSpec> = None;
+    let mut saw_missing_attributes = false;
+
+    for attributes in rows {
+        let Some(attributes) = attributes else {
+            saw_missing_attributes = true;
+            if let Some(schema) = &mut schema {
+                for field in &mut schema.fields {
+                    field.nullable = true;
+                }
+            }
+            continue;
+        };
+
+        let mut fields = attributes
+            .iter()
+            .map(|(name, value)| {
+                Ok(FieldSpec::new(
+                    name.clone(),
+                    infer_data_type(value)?,
+                    matches!(value, OwnedAttributeValue::Null)
+                        || (schema.is_none() && saw_missing_attributes),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        fields.sort_by(|left, right| left.name.cmp(&right.name));
+        let row_schema = StructSpec::new(fields);
+
+        schema = Some(match schema {
+            Some(schema) => merge_struct_data_types(schema, row_schema)?,
+            None => row_schema,
+        });
+    }
+
+    Ok(schema.unwrap_or_else(|| StructSpec::new(Vec::new())))
 }
 
 fn escape_path_segment(_segment: &str) -> String {
@@ -413,14 +450,14 @@ mod tests {
             "metrics".to_string(),
             map([("height", Value::Float(14.5))]),
         )]));
-        let actual = infer_attribute_schema(&[Some(&first), Some(&second)]).unwrap();
+        let actual = infer_attribute_schema(&[Some(&first), Some(&second), None]).unwrap();
         let expected = StructSpec::new(vec![FieldSpec::new(
             "metrics",
             DataType::Struct(StructSpec::new(vec![
                 FieldSpec::new("height", DataType::Float64, false),
                 FieldSpec::new("slope", DataType::Float64, true),
             ])),
-            false,
+            true,
         )]);
         assert_eq!(actual, expected);
     }
