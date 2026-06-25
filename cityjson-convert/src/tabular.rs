@@ -1,38 +1,36 @@
-//! Shared borrowed tabular projection of CityJSON CityObjects.
+//! Shared borrowed tabular representation of CityJSON CityObjects.
 //!
-//! This module projects a [`CityModel`] into a format-neutral schema and a lazy
+//! This module exposes a [`CityModel`] through a format-neutral schema and a lazy
 //! sequence of CityObject rows for flat writers such as CSV, TSV, and
 //! GeoPackage. It defines logical fields and values only; delimiters, SQLite
 //! types, and text encoding belong to the writers.
 //!
 //! # API vocabulary
 //!
-//! The tabular API is organized into three groups:
+//! The tabular API is organized into two groups:
 //!
-//! - Table views: [`TableView`], [`TableSchema`],
-//!   [`RowView`], [`ColumnSchema`], and [`ColumnSource`].
-//! - Projected schemas: [`ProjectedType`], [`StructSchema`], and
-//!   [`StructFieldSchema`].
-//! - Projected values: [`ProjectedValue`], [`ListValueView`], and
-//!   [`StructValueView`].
+//! - Data access: [`Table`], [`Row`], [`Value`], [`ListValue`], and
+//!   [`StructValue`].
+//! - Schema: [`TableSchema`], [`ColumnSchema`], [`LogicalType`],
+//!   [`StructSchema`], and [`StructFieldSchema`].
 //!
 //! The table types describe the flattened row layout. Schema types describe the
-//! logical type accepted by a column or a nested container item. Value types are
-//! borrowed views of actual CityObject data. For example, [`ProjectedType`]
-//! describes a value while [`ProjectedValue`] exposes one value from a row.
+//! logical type accepted by a column or a nested container item. Values borrow
+//! actual CityObject data. For example, [`LogicalType`] describes a value while
+//! [`Value`] exposes one value from a row.
 //! Nested schema and value types remain under this module; the crate root exports
 //! only the primary table vocabulary.
 //!
 //! # Data flow
 //!
-//! [`project_cityobjects`] scans the model once to infer the shared dynamic
-//! schema. The returned table view owns that schema and borrows the model.
+//! [`tabulate_cityobjects`] scans the model once to infer the shared dynamic
+//! schema. The returned table owns that schema and borrows the model.
 //! Iterating rows walks the model directly in CityObject order. Rows and values
-//! are views: source identifiers, strings, attribute names, JSON fallback values,
+//! borrow source identifiers, strings, attribute names, JSON fallback values,
 //! lists, and structs are borrowed rather than copied into a second table.
 //!
 //! Each row exposes fixed identity fields and one logical value for every
-//! projected column. Values are resolved on demand. Lists and structs retained
+//! dynamic column. Values are resolved on demand. Lists and structs retained
 //! inside lists remain lazy, allowing a writer to encode nested values without
 //! first materializing owned child collections.
 //!
@@ -45,9 +43,9 @@
 //! lists retain their item type and item nullability. Mixed shapes and
 //! heterogeneous lists fall back to a JSON value.
 //!
-//! During inference, projected struct schemas form a tree used to discover
+//! During inference, struct schemas form a tree used to discover
 //! paths and merge field types across rows. The top-level trees are flattened
-//! before the table schema is produced. [`ProjectedType::Struct`] is retained
+//! before the table schema is produced. [`LogicalType::Struct`] is retained
 //! only for structs nested inside a container, primarily lists. A top-level
 //! [`ColumnSchema`] is never emitted with a direct struct type.
 //!
@@ -74,7 +72,7 @@
 //! }
 //! ```
 //!
-//! produces these projected columns:
+//! produces these columns:
 //!
 //! ```text
 //! attributes__metrics__height  Float64
@@ -85,7 +83,7 @@
 //! The direct `metrics` map is an inference node only and does not become a
 //! struct-valued column. The `tags` vector remains one list-valued column.
 //!
-//! Struct schemas and struct value views are still needed when a struct occurs
+//! Struct schemas and struct values are still needed when a struct occurs
 //! inside a retained container. For example:
 //!
 //! ```json
@@ -99,16 +97,16 @@
 //! }
 //! ```
 //!
-//! produces one projected column:
+//! produces one column:
 //!
 //! ```text
 //! attributes__items  List<Struct{name: Utf8, count: UInt64}>
 //! ```
 //!
 //! Here the `items` list remains a single column, so its item structs require a
-//! nested [`StructSchema`] and are read through a lazy [`StructValueView`].
+//! nested [`StructSchema`] and are read through a lazy [`StructValue`].
 //!
-//! Physical names start with the column source and join path segments with `__`.
+//! Physical names start with the column origin and join path segments with `__`.
 //! Within a path segment, `%` is escaped as `%25` and literal `__` as `%5F%5F`.
 //! Conflicts are resolved deterministically with `__2`, `__3`, and later
 //! suffixes. Null-only fields do not produce columns. Attribute columns precede
@@ -116,12 +114,12 @@
 //!
 //! # Invariants
 //!
-//! A table view has one row per CityObject in model order. Row ordinals are
+//! A table has one row per CityObject in model order. Row ordinals are
 //! zero-based, and every row uses the same ordered schema. Value index `n`
-//! corresponds to projected-column index `n`. Missing nullable values become
+//! corresponds to dynamic-column index `n`. Missing nullable values become
 //! null values. Non-null values either conform to the inferred logical type or
 //! return a path-bearing error; they are never silently converted to an
-//! unrelated type. The table view and every view derived from it are bounded by
+//! unrelated type. The table and every value derived from it are bounded by
 //! the lifetime of the source model.
 
 use std::collections::{BTreeMap, HashMap};
@@ -135,28 +133,28 @@ use cityjson_lib::CityModel;
 
 /// Borrowed CityObject table with one inferred schema.
 ///
-/// The view owns schema containers and physical column names, but borrows all
+/// The table owns schema containers and physical column names, but borrows all
 /// source field names and values from the model. It does not store rows.
 #[derive(Debug)]
-pub struct TableView<'model> {
+pub struct Table<'model> {
     model: &'model CityModel,
     schema: TableSchema<'model>,
 }
 
-impl<'model> TableView<'model> {
-    /// Returns the shared flattened schema used by every projected row.
+impl<'model> Table<'model> {
+    /// Returns the shared flattened schema used by every row.
     #[must_use]
     pub fn schema(&self) -> &TableSchema<'model> {
         &self.schema
     }
 
     /// Iterates over CityObjects in model order without allocating rows.
-    pub fn rows(&self) -> impl Iterator<Item = RowView<'_, 'model>> {
+    pub fn rows(&self) -> impl Iterator<Item = Row<'_, 'model>> {
         self.model
             .cityobjects()
             .iter()
             .enumerate()
-            .map(|(cityobject_ix, (_, object))| RowView {
+            .map(|(cityobject_ix, (_, object))| Row {
                 cityobject_id: object.id(),
                 cityobject_ix: cityobject_ix as u64,
                 cityobject_type: object.type_cityobject(),
@@ -168,7 +166,7 @@ impl<'model> TableView<'model> {
     }
 }
 
-/// Ordered dynamic-column schema shared by every projected row.
+/// Ordered dynamic-column schema shared by every row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableSchema<'model> {
     /// Columns in the same positional order returned by row value iterators.
@@ -179,27 +177,27 @@ pub struct TableSchema<'model> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnSchema<'model> {
     /// CityObject member from which the column originates.
-    pub source: ColumnSource,
-    /// Unescaped nested source path below the source namespace.
+    pub origin: ColumnOrigin,
+    /// Unescaped nested path below the column origin.
     pub path: Vec<&'model str>,
     /// Escaped and unique physical column name.
     pub name: String,
     /// Logical type shared by every non-null value in the column.
-    pub projected_type: ProjectedType<'model>,
+    pub logical_type: LogicalType<'model>,
     /// Whether the column accepts missing or explicit-null values.
     pub nullable: bool,
 }
 
-/// Source CityObject member from which a projected column originates.
+/// CityObject member from which a dynamic column originates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnSource {
+pub enum ColumnOrigin {
     /// Column inferred from the CityObject `attributes` member.
     Attributes,
     /// Column inferred from custom CityObject members.
     Extra,
 }
 
-impl ColumnSource {
+impl ColumnOrigin {
     /// Returns the physical source prefix used in flattened column names.
     fn as_str(self) -> &'static str {
         match self {
@@ -209,9 +207,9 @@ impl ColumnSource {
     }
 }
 
-/// Logical type of a projected column or nested container item.
+/// Logical type of a dynamic column or nested container item.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProjectedType<'model> {
+pub enum LogicalType<'model> {
     /// Null-only value used for empty or all-null retained containers.
     Null,
     /// Boolean value.
@@ -224,7 +222,7 @@ pub enum ProjectedType<'model> {
     Float64,
     /// UTF-8 string.
     Utf8,
-    /// Original source value used when no stable typed projection exists.
+    /// Original source value used when no stable logical type exists.
     Json,
     /// Reference to geometry owned by the source model.
     GeometryRef,
@@ -233,7 +231,7 @@ pub enum ProjectedType<'model> {
         /// Whether an item in the list may be null.
         item_nullable: bool,
         /// Logical type shared by non-null list items.
-        item: Box<ProjectedType<'model>>,
+        item: Box<LogicalType<'model>>,
     },
     /// Struct retained inside a container value.
     ///
@@ -254,15 +252,15 @@ pub struct StructSchema<'model> {
 pub struct StructFieldSchema<'model> {
     /// Source field name borrowed from the model.
     pub name: &'model str,
-    /// Projected logical type of the field.
-    pub projected_type: ProjectedType<'model>,
+    /// Logical type of the field.
+    pub logical_type: LogicalType<'model>,
     /// Whether the field may be missing or explicitly null.
     pub nullable: bool,
 }
 
-/// One allocation-free row view over a source CityObject.
+/// One allocation-free row over a source CityObject.
 #[derive(Clone, Copy, Debug)]
-pub struct RowView<'table, 'model> {
+pub struct Row<'table, 'model> {
     /// CityJSON object identifier borrowed from the model.
     pub cityobject_id: &'model str,
     /// Zero-based ordinal in model CityObject order.
@@ -275,49 +273,49 @@ pub struct RowView<'table, 'model> {
     schema: &'table TableSchema<'model>,
 }
 
-impl<'table, 'model> RowView<'table, 'model> {
+impl<'table, 'model> Row<'table, 'model> {
     /// Returns the CityObject type using its CityJSON display spelling.
     #[must_use]
     pub fn cityobject_type_name(&self) -> impl Display + '_ {
         self.cityobject_type
     }
 
-    /// Resolves the projected value at `index`.
+    /// Resolves the value at `index`.
     ///
     /// Returns `None` when `index` is outside the shared schema. Otherwise the
     /// result contains a borrowed value or a path-bearing conversion error.
-    pub fn value(&self, index: usize) -> Option<Result<ProjectedValue<'_, 'model>>> {
+    pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
         self.schema
             .columns
             .get(index)
             .map(|column| self.value_for_column(column))
     }
 
-    /// Resolves projected values lazily in shared schema order.
-    pub fn values(&self) -> impl Iterator<Item = Result<ProjectedValue<'_, 'model>>> {
+    /// Resolves values lazily in shared schema order.
+    pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
         self.schema
             .columns
             .iter()
             .map(|column| self.value_for_column(column))
     }
 
-    /// Resolves one projected column against this row's matching source map.
+    /// Resolves one dynamic column against this row's matching source map.
     fn value_for_column<'row>(
         &'row self,
         column: &'row ColumnSchema<'model>,
-    ) -> Result<ProjectedValue<'row, 'model>> {
-        let attributes = match column.source {
-            ColumnSource::Attributes => self.attributes,
-            ColumnSource::Extra => self.extra,
+    ) -> Result<Value<'row, 'model>> {
+        let attributes = match column.origin {
+            ColumnOrigin::Attributes => self.attributes,
+            ColumnOrigin::Extra => self.extra,
         };
         let value = resolve_path(attributes, &column.path, &column.name)?;
-        build_projected_value(value, &column.projected_type, column.nullable, &column.name)
+        build_value(value, &column.logical_type, column.nullable, &column.name)
     }
 }
 
-/// Borrowed logical value from one row and projected column.
+/// Borrowed logical value from one row and dynamic column.
 #[derive(Debug)]
-pub enum ProjectedValue<'schema, 'model> {
+pub enum Value<'schema, 'model> {
     /// Missing or explicit-null value.
     Null,
     /// Boolean value copied from the source scalar.
@@ -332,24 +330,24 @@ pub enum ProjectedValue<'schema, 'model> {
     Utf8(&'model str),
     /// Geometry handle copied from the source value.
     GeometryRef(GeometryHandle),
-    /// List traversed lazily through a borrowed view.
-    List(ListValueView<'schema, 'model>),
-    /// Struct traversed lazily through a borrowed view.
-    Struct(StructValueView<'schema, 'model>),
+    /// List traversed lazily without materializing its items.
+    List(ListValue<'schema, 'model>),
+    /// Struct traversed lazily without materializing its fields.
+    Struct(StructValue<'schema, 'model>),
     /// Original source value borrowed after heterogeneous fallback.
     Json(&'model OwnedAttributeValue),
 }
 
-/// Lazy borrowed view of a list-valued projected value.
+/// Lazy borrowed list value.
 #[derive(Debug)]
-pub struct ListValueView<'schema, 'model> {
+pub struct ListValue<'schema, 'model> {
     values: &'model [OwnedAttributeValue],
-    item_type: &'schema ProjectedType<'model>,
+    item_type: &'schema LogicalType<'model>,
     item_nullable: bool,
     path: &'schema str,
 }
 
-impl<'schema, 'model> ListValueView<'schema, 'model> {
+impl<'schema, 'model> ListValue<'schema, 'model> {
     /// Returns the number of source list items.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -363,32 +361,30 @@ impl<'schema, 'model> ListValueView<'schema, 'model> {
     }
 
     /// Resolves list items lazily in source order.
-    pub fn iter(&self) -> impl Iterator<Item = Result<ProjectedValue<'_, 'model>>> {
-        self.values.iter().map(|value| {
-            build_projected_value(Some(value), self.item_type, self.item_nullable, self.path)
-        })
+    pub fn iter(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
+        self.values
+            .iter()
+            .map(|value| build_value(Some(value), self.item_type, self.item_nullable, self.path))
     }
 }
 
-/// Lazy borrowed view of a struct retained inside a container value.
+/// Lazy borrowed struct retained inside a container value.
 #[derive(Debug)]
-pub struct StructValueView<'schema, 'model> {
+pub struct StructValue<'schema, 'model> {
     values: &'model HashMap<String, OwnedAttributeValue>,
     schema: &'schema StructSchema<'model>,
     path: &'schema str,
 }
 
-impl<'schema, 'model> StructValueView<'schema, 'model> {
+impl<'schema, 'model> StructValue<'schema, 'model> {
     /// Resolves struct fields lazily in lexical schema order.
     ///
-    /// Each item contains the borrowed field name and its projected value.
-    pub fn fields(
-        &self,
-    ) -> impl Iterator<Item = Result<(&'model str, ProjectedValue<'_, 'model>)>> {
+    /// Each item contains the borrowed field name and its value.
+    pub fn fields(&self) -> impl Iterator<Item = Result<(&'model str, Value<'_, 'model>)>> {
         self.schema.fields.values().map(|field| {
-            let value = build_projected_value(
+            let value = build_value(
                 self.values.get(field.name),
-                &field.projected_type,
+                &field.logical_type,
                 field.nullable,
                 self.path,
             )?;
@@ -397,13 +393,13 @@ impl<'schema, 'model> StructValueView<'schema, 'model> {
     }
 }
 
-/// Infers the shared schema and returns a borrowed CityObject table view.
+/// Infers the shared schema and returns a borrowed CityObject table.
 ///
 /// # Errors
 ///
 /// Returns an error when an attribute value variant cannot be represented by the
-/// projection's logical type vocabulary.
-pub fn project_cityobjects(model: &CityModel) -> Result<TableView<'_>> {
+/// table's logical type vocabulary.
+pub fn tabulate_cityobjects(model: &CityModel) -> Result<Table<'_>> {
     let mut attributes = StructSchema::default();
     let mut extra = StructSchema::default();
     for (row_ix, (_, object)) in model.cityobjects().iter().enumerate() {
@@ -416,7 +412,7 @@ pub fn project_cityobjects(model: &CityModel) -> Result<TableView<'_>> {
             None => mark_all_nullable(&mut extra),
         }
     }
-    Ok(TableView {
+    Ok(Table {
         model,
         schema: build_table_schema(attributes, extra),
     })
@@ -467,14 +463,14 @@ fn merge_field<'model>(
         if matches!(value, OwnedAttributeValue::Null) {
             field.nullable = true;
         } else {
-            merge_projected_type_with_value(&mut field.projected_type, value)?;
+            merge_logical_type_with_value(&mut field.logical_type, value)?;
         }
     } else {
         schema.fields.insert(
             name,
             StructFieldSchema {
                 name,
-                projected_type: infer_type(value)?,
+                logical_type: infer_type(value)?,
                 nullable: seen_rows > 0 || matches!(value, OwnedAttributeValue::Null),
             },
         );
@@ -489,45 +485,45 @@ fn mark_all_nullable(schema: &mut StructSchema<'_>) {
     }
 }
 
-/// Infers the projected logical type of one borrowed source value recursively.
-fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<ProjectedType<'model>> {
+/// Infers the logical type of one borrowed source value recursively.
+fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<LogicalType<'model>> {
     Ok(match value {
-        OwnedAttributeValue::Null => ProjectedType::Null,
-        OwnedAttributeValue::Bool(_) => ProjectedType::Boolean,
-        OwnedAttributeValue::Unsigned(_) => ProjectedType::UInt64,
-        OwnedAttributeValue::Integer(_) => ProjectedType::Int64,
-        OwnedAttributeValue::Float(_) => ProjectedType::Float64,
-        OwnedAttributeValue::String(_) => ProjectedType::Utf8,
-        OwnedAttributeValue::Geometry(_) => ProjectedType::GeometryRef,
+        OwnedAttributeValue::Null => LogicalType::Null,
+        OwnedAttributeValue::Bool(_) => LogicalType::Boolean,
+        OwnedAttributeValue::Unsigned(_) => LogicalType::UInt64,
+        OwnedAttributeValue::Integer(_) => LogicalType::Int64,
+        OwnedAttributeValue::Float(_) => LogicalType::Float64,
+        OwnedAttributeValue::String(_) => LogicalType::Utf8,
+        OwnedAttributeValue::Geometry(_) => LogicalType::GeometryRef,
         OwnedAttributeValue::Vec(values) => infer_list_type(values)?,
         OwnedAttributeValue::Map(values) => {
             let mut schema = StructSchema::default();
             merge_attribute_values(&mut schema, values, 0)?;
-            ProjectedType::Struct(schema)
+            LogicalType::Struct(schema)
         }
         unsupported => bail!("unsupported attribute value variant {unsupported}"),
     })
 }
 
 /// Infers a homogeneous list item type or falls back to JSON.
-fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<ProjectedType<'model>> {
+fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<LogicalType<'model>> {
     let mut item_nullable = false;
-    let mut item_type = ProjectedType::Null;
+    let mut item_type = LogicalType::Null;
     let mut saw_item = false;
     for value in values {
         if matches!(value, OwnedAttributeValue::Null) {
             item_nullable = true;
         } else if saw_item {
-            merge_projected_type_with_value(&mut item_type, value)?;
+            merge_logical_type_with_value(&mut item_type, value)?;
         } else {
             item_type = infer_type(value)?;
             saw_item = true;
         }
     }
-    if matches!(item_type, ProjectedType::Json) {
-        Ok(ProjectedType::Json)
+    if matches!(item_type, LogicalType::Json) {
+        Ok(LogicalType::Json)
     } else {
-        Ok(ProjectedType::List {
+        Ok(LogicalType::List {
             item_nullable,
             item: Box::new(item_type),
         })
@@ -535,35 +531,35 @@ fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<Proj
 }
 
 /// Merges a source value into an existing inferred type using widening rules.
-fn merge_projected_type_with_value<'model>(
-    current: &mut ProjectedType<'model>,
+fn merge_logical_type_with_value<'model>(
+    current: &mut LogicalType<'model>,
     value: &'model OwnedAttributeValue,
 ) -> Result<()> {
     if matches!(value, OwnedAttributeValue::Null) {
         return Ok(());
     }
     match (&mut *current, value) {
-        (ProjectedType::Null, _) => *current = infer_type(value)?,
-        (ProjectedType::Boolean, OwnedAttributeValue::Bool(_))
-        | (ProjectedType::UInt64, OwnedAttributeValue::Unsigned(_))
-        | (ProjectedType::Int64, OwnedAttributeValue::Integer(_))
-        | (ProjectedType::Float64, OwnedAttributeValue::Float(_))
-        | (ProjectedType::Utf8, OwnedAttributeValue::String(_))
-        | (ProjectedType::GeometryRef, OwnedAttributeValue::Geometry(_))
-        | (ProjectedType::Json, _) => {}
-        (ProjectedType::UInt64, OwnedAttributeValue::Integer(_))
-        | (ProjectedType::Int64, OwnedAttributeValue::Unsigned(_)) => {
-            *current = ProjectedType::Int64;
+        (LogicalType::Null, _) => *current = infer_type(value)?,
+        (LogicalType::Boolean, OwnedAttributeValue::Bool(_))
+        | (LogicalType::UInt64, OwnedAttributeValue::Unsigned(_))
+        | (LogicalType::Int64, OwnedAttributeValue::Integer(_))
+        | (LogicalType::Float64, OwnedAttributeValue::Float(_))
+        | (LogicalType::Utf8, OwnedAttributeValue::String(_))
+        | (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(_))
+        | (LogicalType::Json, _) => {}
+        (LogicalType::UInt64, OwnedAttributeValue::Integer(_))
+        | (LogicalType::Int64, OwnedAttributeValue::Unsigned(_)) => {
+            *current = LogicalType::Int64;
         }
-        (ProjectedType::UInt64 | ProjectedType::Int64, OwnedAttributeValue::Float(_)) => {
-            *current = ProjectedType::Float64;
+        (LogicalType::UInt64 | LogicalType::Int64, OwnedAttributeValue::Float(_)) => {
+            *current = LogicalType::Float64;
         }
         (
-            ProjectedType::Float64,
+            LogicalType::Float64,
             OwnedAttributeValue::Unsigned(_) | OwnedAttributeValue::Integer(_),
         ) => {}
         (
-            ProjectedType::List {
+            LogicalType::List {
                 item_nullable,
                 item,
             },
@@ -573,23 +569,23 @@ fn merge_projected_type_with_value<'model>(
                 if matches!(value, OwnedAttributeValue::Null) {
                     *item_nullable = true;
                 } else {
-                    merge_projected_type_with_value(item, value)?;
-                    if matches!(item.as_ref(), ProjectedType::Json) {
-                        *current = ProjectedType::Json;
+                    merge_logical_type_with_value(item, value)?;
+                    if matches!(item.as_ref(), LogicalType::Json) {
+                        *current = LogicalType::Json;
                         break;
                     }
                 }
             }
         }
-        (ProjectedType::Struct(schema), OwnedAttributeValue::Map(values)) => {
+        (LogicalType::Struct(schema), OwnedAttributeValue::Map(values)) => {
             merge_attribute_values(schema, values, 1)?;
         }
-        _ => *current = ProjectedType::Json,
+        _ => *current = LogicalType::Json,
     }
     Ok(())
 }
 
-/// Flattens projected attribute and extra trees into one shared table schema.
+/// Flattens attribute and extra trees into one shared table schema.
 fn build_table_schema<'model>(
     attributes: StructSchema<'model>,
     extra: StructSchema<'model>,
@@ -598,7 +594,7 @@ fn build_table_schema<'model>(
     let mut path = Vec::new();
     let mut name_buffer = String::new();
     flatten_struct_schema(
-        ColumnSource::Attributes,
+        ColumnOrigin::Attributes,
         attributes,
         &mut path,
         false,
@@ -606,7 +602,7 @@ fn build_table_schema<'model>(
         &mut columns,
     );
     flatten_struct_schema(
-        ColumnSource::Extra,
+        ColumnOrigin::Extra,
         extra,
         &mut path,
         false,
@@ -616,9 +612,9 @@ fn build_table_schema<'model>(
     TableSchema { columns }
 }
 
-/// Recursively emits non-struct leaves as projected columns.
+/// Recursively emits non-struct leaves as dynamic columns.
 fn flatten_struct_schema<'model>(
-    source: ColumnSource,
+    origin: ColumnOrigin,
     schema: StructSchema<'model>,
     path: &mut Vec<&'model str>,
     inherited_nullable: bool,
@@ -628,19 +624,19 @@ fn flatten_struct_schema<'model>(
     for field in schema.fields.into_values() {
         path.push(field.name);
         let nullable = inherited_nullable || field.nullable;
-        match field.projected_type {
-            ProjectedType::Null => {}
-            ProjectedType::Struct(schema) => {
-                flatten_struct_schema(source, schema, path, nullable, name_buffer, columns);
+        match field.logical_type {
+            LogicalType::Null => {}
+            LogicalType::Struct(schema) => {
+                flatten_struct_schema(origin, schema, path, nullable, name_buffer, columns);
             }
-            projected_type => {
-                build_column_name(name_buffer, source, path);
-                debug_assert!(!matches!(projected_type, ProjectedType::Struct(_)));
+            logical_type => {
+                build_column_name(name_buffer, origin, path);
+                debug_assert!(!matches!(logical_type, LogicalType::Struct(_)));
                 columns.push(ColumnSchema {
-                    source,
+                    origin,
                     path: path.clone(),
                     name: unique_column_name(name_buffer, columns),
-                    projected_type,
+                    logical_type,
                     nullable,
                 });
             }
@@ -650,9 +646,9 @@ fn flatten_struct_schema<'model>(
 }
 
 /// Builds an escaped physical name in a reusable string buffer.
-fn build_column_name(buffer: &mut String, source: ColumnSource, path: &[&str]) {
+fn build_column_name(buffer: &mut String, origin: ColumnOrigin, path: &[&str]) {
     buffer.clear();
-    buffer.push_str(source.as_str());
+    buffer.push_str(origin.as_str());
     for segment in path {
         buffer.push_str("__");
         push_escaped_path_segment(buffer, segment);
@@ -728,70 +724,60 @@ fn resolve_path<'model>(
     Ok(Some(value))
 }
 
-/// Validates and exposes one source value as a borrowed projected value.
-fn build_projected_value<'schema, 'model>(
+/// Validates and exposes one source value as a borrowed table value.
+fn build_value<'schema, 'model>(
     value: Option<&'model OwnedAttributeValue>,
-    projected_type: &'schema ProjectedType<'model>,
+    logical_type: &'schema LogicalType<'model>,
     nullable: bool,
     path: &'schema str,
-) -> Result<ProjectedValue<'schema, 'model>> {
+) -> Result<Value<'schema, 'model>> {
     let Some(value) = value else {
         if nullable {
-            return Ok(ProjectedValue::Null);
+            return Ok(Value::Null);
         }
         bail!("{path}: missing non-nullable value");
     };
     if matches!(value, OwnedAttributeValue::Null) {
         if nullable {
-            return Ok(ProjectedValue::Null);
+            return Ok(Value::Null);
         }
         bail!("{path}: null in non-nullable value");
     }
-    match (projected_type, value) {
-        (ProjectedType::Boolean, OwnedAttributeValue::Bool(value)) => {
-            Ok(ProjectedValue::Boolean(*value))
+    match (logical_type, value) {
+        (LogicalType::Boolean, OwnedAttributeValue::Bool(value)) => Ok(Value::Boolean(*value)),
+        (LogicalType::UInt64, OwnedAttributeValue::Unsigned(value)) => Ok(Value::UInt64(*value)),
+        (LogicalType::Int64, OwnedAttributeValue::Integer(value)) => Ok(Value::Int64(*value)),
+        (LogicalType::Int64, OwnedAttributeValue::Unsigned(value)) => {
+            Ok(Value::Int64(i64::try_from(*value).map_err(|_| {
+                anyhow::anyhow!("{path}: unsigned integer {value} does not fit in Int64")
+            })?))
         }
-        (ProjectedType::UInt64, OwnedAttributeValue::Unsigned(value)) => {
-            Ok(ProjectedValue::UInt64(*value))
+        (LogicalType::Float64, OwnedAttributeValue::Float(value)) => Ok(Value::Float64(*value)),
+        (LogicalType::Float64, OwnedAttributeValue::Unsigned(value)) => {
+            Ok(Value::Float64(*value as f64))
         }
-        (ProjectedType::Int64, OwnedAttributeValue::Integer(value)) => {
-            Ok(ProjectedValue::Int64(*value))
+        (LogicalType::Float64, OwnedAttributeValue::Integer(value)) => {
+            Ok(Value::Float64(*value as f64))
         }
-        (ProjectedType::Int64, OwnedAttributeValue::Unsigned(value)) => {
-            Ok(ProjectedValue::Int64(i64::try_from(*value).map_err(
-                |_| anyhow::anyhow!("{path}: unsigned integer {value} does not fit in Int64"),
-            )?))
+        (LogicalType::Utf8, OwnedAttributeValue::String(value)) => Ok(Value::Utf8(value)),
+        (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(value)) => {
+            Ok(Value::GeometryRef(*value))
         }
-        (ProjectedType::Float64, OwnedAttributeValue::Float(value)) => {
-            Ok(ProjectedValue::Float64(*value))
-        }
-        (ProjectedType::Float64, OwnedAttributeValue::Unsigned(value)) => {
-            Ok(ProjectedValue::Float64(*value as f64))
-        }
-        (ProjectedType::Float64, OwnedAttributeValue::Integer(value)) => {
-            Ok(ProjectedValue::Float64(*value as f64))
-        }
-        (ProjectedType::Utf8, OwnedAttributeValue::String(value)) => {
-            Ok(ProjectedValue::Utf8(value))
-        }
-        (ProjectedType::GeometryRef, OwnedAttributeValue::Geometry(value)) => {
-            Ok(ProjectedValue::GeometryRef(*value))
-        }
-        (ProjectedType::Json, value) => Ok(ProjectedValue::Json(value)),
+        (LogicalType::Json, value) => Ok(Value::Json(value)),
         (
-            ProjectedType::List {
+            LogicalType::List {
                 item_nullable,
                 item,
             },
             OwnedAttributeValue::Vec(values),
-        ) => Ok(ProjectedValue::List(ListValueView {
+        ) => Ok(Value::List(ListValue {
             values,
             item_type: item,
             item_nullable: *item_nullable,
             path,
         })),
-        (ProjectedType::Struct(schema), OwnedAttributeValue::Map(values)) => {
-            Ok(ProjectedValue::Struct(StructValueView {
+        (LogicalType::Struct(schema), OwnedAttributeValue::Map(values)) => {
+            Ok(Value::Struct(StructValue {
                 values,
                 schema,
                 path,
