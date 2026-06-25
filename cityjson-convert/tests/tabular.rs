@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use cityjson_convert::{tabulate_cityobjects, LogicalType, Value};
+use cityjson_convert::{tabulate_cityobjects, ColumnOrigin, LogicalType, Value};
 use cityjson_lib::json;
 
 /// Locates the complete CityJSON 2.0 conformance fixture used by the public
@@ -95,6 +95,26 @@ fn tabulates_cityjson_fake_complete() {
         rows.iter().map(|row| row.cityobject_id).collect::<Vec<_>>(),
         ["id-1", "id-3", "a-tree", "my-neighbourhood"]
     );
+    assert_eq!(
+        rows.iter().map(|row| row.cityobject_ix).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(rows[0].cityobject_type_name().to_string(), "BuildingPart");
+    assert_eq!(rows[1].cityobject_type_name().to_string(), "+NoiseBuilding");
+
+    let height = column_index(&table, "attributes__measuredHeight");
+    let height_schema = &table.schema().columns[height];
+    assert_eq!(height_schema.origin, ColumnOrigin::Attributes);
+    assert_eq!(height_schema.logical_type, LogicalType::Float64);
+    assert!(height_schema.nullable);
+
+    let children_roles = column_index(&table, "extra__children_roles");
+    let children_roles_schema = &table.schema().columns[children_roles];
+    assert_eq!(children_roles_schema.origin, ColumnOrigin::Extra);
+    assert!(matches!(
+        children_roles_schema.logical_type,
+        LogicalType::List { ref item, .. } if matches!(item.as_ref(), LogicalType::Utf8)
+    ));
 
     for row in &rows {
         let cells = row.values().collect::<Result<Vec<_>, _>>().unwrap();
@@ -104,7 +124,6 @@ fn tabulates_cityjson_fake_complete() {
         }
     }
 
-    let height = column_index(&table, "attributes__measuredHeight");
     assert_eq!(
         rows[0].bbox,
         Some([84710.1, 446846.0, -5.3, 84757.1, 446944.0, 40.9])
@@ -113,6 +132,11 @@ fn tabulates_cityjson_fake_complete() {
         rows[0].value(height).unwrap().unwrap(),
         Value::Float64(22.3)
     ));
+    assert!(matches!(
+        rows[2].value(height).unwrap().unwrap(),
+        Value::Null
+    ));
+    assert!(rows[0].value(table.schema().columns.len()).is_none());
 }
 
 /// Establishes the borrowed and lazy API contract with a minimal inline model.
