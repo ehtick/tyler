@@ -45,11 +45,10 @@
 //! lists retain their item type and item nullability. Mixed shapes and
 //! heterogeneous lists fall back to a JSON value.
 //!
-//! Inference and the final projected-column schema are separate layers. During
-//! inference, maps form a private tree used to discover paths and merge field
-//! types across rows. That private tree is flattened before the public table
-//! schema is produced. [`ProjectedType::Struct`] is reserved for structs that
-//! remain nested inside a retained container, primarily lists. A top-level
+//! During inference, projected struct schemas form a tree used to discover
+//! paths and merge field types across rows. The top-level trees are flattened
+//! before the table schema is produced. [`ProjectedType::Struct`] is retained
+//! only for structs nested inside a container, primarily lists. A top-level
 //! [`ColumnSchema`] is never emitted with a direct struct type.
 //!
 //! # Column flattening
@@ -398,38 +397,6 @@ impl<'schema, 'model> StructValueView<'schema, 'model> {
     }
 }
 
-/// Private schema node used while merging and flattening source maps.
-#[derive(Debug)]
-enum InferredType<'model> {
-    Null,
-    Boolean,
-    UInt64,
-    Int64,
-    Float64,
-    Utf8,
-    Json,
-    GeometryRef,
-    List {
-        item_nullable: bool,
-        item: Box<InferredType<'model>>,
-    },
-    Struct(InferredStruct<'model>),
-}
-
-/// Private field in an inferred map tree.
-#[derive(Debug)]
-struct InferredField<'model> {
-    name: &'model str,
-    value: InferredType<'model>,
-    nullable: bool,
-}
-
-/// Private ordered map tree consumed during column flattening.
-#[derive(Debug, Default)]
-struct InferredStruct<'model> {
-    fields: BTreeMap<&'model str, InferredField<'model>>,
-}
-
 /// Infers the shared schema and returns a borrowed CityObject table view.
 ///
 /// # Errors
@@ -437,8 +404,8 @@ struct InferredStruct<'model> {
 /// Returns an error when an attribute value variant cannot be represented by the
 /// projection's logical type vocabulary.
 pub fn project_cityobjects(model: &CityModel) -> Result<TableView<'_>> {
-    let mut attributes = InferredStruct::default();
-    let mut extra = InferredStruct::default();
+    let mut attributes = StructSchema::default();
+    let mut extra = StructSchema::default();
     for (row_ix, (_, object)) in model.cityobjects().iter().enumerate() {
         match object.attributes() {
             Some(values) => merge_attribute_map(&mut attributes, values, row_ix)?,
@@ -457,57 +424,57 @@ pub fn project_cityobjects(model: &CityModel) -> Result<TableView<'_>> {
 
 /// Merges one CityObject attribute map into an ordered inferred tree.
 fn merge_attribute_map<'model>(
-    spec: &mut InferredStruct<'model>,
+    schema: &mut StructSchema<'model>,
     attributes: &'model OwnedAttributes,
     seen_rows: usize,
 ) -> Result<()> {
-    for field in spec.fields.values_mut() {
+    for field in schema.fields.values_mut() {
         if !attributes.contains_key(field.name) {
             field.nullable = true;
         }
     }
     for (name, value) in attributes.iter() {
-        merge_field(spec, name, value, seen_rows)?;
+        merge_field(schema, name, value, seen_rows)?;
     }
     Ok(())
 }
 
 /// Merges one nested map into an ordered inferred tree.
 fn merge_attribute_values<'model>(
-    spec: &mut InferredStruct<'model>,
+    schema: &mut StructSchema<'model>,
     values: &'model HashMap<String, OwnedAttributeValue>,
     seen_rows: usize,
 ) -> Result<()> {
-    for field in spec.fields.values_mut() {
+    for field in schema.fields.values_mut() {
         if !values.contains_key(field.name) {
             field.nullable = true;
         }
     }
     for (name, value) in values {
-        merge_field(spec, name, value, seen_rows)?;
+        merge_field(schema, name, value, seen_rows)?;
     }
     Ok(())
 }
 
 /// Adds a field or merges its value into an existing inferred field.
 fn merge_field<'model>(
-    spec: &mut InferredStruct<'model>,
+    schema: &mut StructSchema<'model>,
     name: &'model str,
     value: &'model OwnedAttributeValue,
     seen_rows: usize,
 ) -> Result<()> {
-    if let Some(field) = spec.fields.get_mut(name) {
+    if let Some(field) = schema.fields.get_mut(name) {
         if matches!(value, OwnedAttributeValue::Null) {
             field.nullable = true;
         } else {
-            merge_inferred_type_with_value(&mut field.value, value)?;
+            merge_projected_type_with_value(&mut field.projected_type, value)?;
         }
     } else {
-        spec.fields.insert(
+        schema.fields.insert(
             name,
-            InferredField {
+            StructFieldSchema {
                 name,
-                value: infer_type(value)?,
+                projected_type: infer_type(value)?,
                 nullable: seen_rows > 0 || matches!(value, OwnedAttributeValue::Null),
             },
         );
@@ -516,51 +483,51 @@ fn merge_field<'model>(
 }
 
 /// Marks every currently known field nullable for a missing source map.
-fn mark_all_nullable(spec: &mut InferredStruct<'_>) {
-    for field in spec.fields.values_mut() {
+fn mark_all_nullable(schema: &mut StructSchema<'_>) {
+    for field in schema.fields.values_mut() {
         field.nullable = true;
     }
 }
 
-/// Infers the private logical type of one borrowed source value recursively.
-fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<InferredType<'model>> {
+/// Infers the projected logical type of one borrowed source value recursively.
+fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<ProjectedType<'model>> {
     Ok(match value {
-        OwnedAttributeValue::Null => InferredType::Null,
-        OwnedAttributeValue::Bool(_) => InferredType::Boolean,
-        OwnedAttributeValue::Unsigned(_) => InferredType::UInt64,
-        OwnedAttributeValue::Integer(_) => InferredType::Int64,
-        OwnedAttributeValue::Float(_) => InferredType::Float64,
-        OwnedAttributeValue::String(_) => InferredType::Utf8,
-        OwnedAttributeValue::Geometry(_) => InferredType::GeometryRef,
+        OwnedAttributeValue::Null => ProjectedType::Null,
+        OwnedAttributeValue::Bool(_) => ProjectedType::Boolean,
+        OwnedAttributeValue::Unsigned(_) => ProjectedType::UInt64,
+        OwnedAttributeValue::Integer(_) => ProjectedType::Int64,
+        OwnedAttributeValue::Float(_) => ProjectedType::Float64,
+        OwnedAttributeValue::String(_) => ProjectedType::Utf8,
+        OwnedAttributeValue::Geometry(_) => ProjectedType::GeometryRef,
         OwnedAttributeValue::Vec(values) => infer_list_type(values)?,
         OwnedAttributeValue::Map(values) => {
-            let mut spec = InferredStruct::default();
-            merge_attribute_values(&mut spec, values, 0)?;
-            InferredType::Struct(spec)
+            let mut schema = StructSchema::default();
+            merge_attribute_values(&mut schema, values, 0)?;
+            ProjectedType::Struct(schema)
         }
         unsupported => bail!("unsupported attribute value variant {unsupported}"),
     })
 }
 
 /// Infers a homogeneous list item type or falls back to JSON.
-fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<InferredType<'model>> {
+fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<ProjectedType<'model>> {
     let mut item_nullable = false;
-    let mut item_type = InferredType::Null;
+    let mut item_type = ProjectedType::Null;
     let mut saw_item = false;
     for value in values {
         if matches!(value, OwnedAttributeValue::Null) {
             item_nullable = true;
         } else if saw_item {
-            merge_inferred_type_with_value(&mut item_type, value)?;
+            merge_projected_type_with_value(&mut item_type, value)?;
         } else {
             item_type = infer_type(value)?;
             saw_item = true;
         }
     }
-    if matches!(item_type, InferredType::Json) {
-        Ok(InferredType::Json)
+    if matches!(item_type, ProjectedType::Json) {
+        Ok(ProjectedType::Json)
     } else {
-        Ok(InferredType::List {
+        Ok(ProjectedType::List {
             item_nullable,
             item: Box::new(item_type),
         })
@@ -568,35 +535,35 @@ fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<Infe
 }
 
 /// Merges a source value into an existing inferred type using widening rules.
-fn merge_inferred_type_with_value<'model>(
-    current: &mut InferredType<'model>,
+fn merge_projected_type_with_value<'model>(
+    current: &mut ProjectedType<'model>,
     value: &'model OwnedAttributeValue,
 ) -> Result<()> {
     if matches!(value, OwnedAttributeValue::Null) {
         return Ok(());
     }
     match (&mut *current, value) {
-        (InferredType::Null, _) => *current = infer_type(value)?,
-        (InferredType::Boolean, OwnedAttributeValue::Bool(_))
-        | (InferredType::UInt64, OwnedAttributeValue::Unsigned(_))
-        | (InferredType::Int64, OwnedAttributeValue::Integer(_))
-        | (InferredType::Float64, OwnedAttributeValue::Float(_))
-        | (InferredType::Utf8, OwnedAttributeValue::String(_))
-        | (InferredType::GeometryRef, OwnedAttributeValue::Geometry(_))
-        | (InferredType::Json, _) => {}
-        (InferredType::UInt64, OwnedAttributeValue::Integer(_))
-        | (InferredType::Int64, OwnedAttributeValue::Unsigned(_)) => {
-            *current = InferredType::Int64;
+        (ProjectedType::Null, _) => *current = infer_type(value)?,
+        (ProjectedType::Boolean, OwnedAttributeValue::Bool(_))
+        | (ProjectedType::UInt64, OwnedAttributeValue::Unsigned(_))
+        | (ProjectedType::Int64, OwnedAttributeValue::Integer(_))
+        | (ProjectedType::Float64, OwnedAttributeValue::Float(_))
+        | (ProjectedType::Utf8, OwnedAttributeValue::String(_))
+        | (ProjectedType::GeometryRef, OwnedAttributeValue::Geometry(_))
+        | (ProjectedType::Json, _) => {}
+        (ProjectedType::UInt64, OwnedAttributeValue::Integer(_))
+        | (ProjectedType::Int64, OwnedAttributeValue::Unsigned(_)) => {
+            *current = ProjectedType::Int64;
         }
-        (InferredType::UInt64 | InferredType::Int64, OwnedAttributeValue::Float(_)) => {
-            *current = InferredType::Float64;
+        (ProjectedType::UInt64 | ProjectedType::Int64, OwnedAttributeValue::Float(_)) => {
+            *current = ProjectedType::Float64;
         }
         (
-            InferredType::Float64,
+            ProjectedType::Float64,
             OwnedAttributeValue::Unsigned(_) | OwnedAttributeValue::Integer(_),
         ) => {}
         (
-            InferredType::List {
+            ProjectedType::List {
                 item_nullable,
                 item,
             },
@@ -606,31 +573,31 @@ fn merge_inferred_type_with_value<'model>(
                 if matches!(value, OwnedAttributeValue::Null) {
                     *item_nullable = true;
                 } else {
-                    merge_inferred_type_with_value(item, value)?;
-                    if matches!(item.as_ref(), InferredType::Json) {
-                        *current = InferredType::Json;
+                    merge_projected_type_with_value(item, value)?;
+                    if matches!(item.as_ref(), ProjectedType::Json) {
+                        *current = ProjectedType::Json;
                         break;
                     }
                 }
             }
         }
-        (InferredType::Struct(spec), OwnedAttributeValue::Map(values)) => {
-            merge_attribute_values(spec, values, 1)?;
+        (ProjectedType::Struct(schema), OwnedAttributeValue::Map(values)) => {
+            merge_attribute_values(schema, values, 1)?;
         }
-        _ => *current = InferredType::Json,
+        _ => *current = ProjectedType::Json,
     }
     Ok(())
 }
 
-/// Flattens inferred attribute and extra trees into one shared table schema.
+/// Flattens projected attribute and extra trees into one shared table schema.
 fn build_table_schema<'model>(
-    attributes: InferredStruct<'model>,
-    extra: InferredStruct<'model>,
+    attributes: StructSchema<'model>,
+    extra: StructSchema<'model>,
 ) -> TableSchema<'model> {
     let mut columns = Vec::new();
     let mut path = Vec::new();
     let mut name_buffer = String::new();
-    flatten_inferred_struct(
+    flatten_struct_schema(
         ColumnSource::Attributes,
         attributes,
         &mut path,
@@ -638,7 +605,7 @@ fn build_table_schema<'model>(
         &mut name_buffer,
         &mut columns,
     );
-    flatten_inferred_struct(
+    flatten_struct_schema(
         ColumnSource::Extra,
         extra,
         &mut path,
@@ -649,26 +616,25 @@ fn build_table_schema<'model>(
     TableSchema { columns }
 }
 
-/// Recursively emits inferred non-struct leaves as projected columns.
-fn flatten_inferred_struct<'model>(
+/// Recursively emits non-struct leaves as projected columns.
+fn flatten_struct_schema<'model>(
     source: ColumnSource,
-    spec: InferredStruct<'model>,
+    schema: StructSchema<'model>,
     path: &mut Vec<&'model str>,
     inherited_nullable: bool,
     name_buffer: &mut String,
     columns: &mut Vec<ColumnSchema<'model>>,
 ) {
-    for field in spec.fields.into_values() {
+    for field in schema.fields.into_values() {
         path.push(field.name);
         let nullable = inherited_nullable || field.nullable;
-        match field.value {
-            InferredType::Null => {}
-            InferredType::Struct(spec) => {
-                flatten_inferred_struct(source, spec, path, nullable, name_buffer, columns);
+        match field.projected_type {
+            ProjectedType::Null => {}
+            ProjectedType::Struct(schema) => {
+                flatten_struct_schema(source, schema, path, nullable, name_buffer, columns);
             }
-            inferred_type => {
+            projected_type => {
                 build_column_name(name_buffer, source, path);
-                let projected_type = into_projected_type(inferred_type);
                 debug_assert!(!matches!(projected_type, ProjectedType::Struct(_)));
                 columns.push(ColumnSchema {
                     source,
@@ -680,43 +646,6 @@ fn flatten_inferred_struct<'model>(
             }
         }
         path.pop();
-    }
-}
-
-/// Converts a retained inferred type into its public projected schema.
-fn into_projected_type<'model>(inferred: InferredType<'model>) -> ProjectedType<'model> {
-    match inferred {
-        InferredType::Null => ProjectedType::Null,
-        InferredType::Boolean => ProjectedType::Boolean,
-        InferredType::UInt64 => ProjectedType::UInt64,
-        InferredType::Int64 => ProjectedType::Int64,
-        InferredType::Float64 => ProjectedType::Float64,
-        InferredType::Utf8 => ProjectedType::Utf8,
-        InferredType::Json => ProjectedType::Json,
-        InferredType::GeometryRef => ProjectedType::GeometryRef,
-        InferredType::List {
-            item_nullable,
-            item,
-        } => ProjectedType::List {
-            item_nullable,
-            item: Box::new(into_projected_type(*item)),
-        },
-        InferredType::Struct(spec) => ProjectedType::Struct(StructSchema {
-            fields: spec
-                .fields
-                .into_values()
-                .map(|field| {
-                    (
-                        field.name,
-                        StructFieldSchema {
-                            name: field.name,
-                            projected_type: into_projected_type(field.value),
-                            nullable: field.nullable,
-                        },
-                    )
-                })
-                .collect(),
-        }),
     }
 }
 
