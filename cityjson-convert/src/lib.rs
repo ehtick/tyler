@@ -17,8 +17,8 @@ pub mod tabular;
 mod triangle_mesh;
 
 pub use tabular::{
-    build_cityobject_table, Cell, CityObjectRow, CityObjectTable, Column, ColumnNamespace,
-    DataType, TableSchema,
+    project_cityobjects, ColumnSchema, ColumnSource, ProjectedType, ProjectedValue, RowView,
+    TableSchema, TableView,
 };
 
 use std::collections::BTreeMap;
