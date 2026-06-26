@@ -131,7 +131,8 @@ use cityjson_lib::cityjson_types::resources::handles::{
 };
 use cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage;
 use cityjson_lib::cityjson_types::v2_0::{
-    CityObjectType, Metadata, OwnedAttributeValue, OwnedAttributes, Semantic, SemanticType,
+    CityObjectType, GeometryType, Metadata, OwnedAttributeValue, OwnedAttributes, Semantic,
+    SemanticType,
 };
 use cityjson_lib::CityModel;
 
@@ -488,6 +489,56 @@ impl<'table, 'model> SemanticRowRef<'table, 'model> {
     }
 }
 
+/// Borrowed semantic-assignment table with one row per mapped geometry primitive.
+#[derive(Debug)]
+pub struct SemanticAssignmentTable<'model> {
+    rows: Vec<SemanticAssignmentRow<'model>>,
+}
+
+impl<'model> SemanticAssignmentTable<'model> {
+    /// Iterates semantic assignment rows in CityObject and geometry order.
+    pub fn rows(&self) -> impl Iterator<Item = &SemanticAssignmentRow<'model>> {
+        self.rows.iter()
+    }
+}
+
+/// Geometry primitive kind addressed by a semantic assignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimitiveType {
+    Point,
+    LineString,
+    Surface,
+}
+
+impl Display for PrimitiveType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Point => f.write_str("point"),
+            Self::LineString => f.write_str("linestring"),
+            Self::Surface => f.write_str("surface"),
+        }
+    }
+}
+
+/// Fixed semantic assignment fields for one geometry primitive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticAssignmentRow<'model> {
+    pub cityobject_id: &'model str,
+    pub cityobject_ix: u64,
+    pub geometry_ix: u64,
+    pub geometry_type: GeometryType,
+    pub geometry_lod: Option<String>,
+    pub geometry_is_instance: bool,
+    pub primitive_type: PrimitiveType,
+    pub primitive_ix: u64,
+    pub point_ix: Option<u64>,
+    pub linestring_ix: Option<u64>,
+    pub solid_ix: Option<u64>,
+    pub shell_ix: Option<u64>,
+    pub surface_ix: Option<u64>,
+    pub semantic_id: Option<u64>,
+}
+
 /// Borrowed logical value from one row and dynamic column.
 #[derive(Debug)]
 pub enum Value<'schema, 'model> {
@@ -662,6 +713,99 @@ pub fn tabulate_semantics(model: &CityModel) -> Result<SemanticTable<'_>> {
     })
 }
 
+/// Tabulates geometry primitive to semantic definition assignments.
+///
+/// # Errors
+///
+/// Returns an error when geometry handles cannot be resolved, boundary nesting
+/// is invalid for the effective geometry type, or semantic assignment counts do
+/// not match primitive counts.
+pub fn tabulate_semantic_assignments(model: &CityModel) -> Result<SemanticAssignmentTable<'_>> {
+    let mut rows = Vec::new();
+    for (cityobject_ix, (_, object)) in model.cityobjects().iter().enumerate() {
+        let Some(geometry_handles) = object.geometry() else {
+            continue;
+        };
+        for (geometry_ix, geometry_handle) in geometry_handles.iter().copied().enumerate() {
+            let source_geometry = model
+                .get_geometry(geometry_handle)
+                .ok_or_else(|| anyhow::anyhow!("dangling geometry handle {geometry_handle:?}"))?;
+            let geometry = model.resolve_geometry(geometry_handle)?;
+            let Some(semantics) = geometry.semantics() else {
+                continue;
+            };
+            let Some(boundary) = geometry.boundaries() else {
+                bail!(
+                    "semantic assignments on geometry {geometry_ix} of CityObject {} have no boundaries",
+                    object.id()
+                );
+            };
+
+            let context = SemanticAssignmentContext {
+                cityobject_id: object.id(),
+                cityobject_ix: cityobject_ix as u64,
+                geometry_ix: geometry_ix as u64,
+                geometry_type: geometry.type_geometry().clone(),
+                geometry_lod: geometry.lod().map(ToString::to_string),
+                geometry_is_instance: source_geometry.instance().is_some(),
+            };
+
+            match geometry.type_geometry() {
+                GeometryType::MultiPoint => {
+                    let points = boundary.to_nested_multi_point()?;
+                    push_point_assignments(&mut rows, &context, semantics.points(), points.len())?;
+                }
+                GeometryType::MultiLineString => {
+                    let linestrings = boundary.to_nested_multi_linestring()?;
+                    push_linestring_assignments(
+                        &mut rows,
+                        &context,
+                        semantics.linestrings(),
+                        linestrings.len(),
+                    )?;
+                }
+                GeometryType::MultiSurface | GeometryType::CompositeSurface => {
+                    let surfaces = boundary.to_nested_multi_or_composite_surface()?;
+                    push_surface_assignments(
+                        &mut rows,
+                        &context,
+                        semantics.surfaces(),
+                        surface_paths_for_multi_surface(surfaces.len()),
+                    )?;
+                }
+                GeometryType::Solid => {
+                    let shells = boundary.to_nested_solid()?;
+                    push_surface_assignments(
+                        &mut rows,
+                        &context,
+                        semantics.surfaces(),
+                        surface_paths_for_solid(&shells),
+                    )?;
+                }
+                GeometryType::MultiSolid | GeometryType::CompositeSolid => {
+                    let solids = boundary.to_nested_multi_or_composite_solid()?;
+                    push_surface_assignments(
+                        &mut rows,
+                        &context,
+                        semantics.surfaces(),
+                        surface_paths_for_multi_solid(&solids),
+                    )?;
+                }
+                GeometryType::GeometryInstance => {
+                    bail!(
+                        "GeometryInstance for CityObject {} was not resolved to an effective geometry",
+                        object.id()
+                    );
+                }
+                geometry_type => {
+                    bail!("unsupported geometry type {geometry_type} in semantic assignments");
+                }
+            }
+        }
+    }
+    Ok(SemanticAssignmentTable { rows })
+}
+
 impl<'model> MetadataRow<'model> {
     fn from_model_metadata(metadata: &'model Metadata<OwnedStringStorage>) -> Self {
         let contact = metadata.point_of_contact();
@@ -750,6 +894,190 @@ fn cityobject_id_list<'model>(
 
 fn semantic_handle_id(handle: SemanticHandle) -> u64 {
     u64::from(handle.raw_parts().0)
+}
+
+#[derive(Clone, Debug)]
+struct SemanticAssignmentContext<'model> {
+    cityobject_id: &'model str,
+    cityobject_ix: u64,
+    geometry_ix: u64,
+    geometry_type: GeometryType,
+    geometry_lod: Option<String>,
+    geometry_is_instance: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SurfacePath {
+    solid_ix: Option<u64>,
+    shell_ix: Option<u64>,
+    surface_ix: u64,
+}
+
+fn push_point_assignments<'model>(
+    rows: &mut Vec<SemanticAssignmentRow<'model>>,
+    context: &SemanticAssignmentContext<'model>,
+    assignments: cityjson_lib::cityjson_types::v2_0::geometry::HandleOptionSlice<
+        '_,
+        SemanticHandle,
+    >,
+    point_count: usize,
+) -> Result<()> {
+    validate_assignment_count(
+        context,
+        PrimitiveType::Point,
+        assignments.len(),
+        point_count,
+    )?;
+    for point_ix in 0..point_count {
+        rows.push(SemanticAssignmentRow {
+            cityobject_id: context.cityobject_id,
+            cityobject_ix: context.cityobject_ix,
+            geometry_ix: context.geometry_ix,
+            geometry_type: context.geometry_type.clone(),
+            geometry_lod: context.geometry_lod.clone(),
+            geometry_is_instance: context.geometry_is_instance,
+            primitive_type: PrimitiveType::Point,
+            primitive_ix: point_ix as u64,
+            point_ix: Some(point_ix as u64),
+            linestring_ix: None,
+            solid_ix: None,
+            shell_ix: None,
+            surface_ix: None,
+            semantic_id: assignments[point_ix].map(semantic_handle_id),
+        });
+    }
+    Ok(())
+}
+
+fn push_linestring_assignments<'model>(
+    rows: &mut Vec<SemanticAssignmentRow<'model>>,
+    context: &SemanticAssignmentContext<'model>,
+    assignments: cityjson_lib::cityjson_types::v2_0::geometry::HandleOptionSlice<
+        '_,
+        SemanticHandle,
+    >,
+    linestring_count: usize,
+) -> Result<()> {
+    validate_assignment_count(
+        context,
+        PrimitiveType::LineString,
+        assignments.len(),
+        linestring_count,
+    )?;
+    for linestring_ix in 0..linestring_count {
+        rows.push(SemanticAssignmentRow {
+            cityobject_id: context.cityobject_id,
+            cityobject_ix: context.cityobject_ix,
+            geometry_ix: context.geometry_ix,
+            geometry_type: context.geometry_type.clone(),
+            geometry_lod: context.geometry_lod.clone(),
+            geometry_is_instance: context.geometry_is_instance,
+            primitive_type: PrimitiveType::LineString,
+            primitive_ix: linestring_ix as u64,
+            point_ix: None,
+            linestring_ix: Some(linestring_ix as u64),
+            solid_ix: None,
+            shell_ix: None,
+            surface_ix: None,
+            semantic_id: assignments[linestring_ix].map(semantic_handle_id),
+        });
+    }
+    Ok(())
+}
+
+fn push_surface_assignments<'model>(
+    rows: &mut Vec<SemanticAssignmentRow<'model>>,
+    context: &SemanticAssignmentContext<'model>,
+    assignments: cityjson_lib::cityjson_types::v2_0::geometry::HandleOptionSlice<
+        '_,
+        SemanticHandle,
+    >,
+    paths: Vec<SurfacePath>,
+) -> Result<()> {
+    validate_assignment_count(
+        context,
+        PrimitiveType::Surface,
+        assignments.len(),
+        paths.len(),
+    )?;
+    for (primitive_ix, path) in paths.into_iter().enumerate() {
+        rows.push(SemanticAssignmentRow {
+            cityobject_id: context.cityobject_id,
+            cityobject_ix: context.cityobject_ix,
+            geometry_ix: context.geometry_ix,
+            geometry_type: context.geometry_type.clone(),
+            geometry_lod: context.geometry_lod.clone(),
+            geometry_is_instance: context.geometry_is_instance,
+            primitive_type: PrimitiveType::Surface,
+            primitive_ix: primitive_ix as u64,
+            point_ix: None,
+            linestring_ix: None,
+            solid_ix: path.solid_ix,
+            shell_ix: path.shell_ix,
+            surface_ix: Some(path.surface_ix),
+            semantic_id: assignments[primitive_ix].map(semantic_handle_id),
+        });
+    }
+    Ok(())
+}
+
+fn validate_assignment_count(
+    context: &SemanticAssignmentContext<'_>,
+    primitive_type: PrimitiveType,
+    assignment_count: usize,
+    primitive_count: usize,
+) -> Result<()> {
+    if assignment_count != primitive_count {
+        bail!(
+            "semantic {} assignment count {} does not match primitive count {} on geometry {} of CityObject {}",
+            primitive_type,
+            assignment_count,
+            primitive_count,
+            context.geometry_ix,
+            context.cityobject_id
+        );
+    }
+    Ok(())
+}
+
+fn surface_paths_for_multi_surface(surface_count: usize) -> Vec<SurfacePath> {
+    (0..surface_count)
+        .map(|surface_ix| SurfacePath {
+            solid_ix: None,
+            shell_ix: None,
+            surface_ix: surface_ix as u64,
+        })
+        .collect()
+}
+
+fn surface_paths_for_solid<Surface>(shells: &[Vec<Surface>]) -> Vec<SurfacePath> {
+    let mut paths = Vec::new();
+    for (shell_ix, surfaces) in shells.iter().enumerate() {
+        for surface_ix in 0..surfaces.len() {
+            paths.push(SurfacePath {
+                solid_ix: None,
+                shell_ix: Some(shell_ix as u64),
+                surface_ix: surface_ix as u64,
+            });
+        }
+    }
+    paths
+}
+
+fn surface_paths_for_multi_solid<Surface>(solids: &[Vec<Vec<Surface>>]) -> Vec<SurfacePath> {
+    let mut paths = Vec::new();
+    for (solid_ix, shells) in solids.iter().enumerate() {
+        for (shell_ix, surfaces) in shells.iter().enumerate() {
+            for surface_ix in 0..surfaces.len() {
+                paths.push(SurfacePath {
+                    solid_ix: Some(solid_ix as u64),
+                    shell_ix: Some(shell_ix as u64),
+                    surface_ix: surface_ix as u64,
+                });
+            }
+        }
+    }
+    paths
 }
 
 fn bbox_wkt_2d(bbox: &cityjson_lib::cityjson_types::v2_0::BBox) -> String {

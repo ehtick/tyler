@@ -17,9 +17,10 @@ pub mod tabular;
 mod triangle_mesh;
 
 pub use tabular::{
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantics, CityObjectRow,
-    CityObjectTable, ColumnOrigin, ColumnSchema, IdList, LogicalType, MetadataRow, MetadataRowRef,
-    MetadataTable, SemanticRow, SemanticRowRef, SemanticTable, TableSchema, Value,
+    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
+    tabulate_semantics, CityObjectRow, CityObjectTable, ColumnOrigin, ColumnSchema, IdList,
+    LogicalType, MetadataRow, MetadataRowRef, MetadataTable, PrimitiveType, SemanticAssignmentRow,
+    SemanticAssignmentTable, SemanticRow, SemanticRowRef, SemanticTable, TableSchema, Value,
 };
 
 use std::collections::BTreeMap;

@@ -2,8 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantics, ColumnOrigin, LogicalType,
-    TableSchema, Value,
+    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
+    tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
 };
 use cityjson_lib::json;
 
@@ -374,4 +374,246 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
         rows[1].value(slope).unwrap().unwrap(),
         Value::Null
     ));
+}
+
+fn with_semantic_assignment_rows(
+    input: &[u8],
+    check: impl FnOnce(Vec<cityjson_convert::SemanticAssignmentRow<'_>>),
+) {
+    let model = json::from_slice(input).expect("parse semantic assignment fixture");
+    let table = tabulate_semantic_assignments(&model).expect("tabulate semantic assignments");
+    check(table.rows().cloned().collect());
+}
+
+#[test]
+fn tabulates_point_and_linestring_semantic_assignments() {
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "points":{
+                    "type":"GenericCityObject",
+                    "geometry":[{
+                        "type":"MultiPoint",
+                        "lod":"1",
+                        "boundaries":[0,1],
+                        "semantics":{
+                            "surfaces":[{"type":"RoofSurface"}],
+                            "values":[0,null]
+                        }
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0]]
+        }"#,
+        |point_rows| {
+            assert_eq!(point_rows.len(), 2);
+            assert_eq!(point_rows[0].primitive_type, PrimitiveType::Point);
+            assert_eq!(point_rows[0].primitive_ix, 0);
+            assert_eq!(point_rows[0].point_ix, Some(0));
+            assert_eq!(point_rows[0].semantic_id, Some(0));
+            assert_eq!(point_rows[1].primitive_ix, 1);
+            assert_eq!(point_rows[1].point_ix, Some(1));
+            assert_eq!(point_rows[1].semantic_id, None);
+        },
+    );
+
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "lines":{
+                    "type":"GenericCityObject",
+                    "geometry":[{
+                        "type":"MultiLineString",
+                        "lod":"1",
+                        "boundaries":[[0,1],[1,2]],
+                        "semantics":{
+                            "surfaces":[{"type":"TrafficArea"}],
+                            "values":[0,null]
+                        }
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[2,0,0]]
+        }"#,
+        |line_rows| {
+            assert_eq!(line_rows.len(), 2);
+            assert_eq!(line_rows[0].primitive_type, PrimitiveType::LineString);
+            assert_eq!(line_rows[0].primitive_ix, 0);
+            assert_eq!(line_rows[0].linestring_ix, Some(0));
+            assert_eq!(line_rows[0].semantic_id, Some(0));
+            assert_eq!(line_rows[1].primitive_ix, 1);
+            assert_eq!(line_rows[1].linestring_ix, Some(1));
+            assert_eq!(line_rows[1].semantic_id, None);
+        },
+    );
+}
+
+#[test]
+fn tabulates_surface_semantic_assignments_with_structural_paths() {
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "solid":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"Solid",
+                        "lod":"2",
+                        "boundaries":[[
+                            [[0,1,2]],
+                            [[0,2,3]]
+                        ],[
+                            [[4,5,6]]
+                        ]],
+                        "semantics":{
+                            "surfaces":[
+                                {"type":"RoofSurface"},
+                                {"type":"WallSurface"}
+                            ],
+                            "values":[[0,1],[null]]
+                        }
+                    }]
+                }
+            },
+            "vertices":[
+                [0,0,0],[1,0,0],[0,1,0],[1,1,0],
+                [0,0,1],[1,0,1],[0,1,1]
+            ]
+        }"#,
+        |rows| {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].primitive_type, PrimitiveType::Surface);
+            assert_eq!(rows[0].primitive_ix, 0);
+            assert_eq!(rows[0].solid_ix, None);
+            assert_eq!(rows[0].shell_ix, Some(0));
+            assert_eq!(rows[0].surface_ix, Some(0));
+            assert_eq!(rows[0].semantic_id, Some(0));
+            assert_eq!(rows[1].primitive_ix, 1);
+            assert_eq!(rows[1].shell_ix, Some(0));
+            assert_eq!(rows[1].surface_ix, Some(1));
+            assert_eq!(rows[1].semantic_id, Some(1));
+            assert_eq!(rows[2].primitive_ix, 2);
+            assert_eq!(rows[2].shell_ix, Some(1));
+            assert_eq!(rows[2].surface_ix, Some(0));
+            assert_eq!(rows[2].semantic_id, None);
+        },
+    );
+}
+
+#[test]
+fn tabulates_multisolid_semantic_assignments_with_solid_paths() {
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "multi-solid":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSolid",
+                        "lod":"2",
+                        "boundaries":[
+                            [[[[0,1,2]]]],
+                            [[[[3,4,5]],[[3,5,6]]]]
+                        ],
+                        "semantics":{
+                            "surfaces":[{"type":"RoofSurface"}],
+                            "values":[[[0]],[[null,0]]]
+                        }
+                    }]
+                }
+            },
+            "vertices":[
+                [0,0,0],[1,0,0],[0,1,0],[2,0,0],[3,0,0],[2,1,0],[3,1,0]
+            ]
+        }"#,
+        |rows| {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0].primitive_ix, 0);
+            assert_eq!(rows[0].solid_ix, Some(0));
+            assert_eq!(rows[0].shell_ix, Some(0));
+            assert_eq!(rows[0].surface_ix, Some(0));
+            assert_eq!(rows[0].semantic_id, Some(0));
+            assert_eq!(rows[1].primitive_ix, 1);
+            assert_eq!(rows[1].solid_ix, Some(1));
+            assert_eq!(rows[1].shell_ix, Some(0));
+            assert_eq!(rows[1].surface_ix, Some(0));
+            assert_eq!(rows[1].semantic_id, None);
+            assert_eq!(rows[2].primitive_ix, 2);
+            assert_eq!(rows[2].solid_ix, Some(1));
+            assert_eq!(rows[2].shell_ix, Some(0));
+            assert_eq!(rows[2].surface_ix, Some(1));
+            assert_eq!(rows[2].semantic_id, Some(0));
+        },
+    );
+}
+
+#[test]
+fn skips_geometries_without_semantic_maps() {
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+        |rows| assert!(rows.is_empty()),
+    );
+}
+
+#[test]
+fn tabulates_resolved_geometry_instance_semantic_assignments() {
+    with_semantic_assignment_rows(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "tree":{
+                    "type":"SolitaryVegetationObject",
+                    "geometry":[{
+                        "type":"GeometryInstance",
+                        "template":0,
+                        "boundaries":[0],
+                        "transformationMatrix":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]
+                    }]
+                }
+            },
+            "vertices":[[10,10,0]],
+            "geometry-templates":{
+                "templates":[{
+                    "type":"MultiSurface",
+                    "lod":"1",
+                    "boundaries":[[[0,1,2]]],
+                    "semantics":{
+                        "surfaces":[{"type":"RoofSurface"}],
+                        "values":[0]
+                    }
+                }],
+                "vertices-templates":[[0,0,0],[1,0,0],[0,1,0]]
+            }
+        }"#,
+        |rows| {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].cityobject_id, "tree");
+            assert!(rows[0].geometry_is_instance);
+            assert_eq!(rows[0].primitive_type, PrimitiveType::Surface);
+            assert_eq!(rows[0].primitive_ix, 0);
+            assert_eq!(rows[0].surface_ix, Some(0));
+            assert_eq!(rows[0].semantic_id, Some(0));
+        },
+    );
 }

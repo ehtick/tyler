@@ -326,7 +326,9 @@ Implemented in `cityjson-convert`:
 - Added hierarchy resolution on `CityObjectRow` through `parents()` and `children()`, returning `IdList` values that borrow resolved CityObject ids.
 - Added `tabulate_model_metadata`, `MetadataTable`, `MetadataRow`, and `MetadataRowRef`, including fixed metadata fields, point-of-contact fields, flattened metadata `extra`, and 2D WKT extent projection.
 - Added `tabulate_semantics`, `SemanticTable`, `SemanticRow`, and `SemanticRowRef`, including semantic type, parent, children, and flattened semantic attributes.
-- Added focused tests for hierarchy, metadata, semantic definitions, and retained existing CityObject table tests.
+- Added `tabulate_semantic_assignments`, `SemanticAssignmentTable`, `SemanticAssignmentRow`, and `PrimitiveType`, including point, linestring, surface, solid, multisolid/composite-solid, and resolved `GeometryInstance` traversal.
+- Semantic assignment rows now preserve explicit null assignments, skip geometries with no semantic map, expose both flat `primitive_ix` and structural path fields, and reuse the same `SemanticHandle::raw_parts().0` id convention as semantic definitions.
+- Added focused tests for hierarchy, metadata, semantic definitions, semantic assignment traversal, and retained existing CityObject table tests.
 
 Implementation notes:
 
@@ -336,7 +338,7 @@ Implementation notes:
 
 Not implemented in this pass:
 
-- TSV writer functions for city objects, metadata, and semantics. No TSV writer exists in `cityjson-convert` yet; the current change exposes logical tables for future writers.
-- Semantic assignment rows / `--tsv-split-semantics`, per the original plan's milestone note.
+- TSV writer functions for city objects, metadata, semantic definitions, and semantic assignments. No TSV writer exists in `cityjson-convert` yet; the current change exposes logical tables for future writers.
+- `--tsv-split-semantics` CLI/output wiring. The logical semantic assignment table exists, but no physical split TSV writer or flag consumes it yet.
 - GeoPackage-specific physical encoding.
 
