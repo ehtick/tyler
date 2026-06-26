@@ -329,6 +329,9 @@ Implemented in `cityjson-convert`:
 - Added `tabulate_semantic_assignments`, `SemanticAssignmentTable`, `SemanticAssignmentRow`, and `PrimitiveType`, including point, linestring, surface, solid, multisolid/composite-solid, and resolved `GeometryInstance` traversal.
 - Semantic assignment rows now preserve explicit null assignments, skip geometries with no semantic map, expose both flat `primitive_ix` and structural path fields, and reuse the same `SemanticHandle::raw_parts().0` id convention as semantic definitions.
 - Added focused tests for hierarchy, metadata, semantic definitions, semantic assignment traversal, and retained existing CityObject table tests.
+- Added TSV writer functions for CityObjects, metadata, semantic definitions, semantic assignments, and the split-semantics joined output.
+- Wired `cjconvert --format tsv` with options for null-row retention, hierarchy columns, CityJSON ordinal columns, metadata output, and split semantics output.
+- Added TSV writer tests covering filtering, hierarchy/ordinal columns, metadata, semantic definitions, semantic assignments, split semantics, and directory-level conversion.
 
 Implementation notes:
 
@@ -338,7 +341,5 @@ Implementation notes:
 
 Not implemented in this pass:
 
-- TSV writer functions for city objects, metadata, semantic definitions, and semantic assignments. No TSV writer exists in `cityjson-convert` yet; the current change exposes logical tables for future writers.
-- `--tsv-split-semantics` CLI/output wiring. The logical semantic assignment table exists, but no physical split TSV writer or flag consumes it yet.
 - GeoPackage-specific physical encoding.
 

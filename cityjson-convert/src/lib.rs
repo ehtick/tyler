@@ -15,12 +15,17 @@ pub mod obj_writer;
 pub mod tabular;
 #[path = "triangle-mesh.rs"]
 mod triangle_mesh;
+pub mod tsv_writer;
 
 pub use tabular::{
     tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
     tabulate_semantics, CityObjectRow, CityObjectTable, ColumnOrigin, ColumnSchema, IdList,
     LogicalType, MetadataRow, MetadataRowRef, MetadataTable, PrimitiveType, SemanticAssignmentRow,
     SemanticAssignmentTable, SemanticRow, SemanticRowRef, SemanticTable, TableSchema, Value,
+};
+pub use tsv_writer::{
+    convert_to_tsv, write_cityobjects_tsv, write_metadata_tsv, write_semantic_assignments_tsv,
+    write_semantic_definitions_tsv, write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
 };
 
 use std::collections::BTreeMap;
