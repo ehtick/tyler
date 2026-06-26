@@ -126,22 +126,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 
 use anyhow::{bail, Result};
-use cityjson_lib::cityjson_types::resources::handles::GeometryHandle;
+use cityjson_lib::cityjson_types::resources::handles::{
+    CityObjectHandle, GeometryHandle, SemanticHandle,
+};
 use cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage;
-use cityjson_lib::cityjson_types::v2_0::{CityObjectType, OwnedAttributeValue, OwnedAttributes};
+use cityjson_lib::cityjson_types::v2_0::{
+    CityObjectType, Metadata, OwnedAttributeValue, OwnedAttributes, Semantic, SemanticType,
+};
 use cityjson_lib::CityModel;
 
-/// Borrowed CityObject table with one inferred schema.
-///
-/// The table owns schema containers and physical column names, but borrows all
-/// source field names and values from the model. It does not store rows.
 #[derive(Debug)]
-pub struct Table<'model> {
+pub struct CityObjectTable<'model> {
     model: &'model CityModel,
     schema: TableSchema<'model>,
 }
 
-impl<'model> Table<'model> {
+impl<'model> CityObjectTable<'model> {
     /// Returns the shared flattened schema used by every row.
     #[must_use]
     pub fn schema(&self) -> &TableSchema<'model> {
@@ -149,19 +149,22 @@ impl<'model> Table<'model> {
     }
 
     /// Iterates over CityObjects in model order without allocating rows.
-    pub fn rows(&self) -> impl Iterator<Item = Row<'_, 'model>> {
+    pub fn rows(&self) -> impl Iterator<Item = CityObjectRow<'_, 'model>> {
         self.model
             .cityobjects()
             .iter()
             .enumerate()
-            .map(|(cityobject_ix, (_, object))| Row {
+            .map(|(cityobject_ix, (_, object))| CityObjectRow {
+                model: self.model,
                 cityobject_id: object.id(),
                 cityobject_ix: cityobject_ix as u64,
                 cityobject_type: object.type_cityobject(),
                 bbox: object.geographical_extent().map(|bbox| (*bbox).into()),
+                parents: object.parents(),
+                children: object.children(),
                 attributes: object.attributes(),
                 extra: object.extra(),
-                schema: &self.schema,
+                columns: &self.schema.columns,
             })
     }
 }
@@ -195,6 +198,10 @@ pub enum ColumnOrigin {
     Attributes,
     /// Column inferred from custom CityObject members.
     Extra,
+    /// Column inferred from custom metadata members.
+    MetadataExtra,
+    /// Column inferred from semantic-object attributes.
+    SemanticAttributes,
 }
 
 impl ColumnOrigin {
@@ -203,6 +210,8 @@ impl ColumnOrigin {
         match self {
             Self::Attributes => "attributes",
             Self::Extra => "extra",
+            Self::MetadataExtra => "metadata_extra",
+            Self::SemanticAttributes => "semantic_attributes",
         }
     }
 }
@@ -259,8 +268,9 @@ pub struct StructFieldSchema<'model> {
 }
 
 /// One allocation-free row over a source CityObject.
-#[derive(Clone, Copy, Debug)]
-pub struct Row<'table, 'model> {
+#[derive(Clone, Debug)]
+pub struct CityObjectRow<'table, 'model> {
+    model: &'model CityModel,
     /// CityJSON object identifier borrowed from the model.
     pub cityobject_id: &'model str,
     /// Zero-based ordinal in model CityObject order.
@@ -268,12 +278,14 @@ pub struct Row<'table, 'model> {
     /// Stored source `geographicalExtent`, when present.
     pub bbox: Option<[f64; 6]>,
     cityobject_type: &'model CityObjectType<OwnedStringStorage>,
+    parents: Option<&'model [CityObjectHandle]>,
+    children: Option<&'model [CityObjectHandle]>,
     attributes: Option<&'model OwnedAttributes>,
     extra: Option<&'model OwnedAttributes>,
-    schema: &'table TableSchema<'model>,
+    columns: &'table [ColumnSchema<'model>],
 }
 
-impl<'table, 'model> Row<'table, 'model> {
+impl<'table, 'model> CityObjectRow<'table, 'model> {
     /// Returns the CityObject type using its CityJSON display spelling.
     #[must_use]
     pub fn cityobject_type_name(&self) -> impl Display + '_ {
@@ -285,18 +297,26 @@ impl<'table, 'model> Row<'table, 'model> {
     /// Returns `None` when `index` is outside the shared schema. Otherwise the
     /// result contains a borrowed value or a path-bearing conversion error.
     pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
-        self.schema
-            .columns
+        self.columns
             .get(index)
             .map(|column| self.value_for_column(column))
     }
 
     /// Resolves values lazily in shared schema order.
     pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
-        self.schema
-            .columns
+        self.columns
             .iter()
             .map(|column| self.value_for_column(column))
+    }
+
+    /// Resolves parent CityObject handles into borrowed CityObject ids.
+    pub fn parents(&self) -> Result<IdList<'model>> {
+        cityobject_id_list(self.model, self.parents)
+    }
+
+    /// Resolves child CityObject handles into borrowed CityObject ids.
+    pub fn children(&self) -> Result<IdList<'model>> {
+        cityobject_id_list(self.model, self.children)
     }
 
     /// Resolves one dynamic column against this row's matching source map.
@@ -307,9 +327,164 @@ impl<'table, 'model> Row<'table, 'model> {
         let attributes = match column.origin {
             ColumnOrigin::Attributes => self.attributes,
             ColumnOrigin::Extra => self.extra,
+            ColumnOrigin::MetadataExtra | ColumnOrigin::SemanticAttributes => None,
         };
         let value = resolve_path(attributes, &column.path, &column.name)?;
         build_value(value, &column.logical_type, column.nullable, &column.name)
+    }
+}
+
+/// Borrowed list of CityObject identifiers for hierarchy columns.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdList<'model> {
+    ids: Vec<&'model str>,
+}
+
+impl<'model> IdList<'model> {
+    /// Returns the resolved ids in source handle order.
+    #[must_use]
+    pub fn ids(&self) -> &[&'model str] {
+        &self.ids
+    }
+
+    /// Iterates resolved ids in source handle order.
+    pub fn iter(&self) -> impl Iterator<Item = &'model str> + '_ {
+        self.ids.iter().copied()
+    }
+}
+
+/// One-row logical metadata table for a CityJSON model.
+#[derive(Debug)]
+pub struct MetadataTable<'model> {
+    rows: Vec<MetadataRow<'model>>,
+    schema: TableSchema<'model>,
+}
+
+impl<'model> MetadataTable<'model> {
+    /// Returns the flattened schema for metadata `extra` fields.
+    #[must_use]
+    pub fn schema(&self) -> &TableSchema<'model> {
+        &self.schema
+    }
+
+    /// Iterates metadata rows.
+    pub fn rows(&self) -> impl Iterator<Item = MetadataRowRef<'_, 'model>> {
+        self.rows.iter().map(|row| MetadataRowRef {
+            row,
+            columns: &self.schema.columns,
+        })
+    }
+}
+
+/// Fixed metadata fields plus a borrowed dynamic `extra` source.
+#[derive(Clone, Debug, Default)]
+pub struct MetadataRow<'model> {
+    pub identifier: Option<String>,
+    pub reference_date: Option<String>,
+    pub reference_system: Option<String>,
+    pub title: Option<String>,
+    pub geographical_extent: Option<[f64; 6]>,
+    pub geographical_extent_wkt: Option<String>,
+    pub contact_name: Option<String>,
+    pub contact_email_address: Option<String>,
+    pub contact_role: Option<String>,
+    pub contact_website: Option<String>,
+    pub contact_type: Option<String>,
+    pub contact_phone: Option<String>,
+    pub contact_organization: Option<String>,
+    extra: Option<&'model OwnedAttributes>,
+}
+
+/// Borrowed metadata row bound to shared dynamic columns.
+#[derive(Clone, Copy, Debug)]
+pub struct MetadataRowRef<'table, 'model> {
+    row: &'table MetadataRow<'model>,
+    columns: &'table [ColumnSchema<'model>],
+}
+
+impl<'table, 'model> MetadataRowRef<'table, 'model> {
+    #[must_use]
+    pub fn fixed(&self) -> &'table MetadataRow<'model> {
+        self.row
+    }
+
+    pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
+        self.columns
+            .get(index)
+            .map(|column| resolve_dynamic_value(self.row.extra, column))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
+        self.columns
+            .iter()
+            .map(|column| resolve_dynamic_value(self.row.extra, column))
+    }
+}
+
+/// Borrowed semantic-definition table with one row per semantic object.
+#[derive(Debug)]
+pub struct SemanticTable<'model> {
+    rows: Vec<SemanticRow<'model>>,
+    schema: TableSchema<'model>,
+}
+
+impl<'model> SemanticTable<'model> {
+    /// Returns the flattened schema for semantic attributes.
+    #[must_use]
+    pub fn schema(&self) -> &TableSchema<'model> {
+        &self.schema
+    }
+
+    /// Iterates semantic definition rows.
+    pub fn rows(&self) -> impl Iterator<Item = SemanticRowRef<'_, 'model>> {
+        self.rows.iter().map(|row| SemanticRowRef {
+            row,
+            columns: &self.schema.columns,
+        })
+    }
+}
+
+/// Fixed semantic fields plus a borrowed dynamic attribute source.
+#[derive(Clone, Debug)]
+pub struct SemanticRow<'model> {
+    pub semantic_id: u64,
+    pub semantic_type: &'model SemanticType<OwnedStringStorage>,
+    pub parent: Option<u64>,
+    pub children: Vec<u64>,
+    attributes: Option<&'model OwnedAttributes>,
+}
+
+impl<'model> SemanticRow<'model> {
+    /// Returns the semantic type using its CityJSON display spelling.
+    #[must_use]
+    pub fn semantic_type_name(&self) -> impl Display + '_ {
+        self.semantic_type
+    }
+}
+
+/// Borrowed semantic row bound to shared dynamic columns.
+#[derive(Clone, Copy, Debug)]
+pub struct SemanticRowRef<'table, 'model> {
+    row: &'table SemanticRow<'model>,
+    columns: &'table [ColumnSchema<'model>],
+}
+
+impl<'table, 'model> SemanticRowRef<'table, 'model> {
+    #[must_use]
+    pub fn fixed(&self) -> &'table SemanticRow<'model> {
+        self.row
+    }
+
+    pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
+        self.columns
+            .get(index)
+            .map(|column| resolve_dynamic_value(self.row.attributes, column))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
+        self.columns
+            .iter()
+            .map(|column| resolve_dynamic_value(self.row.attributes, column))
     }
 }
 
@@ -399,23 +574,198 @@ impl<'schema, 'model> StructValue<'schema, 'model> {
 ///
 /// Returns an error when an attribute value variant cannot be represented by the
 /// table's logical type vocabulary.
-pub fn tabulate_cityobjects(model: &CityModel) -> Result<Table<'_>> {
-    let mut attributes = StructSchema::default();
-    let mut extra = StructSchema::default();
-    for (row_ix, (_, object)) in model.cityobjects().iter().enumerate() {
-        match object.attributes() {
-            Some(values) => merge_attribute_map(&mut attributes, values, row_ix)?,
-            None => mark_all_nullable(&mut attributes),
-        }
-        match object.extra() {
-            Some(values) => merge_attribute_map(&mut extra, values, row_ix)?,
-            None => mark_all_nullable(&mut extra),
+pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
+    let attributes = infer_attribute_schema(
+        model
+            .cityobjects()
+            .iter()
+            .map(|(_, object)| object.attributes()),
+    )?;
+    let extra =
+        infer_attribute_schema(model.cityobjects().iter().map(|(_, object)| object.extra()))?;
+    Ok(CityObjectTable {
+        model,
+        schema: build_dynamic_schema(
+            [
+                (ColumnOrigin::Attributes, attributes),
+                (ColumnOrigin::Extra, extra),
+            ],
+            &[
+                "cityobject_id",
+                "cityobject_ix",
+                "cityobject_type",
+                "bbox",
+                "parents",
+                "children",
+            ],
+        ),
+    })
+}
+
+/// Infers the metadata table for a CityJSON model.
+///
+/// # Errors
+///
+/// Returns an error when metadata `extra` values cannot be represented by the
+/// table's logical type vocabulary.
+pub fn tabulate_model_metadata(model: &CityModel) -> Result<MetadataTable<'_>> {
+    let row = model
+        .metadata()
+        .map(MetadataRow::from_model_metadata)
+        .unwrap_or_default();
+    let extra = infer_attribute_schema([row.extra])?;
+    Ok(MetadataTable {
+        rows: vec![row],
+        schema: build_dynamic_schema(
+            [(ColumnOrigin::MetadataExtra, extra)],
+            &[
+                "identifier",
+                "reference_date",
+                "reference_system",
+                "title",
+                "geographical_extent",
+                "geographical_extent_wkt",
+                "contact_name",
+                "contact_email_address",
+                "contact_role",
+                "contact_website",
+                "contact_type",
+                "contact_phone",
+                "contact_organization",
+            ],
+        ),
+    })
+}
+
+/// Infers the semantic-definition table for a CityJSON model.
+///
+/// # Errors
+///
+/// Returns an error when semantic attributes cannot be represented by the
+/// table's logical type vocabulary.
+pub fn tabulate_semantics(model: &CityModel) -> Result<SemanticTable<'_>> {
+    let attributes = infer_attribute_schema(
+        model
+            .iter_semantics()
+            .map(|(_, semantic)| semantic.attributes()),
+    )?;
+    let rows = model
+        .iter_semantics()
+        .map(|(handle, semantic)| SemanticRow::from_semantic(handle, semantic))
+        .collect();
+    Ok(SemanticTable {
+        rows,
+        schema: build_dynamic_schema(
+            [(ColumnOrigin::SemanticAttributes, attributes)],
+            &["semantic_id", "semantic_type", "parent", "children"],
+        ),
+    })
+}
+
+impl<'model> MetadataRow<'model> {
+    fn from_model_metadata(metadata: &'model Metadata<OwnedStringStorage>) -> Self {
+        let contact = metadata.point_of_contact();
+        Self {
+            identifier: metadata.identifier().map(ToString::to_string),
+            reference_date: metadata.reference_date().map(ToString::to_string),
+            reference_system: metadata.reference_system().map(ToString::to_string),
+            title: metadata.title().map(ToString::to_string),
+            geographical_extent: metadata.geographical_extent().map(|bbox| (*bbox).into()),
+            geographical_extent_wkt: metadata.geographical_extent().map(bbox_wkt_2d),
+            contact_name: contact.map(|contact| contact.contact_name().to_string()),
+            contact_email_address: contact.map(|contact| contact.email_address().to_string()),
+            contact_role: contact.and_then(|contact| contact.role().map(|role| role.to_string())),
+            contact_website: contact
+                .and_then(|contact| contact.website().as_ref().map(ToString::to_string)),
+            contact_type: contact
+                .and_then(|contact| contact.contact_type().map(|kind| kind.to_string())),
+            contact_phone: contact
+                .and_then(|contact| contact.phone().as_ref().map(ToString::to_string)),
+            contact_organization: contact
+                .and_then(|contact| contact.organization().as_ref().map(ToString::to_string)),
+            extra: metadata.extra(),
         }
     }
-    Ok(Table {
-        model,
-        schema: build_table_schema(attributes, extra),
-    })
+}
+
+impl<'model> SemanticRow<'model> {
+    fn from_semantic(
+        handle: SemanticHandle,
+        semantic: &'model Semantic<OwnedStringStorage>,
+    ) -> Self {
+        Self {
+            semantic_id: semantic_handle_id(handle),
+            semantic_type: semantic.type_semantic(),
+            parent: semantic.parent().map(semantic_handle_id),
+            children: semantic
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .map(semantic_handle_id)
+                .collect(),
+            attributes: semantic.attributes(),
+        }
+    }
+}
+
+fn infer_attribute_schema<'model>(
+    sources: impl IntoIterator<Item = Option<&'model OwnedAttributes>>,
+) -> Result<StructSchema<'model>> {
+    let mut schema = StructSchema::default();
+    for (row_ix, source) in sources.into_iter().enumerate() {
+        match source {
+            Some(values) => merge_attribute_map(&mut schema, values, row_ix)?,
+            None => mark_all_nullable(&mut schema),
+        }
+    }
+    Ok(schema)
+}
+
+fn resolve_dynamic_value<'row, 'model>(
+    source: Option<&'model OwnedAttributes>,
+    column: &'row ColumnSchema<'model>,
+) -> Result<Value<'row, 'model>> {
+    let value = resolve_path(source, &column.path, &column.name)?;
+    build_value(value, &column.logical_type, column.nullable, &column.name)
+}
+
+fn cityobject_id_list<'model>(
+    model: &'model CityModel,
+    handles: Option<&[CityObjectHandle]>,
+) -> Result<IdList<'model>> {
+    let ids = handles
+        .unwrap_or_default()
+        .iter()
+        .map(|handle| {
+            model
+                .cityobjects()
+                .get(*handle)
+                .map(|object| object.id())
+                .ok_or_else(|| anyhow::anyhow!("dangling CityObject handle {handle:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(IdList { ids })
+}
+
+fn semantic_handle_id(handle: SemanticHandle) -> u64 {
+    u64::from(handle.raw_parts().0)
+}
+
+fn bbox_wkt_2d(bbox: &cityjson_lib::cityjson_types::v2_0::BBox) -> String {
+    format!(
+        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
+        bbox.min_x(),
+        bbox.min_y(),
+        bbox.max_x(),
+        bbox.min_y(),
+        bbox.max_x(),
+        bbox.max_y(),
+        bbox.min_x(),
+        bbox.max_y(),
+        bbox.min_x(),
+        bbox.min_y()
+    )
 }
 
 /// Merges one CityObject attribute map into an ordered inferred tree.
@@ -585,30 +935,25 @@ fn merge_logical_type_with_value<'model>(
     Ok(())
 }
 
-/// Flattens attribute and extra trees into one shared table schema.
-fn build_table_schema<'model>(
-    attributes: StructSchema<'model>,
-    extra: StructSchema<'model>,
+/// Flattens dynamic source trees into one shared table schema.
+fn build_dynamic_schema<'model>(
+    groups: impl IntoIterator<Item = (ColumnOrigin, StructSchema<'model>)>,
+    reserved_names: &[&str],
 ) -> TableSchema<'model> {
     let mut columns = Vec::new();
     let mut path = Vec::new();
     let mut name_buffer = String::new();
-    flatten_struct_schema(
-        ColumnOrigin::Attributes,
-        attributes,
-        &mut path,
-        false,
-        &mut name_buffer,
-        &mut columns,
-    );
-    flatten_struct_schema(
-        ColumnOrigin::Extra,
-        extra,
-        &mut path,
-        false,
-        &mut name_buffer,
-        &mut columns,
-    );
+    for (origin, schema) in groups {
+        flatten_struct_schema(
+            origin,
+            schema,
+            &mut path,
+            false,
+            &mut name_buffer,
+            &mut columns,
+            reserved_names,
+        );
+    }
     TableSchema { columns }
 }
 
@@ -620,6 +965,7 @@ fn flatten_struct_schema<'model>(
     inherited_nullable: bool,
     name_buffer: &mut String,
     columns: &mut Vec<ColumnSchema<'model>>,
+    reserved_names: &[&str],
 ) {
     for field in schema.fields.into_values() {
         path.push(field.name);
@@ -627,7 +973,15 @@ fn flatten_struct_schema<'model>(
         match field.logical_type {
             LogicalType::Null => {}
             LogicalType::Struct(schema) => {
-                flatten_struct_schema(origin, schema, path, nullable, name_buffer, columns);
+                flatten_struct_schema(
+                    origin,
+                    schema,
+                    path,
+                    nullable,
+                    name_buffer,
+                    columns,
+                    reserved_names,
+                );
             }
             logical_type => {
                 build_column_name(name_buffer, origin, path);
@@ -635,7 +989,7 @@ fn flatten_struct_schema<'model>(
                 columns.push(ColumnSchema {
                     origin,
                     path: path.clone(),
-                    name: unique_column_name(name_buffer, columns),
+                    name: unique_column_name(name_buffer, columns, reserved_names),
                     logical_type,
                     nullable,
                 });
@@ -675,14 +1029,14 @@ fn push_escaped_path_segment(output: &mut String, segment: &str) {
 }
 
 /// Returns the first column name not used by fixed or dynamic columns.
-fn unique_column_name(base: &str, columns: &[ColumnSchema<'_>]) -> String {
-    if !column_name_exists(base, columns) {
+fn unique_column_name(base: &str, columns: &[ColumnSchema<'_>], reserved_names: &[&str]) -> String {
+    if !column_name_exists(base, columns, reserved_names) {
         return base.to_string();
     }
     let mut suffix = 2;
     loop {
         let candidate = format!("{base}__{suffix}");
-        if !column_name_exists(&candidate, columns) {
+        if !column_name_exists(&candidate, columns, reserved_names) {
             return candidate;
         }
         suffix += 1;
@@ -690,9 +1044,8 @@ fn unique_column_name(base: &str, columns: &[ColumnSchema<'_>]) -> String {
 }
 
 /// Reports whether a physical name is reserved or already emitted.
-fn column_name_exists(name: &str, columns: &[ColumnSchema<'_>]) -> bool {
-    const FIXED_COLUMNS: [&str; 4] = ["cityobject_id", "cityobject_ix", "cityobject_type", "bbox"];
-    FIXED_COLUMNS.contains(&name) || columns.iter().any(|column| column.name == name)
+fn column_name_exists(name: &str, columns: &[ColumnSchema<'_>], reserved_names: &[&str]) -> bool {
+    reserved_names.contains(&name) || columns.iter().any(|column| column.name == name)
 }
 
 /// Follows a flattened column path through one optional source map.

@@ -1,7 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 
-use cityjson_convert::{tabulate_cityobjects, ColumnOrigin, LogicalType, Value};
+use cityjson_convert::{
+    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantics, ColumnOrigin, LogicalType,
+    TableSchema, Value,
+};
 use cityjson_lib::json;
 
 /// Locates the complete CityJSON 2.0 conformance fixture used by the public
@@ -35,9 +38,17 @@ fn corpus_fixture() -> PathBuf {
 }
 
 /// Returns the schema index for a named dynamic column used by a test assertion.
-fn column_index(table: &cityjson_convert::Table<'_>, name: &str) -> usize {
+fn column_index(table: &cityjson_convert::CityObjectTable<'_>, name: &str) -> usize {
     table
         .schema()
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .unwrap_or_else(|| panic!("missing column {name}"))
+}
+
+fn schema_column_index(schema: &TableSchema<'_>, name: &str) -> usize {
+    schema
         .columns
         .iter()
         .position(|column| column.name == name)
@@ -230,4 +241,137 @@ fn borrows_source_values_and_traverses_nested_values_lazily() {
     assert_eq!(label_name, "label");
     assert!(matches!(label, Value::Utf8("first")));
     assert!(fields.next().is_none());
+}
+
+#[test]
+fn exposes_cityobject_hierarchy_as_resolved_id_lists() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{"type":"Building","children":["room"]},
+                "room":{"type":"BuildingRoom","parents":["building"]}
+            },
+            "vertices":[]
+        }"#,
+    )
+    .expect("parse hierarchy CityJSON");
+    let table = tabulate_cityobjects(&model).unwrap();
+    let rows = table.rows().collect::<Vec<_>>();
+
+    assert_eq!(rows[0].children().unwrap().ids(), &["room"]);
+    assert_eq!(rows[0].parents().unwrap().ids(), &[] as &[&str]);
+    assert_eq!(rows[1].parents().unwrap().ids(), &["building"]);
+    assert_eq!(rows[1].children().unwrap().ids(), &[] as &[&str]);
+}
+
+#[test]
+fn tabulates_model_metadata_with_extent_wkt_and_extra_schema() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{},
+            "vertices":[],
+            "metadata":{
+                "identifier":"dataset-1",
+                "referenceDate":"2026-01-02",
+                "referenceSystem":"https://www.opengis.net/def/crs/EPSG/0/7415",
+                "title":"Demo dataset",
+                "geographicalExtent":[1.0,2.0,3.0,4.0,5.0,6.0],
+                "pointOfContact":{
+                    "contactName":"Ada",
+                    "emailAddress":"ada@example.test",
+                    "role":"pointOfContact",
+                    "website":"https://example.test",
+                    "contactType":"individual",
+                    "phone":"+31000000000",
+                    "organization":"Example"
+                },
+                "+quality":{"score":7}
+            }
+        }"#,
+    )
+    .expect("parse metadata CityJSON");
+    let table = tabulate_model_metadata(&model).unwrap();
+    let rows = table.rows().collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 1);
+    let fixed = rows[0].fixed();
+    assert_eq!(fixed.identifier.as_deref(), Some("dataset-1"));
+    assert_eq!(fixed.reference_date.as_deref(), Some("2026-01-02"));
+    assert_eq!(fixed.title.as_deref(), Some("Demo dataset"));
+    assert_eq!(
+        fixed.geographical_extent,
+        Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    );
+    assert_eq!(
+        fixed.geographical_extent_wkt.as_deref(),
+        Some("POLYGON((1 2, 4 2, 4 5, 1 5, 1 2))")
+    );
+    assert_eq!(fixed.contact_name.as_deref(), Some("Ada"));
+
+    let score = schema_column_index(table.schema(), "metadata_extra__+quality__score");
+    assert_eq!(
+        table.schema().columns[score].origin,
+        ColumnOrigin::MetadataExtra
+    );
+    assert!(matches!(
+        rows[0].value(score).unwrap().unwrap(),
+        Value::UInt64(7)
+    ));
+}
+
+#[test]
+fn tabulates_semantic_definitions_with_attributes_and_relationships() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"2.0",
+                        "boundaries":[[[0,1,2]]],
+                        "semantics":{
+                            "surfaces":[
+                                {"type":"RoofSurface","children":[1],"slope":30},
+                                {"type":"WallSurface","parent":0,"material":"brick"}
+                            ],
+                            "values":[0]
+                        }
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+    )
+    .expect("parse semantic CityJSON");
+    let table = tabulate_semantics(&model).unwrap();
+    let rows = table.rows().collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 2);
+    let first = rows[0].fixed();
+    let second = rows[1].fixed();
+    assert_eq!(first.semantic_type_name().to_string(), "RoofSurface");
+    assert_eq!(second.semantic_type_name().to_string(), "WallSurface");
+    assert_eq!(first.children, vec![second.semantic_id]);
+    assert_eq!(second.parent, Some(first.semantic_id));
+
+    let slope = schema_column_index(table.schema(), "semantic_attributes__slope");
+    assert_eq!(
+        table.schema().columns[slope].origin,
+        ColumnOrigin::SemanticAttributes
+    );
+    assert!(matches!(
+        rows[0].value(slope).unwrap().unwrap(),
+        Value::UInt64(30)
+    ));
+    assert!(matches!(
+        rows[1].value(slope).unwrap().unwrap(),
+        Value::Null
+    ));
 }
