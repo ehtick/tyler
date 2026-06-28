@@ -174,7 +174,7 @@ fn writes_semantic_definition_and_assignment_tsvs() {
             "semantic_type",
             "parent",
             "children",
-            "semantic_attributes__slope"
+            "attributes__slope"
         ]
     );
     assert_eq!(rows[1][1], "RoofSurface");
@@ -195,7 +195,18 @@ fn writes_semantic_definition_and_assignment_tsvs() {
     .unwrap();
     let rows = parse_tsv(&assignment_bytes);
     assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0][2], "cityobject_ix");
+    assert_eq!(
+        rows[0],
+        [
+            "semantic_id",
+            "cityobject_id",
+            "cityobject_ix",
+            "geometry_ix",
+            "geometry_type",
+            "geometry_lod",
+            "primitive_ix",
+        ]
+    );
     assert_eq!(rows[1][0], "0");
     assert_eq!(rows[2][0], "1");
     assert_eq!(rows[3][0], "");
@@ -227,7 +238,7 @@ fn writes_split_semantics_as_joined_filtered_tsv() {
     assert!(rows[0].contains(&"semantic_type".to_string()));
     assert!(rows[0].contains(&"parent".to_string()));
     assert!(rows[0].contains(&"children".to_string()));
-    assert!(rows[0].contains(&"semantic_attributes__slope".to_string()));
+    assert!(rows[0].contains(&"attributes__slope".to_string()));
     assert_eq!(rows[1][0], "0");
     assert_eq!(rows[1][1], "building");
     assert!(rows[1].contains(&"RoofSurface".to_string()));

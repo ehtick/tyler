@@ -119,7 +119,7 @@ fn tabulates_cityjson_fake_complete() {
     assert_eq!(height_schema.logical_type, LogicalType::Float64);
     assert!(height_schema.nullable);
 
-    let children_roles = column_index(&table, "extra__children_roles");
+    let children_roles = column_index(&table, "children_roles");
     let children_roles_schema = &table.schema().columns[children_roles];
     assert_eq!(children_roles_schema.origin, ColumnOrigin::Extra);
     assert!(matches!(
@@ -244,6 +244,48 @@ fn borrows_source_values_and_traverses_nested_values_lazily() {
 }
 
 #[test]
+fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{"name":"Library"},
+                    "name":"extra-name",
+                    "cityobject_id":"extra-id"
+                }
+            },
+            "vertices":[]
+        }"#,
+    )
+    .expect("parse extra CityJSON");
+    let table = tabulate_cityobjects(&model).unwrap();
+
+    let extra_name = column_index(&table, "name");
+    let fixed_conflict = column_index(&table, "cityobject_id__2");
+    assert_eq!(
+        table.schema().columns[extra_name].origin,
+        ColumnOrigin::Extra
+    );
+    assert_eq!(
+        table.schema().columns[fixed_conflict].origin,
+        ColumnOrigin::Extra
+    );
+
+    let row = table.rows().next().unwrap();
+    assert!(matches!(
+        row.value(extra_name).unwrap().unwrap(),
+        Value::Utf8("extra-name")
+    ));
+    assert!(matches!(
+        row.value(fixed_conflict).unwrap().unwrap(),
+        Value::Utf8("extra-id")
+    ));
+}
+
+#[test]
 fn exposes_cityobject_hierarchy_as_resolved_id_lists() {
     let model = json::from_slice(
         br#"{
@@ -361,7 +403,7 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert_eq!(first.children, vec![second.semantic_id]);
     assert_eq!(second.parent, Some(first.semantic_id));
 
-    let slope = schema_column_index(table.schema(), "semantic_attributes__slope");
+    let slope = schema_column_index(table.schema(), "attributes__slope");
     assert_eq!(
         table.schema().columns[slope].origin,
         ColumnOrigin::SemanticAttributes

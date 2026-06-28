@@ -73,7 +73,7 @@ GeoPackage uses this row schema with the physical columns required by
 
 #### `semantic_surfaces`
 
-One row per exported semantic surface when Tyler splits semantics.
+One row per exported semantic primitive when Tyler splits semantics.
 
 | Logical field   | Type            | Required | Source                                     |
 |-----------------|-----------------|----------|--------------------------------------------|
@@ -81,9 +81,11 @@ One row per exported semantic surface when Tyler splits semantics.
 | `cityobject_id` | `Utf8`          | yes      | owning CityObject id                       |
 | `cityobject_ix` | `UInt64`        | yes      | owning CityObject ordinal                  |
 | `geometry_ix`   | `UInt64`        | yes      | owning geometry index                      |
-| `surface_ix`    | `UInt64`        | yes      | semantic surface index within the geometry |
+| `geometry_type` | `Utf8`          | yes      | resolved CityJSON geometry type            |
+| `geometry_lod`  | `Utf8`          | no       | CityJSON LoD value                         |
+| `primitive_ix`  | `UInt64`        | yes      | semantic primitive index within geometry   |
 | `semantic_type` | `Utf8`          | yes      | semantic object `type`                     |
-| `geom`          | format geometry | yes      | semantic geometry, if materialized         |
+| `geom`          | format geometry | yes      | semantic primitive geometry, if materialized |
 | `attributes`    | `Struct{...}`   | no       | semantic surface `attributes`              |
 
 ### Projected Field Types
@@ -117,14 +119,15 @@ types, mixed scalar/list/object shapes, or unstable nested list shapes become
 ### Flattened Column Names
 
 Flat formats use the field namespace plus the nested path, joined by `__`.
-Fixed identity columns are not prefixed.
+Fixed identity columns are not prefixed. CityObject `extra` fields are also not
+prefixed in TSV output.
 
 | Logical path                | Flat column                   |
 |-----------------------------|-------------------------------|
 | `attributes.measuredHeight` | `attributes__measuredHeight`  |
 | `attributes.metrics.height` | `attributes__metrics__height` |
-| `extra.creationDate`        | `extra__creationDate`         |
-| `geometry_extra.source.id`  | `geometry_extra__source__id`  |
+| `extra.creationDate`        | `creationDate`                |
+| `metadata_extra.source.id`  | `metadata_extra__source__id`  |
 | `attributes.address.street` | `attributes__address__street` |
 
 Writers must escape path segments deterministically before joining them. The

@@ -491,14 +491,7 @@ fn semantic_assignment_header(include_cityobject_ix: bool) -> Vec<String> {
             "geometry_ix",
             "geometry_type",
             "geometry_lod",
-            "geometry_is_instance",
-            "primitive_type",
             "primitive_ix",
-            "point_ix",
-            "linestring_ix",
-            "solid_ix",
-            "shell_ix",
-            "surface_ix",
         ]
         .into_iter()
         .map(str::to_string),
@@ -521,14 +514,7 @@ fn semantic_assignment_cells(
         row.geometry_ix.to_string(),
         row.geometry_type.to_string(),
         option_string_cell(row.geometry_lod.as_deref()),
-        row.geometry_is_instance.to_string(),
-        row.primitive_type.to_string(),
         row.primitive_ix.to_string(),
-        optional_u64_cell(row.point_ix),
-        optional_u64_cell(row.linestring_ix),
-        optional_u64_cell(row.solid_ix),
-        optional_u64_cell(row.shell_ix),
-        optional_u64_cell(row.surface_ix),
     ]);
     cells
 }

@@ -207,12 +207,12 @@ pub enum ColumnOrigin {
 
 impl ColumnOrigin {
     /// Returns the physical source prefix used in flattened column names.
-    fn as_str(self) -> &'static str {
+    fn physical_prefix(self) -> Option<&'static str> {
         match self {
-            Self::Attributes => "attributes",
-            Self::Extra => "extra",
-            Self::MetadataExtra => "metadata_extra",
-            Self::SemanticAttributes => "semantic_attributes",
+            Self::Attributes => Some("attributes"),
+            Self::Extra => None,
+            Self::MetadataExtra => Some("metadata_extra"),
+            Self::SemanticAttributes => Some("attributes"),
         }
     }
 }
@@ -1330,9 +1330,13 @@ fn flatten_struct_schema<'model>(
 /// Builds an escaped physical name in a reusable string buffer.
 fn build_column_name(buffer: &mut String, origin: ColumnOrigin, path: &[&str]) {
     buffer.clear();
-    buffer.push_str(origin.as_str());
+    if let Some(prefix) = origin.physical_prefix() {
+        buffer.push_str(prefix);
+    }
     for segment in path {
-        buffer.push_str("__");
+        if !buffer.is_empty() {
+            buffer.push_str("__");
+        }
         push_escaped_path_segment(buffer, segment);
     }
 }
