@@ -81,6 +81,23 @@ fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read json file")).expect("parse json file")
 }
 
+fn parse_tsv(text: &str) -> Vec<Vec<String>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_reader(text.as_bytes());
+    reader
+        .records()
+        .map(|record| {
+            record
+                .expect("parse TSV record")
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+        .collect()
+}
+
 fn read_json_line_type(line: &str) -> String {
     let value: Value = serde_json::from_str(line).expect("parse json line");
     value["type"]
@@ -240,11 +257,61 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         output_dir.join("t").display()
     );
 
-    let metadata = fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
-    let metadata_header = metadata.lines().next().expect("metadata header");
+    let aggregate_metadata =
+        fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
+    let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
     assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
     assert!(metadata_header.contains("geographical_extent_wkt"));
-    assert!(metadata.lines().skip(1).any(|line| line.contains("t/")));
+    assert!(aggregate_metadata
+        .lines()
+        .skip(1)
+        .any(|line| line.contains("t/")));
+
+    let rows = parse_tsv(&aggregate_metadata);
+    assert!(
+        rows.len() >= 2,
+        "metadata.tsv should contain at least one data row"
+    );
+    let extent_ix = rows[0]
+        .iter()
+        .position(|column| column == "geographical_extent")
+        .expect("metadata.tsv should contain geographical_extent");
+    let extent_wkt_ix = rows[0]
+        .iter()
+        .position(|column| column == "geographical_extent_wkt")
+        .expect("metadata.tsv should contain geographical_extent_wkt");
+    let tile_extent: Vec<f64> =
+        serde_json::from_str(&rows[1][extent_ix]).expect("parse tile geographical_extent");
+    let expected_tile_extent = [
+        85_530.015_986_816_4,
+        446_894.658_972_168,
+        -0.319_460_330_963_134_53,
+        85_722.015_986_816_4,
+        447_086.658_972_168,
+        9.717_539_669_036_865,
+    ];
+    assert_eq!(tile_extent.len(), expected_tile_extent.len());
+    for (actual, expected) in tile_extent.iter().zip(expected_tile_extent) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected tile extent value {expected}, got {actual}"
+        );
+    }
+    assert!((tile_extent[3] - tile_extent[0] - (tile_extent[4] - tile_extent[1])).abs() < 1e-6);
+    let expected_wkt = format!(
+        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
+        tile_extent[0],
+        tile_extent[1],
+        tile_extent[3],
+        tile_extent[1],
+        tile_extent[3],
+        tile_extent[4],
+        tile_extent[0],
+        tile_extent[4],
+        tile_extent[0],
+        tile_extent[1]
+    );
+    assert_eq!(rows[1][extent_wkt_ix], expected_wkt);
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
     assert!(!output_dir
         .join("metadata/cjindex-metadata.city.json")

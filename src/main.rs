@@ -76,6 +76,7 @@ use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
 use cityjson_lib::cityjson_types::v2_0::appearance::RGB;
+use cityjson_lib::cityjson_types::v2_0::BBox;
 use cityjson_lib::ops::Transformer;
 use clap::{Parser, ValueEnum};
 use log::{debug, info, log_enabled, warn, Level};
@@ -1333,11 +1334,25 @@ fn write_tsv_metadata_fragment(
 ) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&context.tsv_metadata_dir)?;
     let mut metadata_model = model.clone();
-    if let Some(extent) = metadata_model.calculate_geographical_extent()? {
-        metadata_model
-            .metadata_mut()
-            .set_geographical_extent(extent);
-    }
+    let source_node_id = job.source_node_id.as_ref().ok_or_else(|| {
+        format!(
+            "TSV tile {} is missing its source quadtree node",
+            job.content_tile_coord
+        )
+    })?;
+    let qtree_node_id = spatial_structs::QuadTreeNodeId::from(source_node_id);
+    let qtree_node = context.quadtree.node(&qtree_node_id).ok_or_else(|| {
+        format!(
+            "TSV tile {} references missing source quadtree node {}",
+            job.content_tile_coord, qtree_node_id
+        )
+    })?;
+    let extent = qtree_node.bbox(&context.world.grid);
+    metadata_model
+        .metadata_mut()
+        .set_geographical_extent(BBox::new(
+            extent[0], extent[1], extent[2], extent[3], extent[4], extent[5],
+        ));
     let metadata = cityjson_convert::tabulate_model_metadata(&metadata_model)?;
     let output = File::create(tsv_metadata_fragment_path(
         &context.tsv_metadata_dir,
