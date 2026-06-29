@@ -25,6 +25,34 @@ fn stable_output_path_with_suffix(name: &str, suffix: &str) -> PathBuf {
         .join(format!("{name}.{suffix}"))
 }
 
+fn legacy_feature_dataset_path(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("output")
+        .join(name);
+    if path.exists() {
+        fs::remove_dir_all(&path).expect("remove previous legacy feature dataset");
+    }
+    fs::create_dir_all(&path).expect("create legacy feature dataset");
+
+    let items = include_bytes!("data/multi_feature_types.city.jsonl")
+        .split(|byte| *byte == b'\n')
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 3);
+    let mut metadata: Value =
+        serde_json::from_slice(items[0]).expect("parse dataset metadata fixture");
+    metadata["transform"]["translate"] = serde_json::json!([100.0, 200.0, 0.0]);
+    fs::write(
+        path.join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize dataset metadata"),
+    )
+    .expect("write dataset metadata");
+    fs::write(path.join("building.city.jsonl"), items[1]).expect("write building feature");
+    fs::write(path.join("water.city.jsonl"), items[2]).expect("write water feature");
+    path
+}
+
 fn read_glb_json(bytes: &[u8]) -> Value {
     assert!(
         bytes.len() >= 20,
@@ -365,6 +393,59 @@ fn cjconvert_can_write_cityjson_cityjsonseq_and_obj() {
     assert!(obj_lines.iter().any(|line| line.starts_with("o ")));
     assert!(obj_lines.iter().any(|line| line.starts_with("v ")));
     assert!(obj_lines.iter().any(|line| line.starts_with("f ")));
+}
+
+#[test]
+fn cjconvert_supports_legacy_feature_file_datasets() {
+    let dataset = legacy_feature_dataset_path("cjconvert_legacy_feature_dataset");
+    let cityjson_output = stable_output_path_with_suffix("cjconvert_legacy", "city.json");
+    let cityjsonseq_output = stable_output_path_with_suffix("cjconvert_legacy", "city.jsonl");
+    let obj_output = stable_output_path_with_suffix("cjconvert_legacy", "obj");
+    let glb_output = stable_output_path("cjconvert_legacy");
+
+    for (format, output) in [
+        ("cityjson", &cityjson_output),
+        ("cityjsonseq", &cityjsonseq_output),
+        ("obj", &obj_output),
+        ("glb", &glb_output),
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_cjconvert"))
+            .arg(&dataset)
+            .arg("--output")
+            .arg(output)
+            .arg("--format")
+            .arg(format)
+            .status()
+            .unwrap_or_else(|error| panic!("run cjconvert {format}: {error}"));
+        assert!(status.success(), "cjconvert {format} should succeed");
+    }
+
+    assert!(dataset.join(".cityjson-index.sqlite").is_file());
+
+    let cityjson: Value = serde_json::from_slice(
+        &fs::read(&cityjson_output).expect("read legacy dataset CityJSON output"),
+    )
+    .expect("parse legacy dataset CityJSON output");
+    assert_eq!(cityjson["type"], "CityJSON");
+    assert!(cityjson["CityObjects"].get("building-feature").is_some());
+    assert!(cityjson["CityObjects"].get("water-feature").is_some());
+
+    let sequence = read_json_lines(&cityjsonseq_output);
+    assert_eq!(sequence.len(), 3);
+    assert_eq!(sequence[0]["type"], "CityJSON");
+    assert_eq!(sequence[1]["type"], "CityJSONFeature");
+    assert_eq!(sequence[2]["type"], "CityJSONFeature");
+
+    let obj = read_obj_lines(&obj_output);
+    assert!(obj.iter().any(|line| line == "o building-feature"));
+    assert!(obj.iter().any(|line| line == "o water-feature"));
+    assert!(obj.iter().any(|line| line == "v 100 200 0"));
+
+    let glb = fs::read(&glb_output).expect("read legacy dataset GLB output");
+    let glb_json = read_glb_json(&glb);
+    assert!(glb_json["meshes"]
+        .as_array()
+        .is_some_and(|meshes| !meshes.is_empty()));
 }
 
 #[allow(clippy::cast_possible_truncation)]

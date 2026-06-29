@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use cityjson_convert::{
@@ -11,6 +11,8 @@ use cityjson_convert::{
 use cityjson_lib::json;
 use clap::{Args, Parser, ValueEnum};
 use log::info;
+
+const CJINDEX_PAGE_SIZE: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 #[clap(rename_all = "lower")]
@@ -26,7 +28,7 @@ enum OutputFormat {
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Input `CityJSON` file (.city.json) or CityJSONSeq/CityJSONFeature stream.
+    /// Input `CityJSON` file, `CityJSONSeq`/`CityJSONFeature` stream, or dataset directory.
     input: PathBuf,
     /// Path to the output file.
     #[arg(short, long)]
@@ -86,7 +88,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.format {
         OutputFormat::Glb => {
-            let model = json::from_file(&cli.input)?;
+            let model = read_model(&cli.input)?;
             let options = ExportOptions {
                 native_glb_color: cli.native_glb_color,
                 metadata_class_name: cli.metadata_class_name,
@@ -104,13 +106,13 @@ fn main() -> anyhow::Result<()> {
             info!("GLB written to {}", cli.output.display());
         }
         OutputFormat::Obj => {
-            let model = json::from_file(&cli.input)?;
+            let model = read_model(&cli.input)?;
             info!("Converting to OBJ");
             convert_to_obj(&model, &cli.output, &ObjExportOptions::default())?;
             info!("OBJ written to {}", cli.output.display());
         }
         OutputFormat::Cityjson => {
-            let model = json::from_file(&cli.input)?;
+            let model = read_model(&cli.input)?;
             info!("Converting to CityJSON");
             convert_to_cityjson(&model, &cli.output, &JsonExportOptions::default())?;
             info!("CityJSON written to {}", cli.output.display());
@@ -148,9 +150,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_model(input: &Path) -> anyhow::Result<cityjson_lib::CityModel> {
+    if !input.is_dir() {
+        return json::from_file(input).map_err(Into::into);
+    }
+
+    let (_, feature_models) = read_indexed_dataset(input)?;
+    cityjson_lib::ops::merge(feature_models).map_err(Into::into)
+}
+
 fn read_cityjsonseq_or_feature_stream(
-    input: &PathBuf,
+    input: &Path,
 ) -> anyhow::Result<(cityjson_lib::CityModel, Vec<cityjson_lib::CityModel>)> {
+    if input.is_dir() {
+        return read_indexed_dataset(input);
+    }
+
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     let mut stream = serde_json::Deserializer::from_slice(&bytes).into_iter::<serde_json::Value>();
     let Some(first) = stream.next().transpose()? else {
@@ -183,4 +198,48 @@ fn read_cityjsonseq_or_feature_stream(
             Ok((base_root, feature_models))
         }
     }
+}
+
+fn read_indexed_dataset(
+    input: &Path,
+) -> anyhow::Result<(cityjson_lib::CityModel, Vec<cityjson_lib::CityModel>)> {
+    let resolved = cityjson_index::resolve_dataset(input, None)
+        .with_context(|| format!("resolve dataset {}", input.display()))?;
+    let inspection = resolved.inspect()?;
+    let mut city_index =
+        cityjson_index::CityIndex::open(resolved.storage_layout(), &resolved.index_path)?;
+    if !inspection.index.exists || inspection.index.fresh != Some(true) {
+        info!(
+            "Rebuilding cjindex sidecar at {}",
+            resolved.index_path.display()
+        );
+        city_index.reindex()?;
+    }
+
+    let metadata = city_index.metadata()?;
+    let base_document = metadata
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("dataset does not contain any source metadata"))?;
+    let base_root = json::from_slice(&serde_json::to_vec(base_document.as_ref())?)?;
+    let mut feature_models = Vec::new();
+    let mut after_record_id = None;
+    loop {
+        let page =
+            city_index.package_ref_page_after_record_id(after_record_id, CJINDEX_PAGE_SIZE)?;
+        if page.is_empty() {
+            break;
+        }
+        after_record_id = page.last().map(|package| package.record_id);
+        feature_models.extend(
+            city_index
+                .read_packages(&page)?
+                .into_iter()
+                .map(|package| package.model),
+        );
+    }
+    if feature_models.is_empty() {
+        bail!("dataset does not contain any features");
+    }
+
+    Ok((base_root, feature_models))
 }

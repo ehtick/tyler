@@ -119,6 +119,27 @@ cjconvert input.city.jsonl --output output/features.city.jsonl --format cityjson
 single CityJSON document is rejected because decomposing a merged document into
 feature models is not implemented.
 
+The CLI also accepts a dataset directory. This includes the legacy split
+CityJSONFeature layout with a `metadata.json` base document and one or more
+`*.city.jsonl` feature files:
+
+```text
+dataset/
+├── metadata.json
+├── feature1.city.jsonl
+└── feature2.city.jsonl
+```
+
+```shell
+cjconvert dataset --output output/model.glb --format glb
+```
+
+Directory inputs are discovered and read through `cityjson-index`. The input 
+directory is recursively scanned for CityJSONFeature files. The CLI creates or 
+refreshes the `.cityjson-index.sqlite` sidecar in the dataset
+directory. GLB, OBJ and CityJSON output merge all indexed features into one
+model in memory; CityJSONSeq preserves them as separate features.
+
 You can also customize the output:
 
 ```shell

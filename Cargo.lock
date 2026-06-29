@@ -259,6 +259,7 @@ name = "cityjson-convert"
 version = "1.0.0-alpha1"
 dependencies = [
  "anyhow",
+ "cityjson-index",
  "cityjson-lib",
  "clap",
  "csv",
