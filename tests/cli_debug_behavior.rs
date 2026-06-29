@@ -194,6 +194,63 @@ fn debug_dump_data_writes_bincode_and_intermediary_cityjson() {
 }
 
 #[test]
+fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-tsv", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-tsv-output");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &[
+            "--format",
+            "tsv",
+            "--tsv-include-null-rows",
+            "--tsv-include-hierarchy",
+            "--tsv-include-cityjson-ordinal",
+            "--tsv-include-metadata",
+            "--tsv-split-semantics",
+        ],
+    );
+    assert_success(&output, "TSV format run");
+
+    let mut cityobject_tables = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("t"),
+        "cityobjects.tsv",
+        &mut cityobject_tables,
+    );
+    assert!(
+        !cityobject_tables.is_empty(),
+        "expected CityObject TSV tables under {}",
+        output_dir.join("t").display()
+    );
+    let cityobjects = fs::read_to_string(&cityobject_tables[0]).expect("read cityobjects.tsv");
+    let cityobjects_header = cityobjects.lines().next().expect("cityobjects header");
+    assert!(cityobjects_header.contains("cityobject_id"));
+    assert!(cityobjects_header.contains("cityobject_ix"));
+    assert!(cityobjects_header.contains("parents"));
+    assert!(cityobjects_header.contains("children"));
+
+    let mut semantic_tables = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), "semantics.tsv", &mut semantic_tables);
+    assert!(
+        !semantic_tables.is_empty(),
+        "expected split semantic TSV tables under {}",
+        output_dir.join("t").display()
+    );
+
+    let metadata = fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
+    let metadata_header = metadata.lines().next().expect("metadata header");
+    assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
+    assert!(metadata_header.contains("geographical_extent_wkt"));
+    assert!(metadata.lines().skip(1).any(|line| line.contains("t/")));
+    assert!(!output_dir.join(".tyler-tsv-metadata").exists());
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
 fn format_cityjson_writes_cityjson_tiles() {
     let metadata = read_fixture("resources/data/3dbag_x00.city.json");
     let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");

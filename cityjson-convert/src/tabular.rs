@@ -1,8 +1,8 @@
-//! Shared borrowed tabular representation of CityJSON CityObjects.
+//! Shared borrowed tabular representation of `CityJSON` `CityObjects`.
 //!
 //! This module exposes a [`CityModel`] through a format-neutral schema and a lazy
-//! sequence of CityObject rows for flat writers such as CSV, TSV, and
-//! GeoPackage. It defines logical fields and values only; delimiters, SQLite
+//! sequence of `CityObject` rows for flat writers such as CSV, TSV, and
+//! `GeoPackage`. It defines logical fields and values only; delimiters, `SQLite`
 //! types, and text encoding belong to the writers.
 //!
 //! # API vocabulary
@@ -16,7 +16,7 @@
 //!
 //! The table types describe the flattened row layout. Schema types describe the
 //! logical type accepted by a column or a nested container item. Values borrow
-//! actual CityObject data. For example, [`LogicalType`] describes a value while
+//! actual `CityObject` data. For example, [`LogicalType`] describes a value while
 //! [`Value`] exposes one value from a row.
 //! Nested schema and value types remain under this module; the crate root exports
 //! only the primary table vocabulary.
@@ -25,7 +25,7 @@
 //!
 //! [`tabulate_cityobjects`] scans the model once to infer the shared dynamic
 //! schema. The returned table owns that schema and borrows the model.
-//! Iterating rows walks the model directly in CityObject order. Rows and values
+//! Iterating rows walks the model directly in `CityObject` order. Rows and values
 //! borrow source identifiers, strings, attribute names, JSON fallback values,
 //! lists, and structs are borrowed rather than copied into a second table.
 //!
@@ -36,8 +36,8 @@
 //!
 //! # Schema inference
 //!
-//! CityObject `attributes` and custom `extra` members are inferred independently.
-//! A field is nullable when it is explicitly null or absent from any CityObject.
+//! `CityObject` `attributes` and custom `extra` members are inferred independently.
+//! A field is nullable when it is explicitly null or absent from any `CityObject`.
 //! Scalar types are retained; unsigned/signed integer combinations widen to
 //! signed integers, and integer/float combinations widen to floats. Homogeneous
 //! lists retain their item type and item nullability. Mixed shapes and
@@ -51,7 +51,7 @@
 //!
 //! # Column flattening
 //!
-//! A dynamic column is derived from a CityObject's `attributes` or `extra` map
+//! A dynamic column is derived from a `CityObject`'s `attributes` or `extra` map
 //! instead of a fixed field such as `cityobject_id`. Flattening means that maps
 //! directly beneath those sources, including recursively nested maps, disappear
 //! from the final table shape and their leaf paths become columns. Flattening
@@ -114,7 +114,7 @@
 //!
 //! # Invariants
 //!
-//! A table has one row per CityObject in model order. Row ordinals are
+//! A table has one row per `CityObject` in model order. Row ordinals are
 //! zero-based, and every row uses the same ordered schema. Value index `n`
 //! corresponds to dynamic-column index `n`. Missing nullable values become
 //! null values. Non-null values either conform to the inferred logical type or
@@ -149,7 +149,7 @@ impl<'model> CityObjectTable<'model> {
         &self.schema
     }
 
-    /// Iterates over CityObjects in model order without allocating rows.
+    /// Iterates over `CityObjects` in model order without allocating rows.
     pub fn rows(&self) -> impl Iterator<Item = CityObjectRow<'_, 'model>> {
         self.model
             .cityobjects()
@@ -180,7 +180,7 @@ pub struct TableSchema<'model> {
 /// Definition of one flattened dynamic table column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnSchema<'model> {
-    /// CityObject member from which the column originates.
+    /// `CityObject` member from which the column originates.
     pub origin: ColumnOrigin,
     /// Unescaped nested path below the column origin.
     pub path: Vec<&'model str>,
@@ -192,12 +192,12 @@ pub struct ColumnSchema<'model> {
     pub nullable: bool,
 }
 
-/// CityObject member from which a dynamic column originates.
+/// `CityObject` member from which a dynamic column originates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColumnOrigin {
-    /// Column inferred from the CityObject `attributes` member.
+    /// Column inferred from the `CityObject` `attributes` member.
     Attributes,
-    /// Column inferred from custom CityObject members.
+    /// Column inferred from custom `CityObject` members.
     Extra,
     /// Column inferred from custom metadata members.
     MetadataExtra,
@@ -209,10 +209,9 @@ impl ColumnOrigin {
     /// Returns the physical source prefix used in flattened column names.
     fn physical_prefix(self) -> Option<&'static str> {
         match self {
-            Self::Attributes => Some("attributes"),
+            Self::Attributes | Self::SemanticAttributes => Some("attributes"),
             Self::Extra => None,
             Self::MetadataExtra => Some("metadata_extra"),
-            Self::SemanticAttributes => Some("attributes"),
         }
     }
 }
@@ -268,13 +267,13 @@ pub struct StructFieldSchema<'model> {
     pub nullable: bool,
 }
 
-/// One allocation-free row over a source CityObject.
+/// One allocation-free row over a source `CityObject`.
 #[derive(Clone, Debug)]
 pub struct CityObjectRow<'table, 'model> {
     model: &'model CityModel,
-    /// CityJSON object identifier borrowed from the model.
+    /// `CityJSON` object identifier borrowed from the model.
     pub cityobject_id: &'model str,
-    /// Zero-based ordinal in model CityObject order.
+    /// Zero-based ordinal in model `CityObject` order.
     pub cityobject_ix: u64,
     /// Stored source `geographicalExtent`, when present.
     pub bbox: Option<[f64; 6]>,
@@ -286,8 +285,8 @@ pub struct CityObjectRow<'table, 'model> {
     columns: &'table [ColumnSchema<'model>],
 }
 
-impl<'table, 'model> CityObjectRow<'table, 'model> {
-    /// Returns the CityObject type using its CityJSON display spelling.
+impl<'model> CityObjectRow<'_, 'model> {
+    /// Returns the `CityObject` type using its `CityJSON` display spelling.
     #[must_use]
     pub fn cityobject_type_name(&self) -> impl Display + '_ {
         self.cityobject_type
@@ -297,6 +296,7 @@ impl<'table, 'model> CityObjectRow<'table, 'model> {
     ///
     /// Returns `None` when `index` is outside the shared schema. Otherwise the
     /// result contains a borrowed value or a path-bearing conversion error.
+    #[must_use]
     pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
         self.columns
             .get(index)
@@ -310,12 +310,20 @@ impl<'table, 'model> CityObjectRow<'table, 'model> {
             .map(|column| self.value_for_column(column))
     }
 
-    /// Resolves parent CityObject handles into borrowed CityObject ids.
+    /// Resolves parent `CityObject` handles into borrowed `CityObject` ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model contains dangling parent handles.
     pub fn parents(&self) -> Result<IdList<'model>> {
         cityobject_id_list(self.model, self.parents)
     }
 
-    /// Resolves child CityObject handles into borrowed CityObject ids.
+    /// Resolves child `CityObject` handles into borrowed `CityObject` ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model contains dangling child handles.
     pub fn children(&self) -> Result<IdList<'model>> {
         cityobject_id_list(self.model, self.children)
     }
@@ -335,7 +343,7 @@ impl<'table, 'model> CityObjectRow<'table, 'model> {
     }
 }
 
-/// Borrowed list of CityObject identifiers for hierarchy columns.
+/// Borrowed list of `CityObject` identifiers for hierarchy columns.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdList<'model> {
     ids: Vec<&'model str>,
@@ -354,7 +362,7 @@ impl<'model> IdList<'model> {
     }
 }
 
-/// One-row logical metadata table for a CityJSON model.
+/// One-row logical metadata table for a `CityJSON` model.
 #[derive(Debug)]
 pub struct MetadataTable<'model> {
     rows: Vec<MetadataRow<'model>>,
@@ -409,6 +417,7 @@ impl<'table, 'model> MetadataRowRef<'table, 'model> {
         self.row
     }
 
+    #[must_use]
     pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
         self.columns
             .get(index)
@@ -455,8 +464,8 @@ pub struct SemanticRow<'model> {
     attributes: Option<&'model OwnedAttributes>,
 }
 
-impl<'model> SemanticRow<'model> {
-    /// Returns the semantic type using its CityJSON display spelling.
+impl SemanticRow<'_> {
+    /// Returns the semantic type using its `CityJSON` display spelling.
     #[must_use]
     pub fn semantic_type_name(&self) -> impl Display + '_ {
         self.semantic_type
@@ -476,6 +485,7 @@ impl<'table, 'model> SemanticRowRef<'table, 'model> {
         self.row
     }
 
+    #[must_use]
     pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
         self.columns
             .get(index)
@@ -496,7 +506,7 @@ pub struct SemanticAssignmentTable<'model> {
 }
 
 impl<'model> SemanticAssignmentTable<'model> {
-    /// Iterates semantic assignment rows in CityObject and geometry order.
+    /// Iterates semantic assignment rows in `CityObject` and geometry order.
     pub fn rows(&self) -> impl Iterator<Item = &SemanticAssignmentRow<'model>> {
         self.rows.iter()
     }
@@ -573,7 +583,7 @@ pub struct ListValue<'schema, 'model> {
     path: &'schema str,
 }
 
-impl<'schema, 'model> ListValue<'schema, 'model> {
+impl<'model> ListValue<'_, 'model> {
     /// Returns the number of source list items.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -602,7 +612,7 @@ pub struct StructValue<'schema, 'model> {
     path: &'schema str,
 }
 
-impl<'schema, 'model> StructValue<'schema, 'model> {
+impl<'model> StructValue<'_, 'model> {
     /// Resolves struct fields lazily in lexical schema order.
     ///
     /// Each item contains the borrowed field name and its value.
@@ -619,7 +629,7 @@ impl<'schema, 'model> StructValue<'schema, 'model> {
     }
 }
 
-/// Infers the shared schema and returns a borrowed CityObject table.
+/// Infers the shared schema and returns a borrowed `CityObject` table.
 ///
 /// # Errors
 ///
@@ -653,7 +663,7 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
     })
 }
 
-/// Infers the metadata table for a CityJSON model.
+/// Infers the metadata table for a `CityJSON` model.
 ///
 /// # Errors
 ///
@@ -688,7 +698,7 @@ pub fn tabulate_model_metadata(model: &CityModel) -> Result<MetadataTable<'_>> {
     })
 }
 
-/// Infers the semantic-definition table for a CityJSON model.
+/// Infers the semantic-definition table for a `CityJSON` model.
 ///
 /// # Errors
 ///
@@ -885,7 +895,7 @@ fn cityobject_id_list<'model>(
             model
                 .cityobjects()
                 .get(*handle)
-                .map(|object| object.id())
+                .map(cityjson_lib::cityjson_types::v2_0::CityObject::id)
                 .ok_or_else(|| anyhow::anyhow!("dangling CityObject handle {handle:?}"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -908,9 +918,9 @@ struct SemanticAssignmentContext<'model> {
 
 #[derive(Clone, Copy, Debug)]
 struct SurfacePath {
-    solid_ix: Option<u64>,
-    shell_ix: Option<u64>,
-    surface_ix: u64,
+    solid: Option<u64>,
+    shell: Option<u64>,
+    surface: u64,
 }
 
 fn push_point_assignments<'model>(
@@ -1012,9 +1022,9 @@ fn push_surface_assignments<'model>(
             primitive_ix: primitive_ix as u64,
             point_ix: None,
             linestring_ix: None,
-            solid_ix: path.solid_ix,
-            shell_ix: path.shell_ix,
-            surface_ix: Some(path.surface_ix),
+            solid_ix: path.solid,
+            shell_ix: path.shell,
+            surface_ix: Some(path.surface),
             semantic_id: assignments[primitive_ix].map(semantic_handle_id),
         });
     }
@@ -1043,9 +1053,9 @@ fn validate_assignment_count(
 fn surface_paths_for_multi_surface(surface_count: usize) -> Vec<SurfacePath> {
     (0..surface_count)
         .map(|surface_ix| SurfacePath {
-            solid_ix: None,
-            shell_ix: None,
-            surface_ix: surface_ix as u64,
+            solid: None,
+            shell: None,
+            surface: surface_ix as u64,
         })
         .collect()
 }
@@ -1055,9 +1065,9 @@ fn surface_paths_for_solid<Surface>(shells: &[Vec<Surface>]) -> Vec<SurfacePath>
     for (shell_ix, surfaces) in shells.iter().enumerate() {
         for surface_ix in 0..surfaces.len() {
             paths.push(SurfacePath {
-                solid_ix: None,
-                shell_ix: Some(shell_ix as u64),
-                surface_ix: surface_ix as u64,
+                solid: None,
+                shell: Some(shell_ix as u64),
+                surface: surface_ix as u64,
             });
         }
     }
@@ -1070,9 +1080,9 @@ fn surface_paths_for_multi_solid<Surface>(solids: &[Vec<Vec<Surface>>]) -> Vec<S
         for (shell_ix, surfaces) in shells.iter().enumerate() {
             for surface_ix in 0..surfaces.len() {
                 paths.push(SurfacePath {
-                    solid_ix: Some(solid_ix as u64),
-                    shell_ix: Some(shell_ix as u64),
-                    surface_ix: surface_ix as u64,
+                    solid: Some(solid_ix as u64),
+                    shell: Some(shell_ix as u64),
+                    surface: surface_ix as u64,
                 });
             }
         }
@@ -1096,7 +1106,7 @@ fn bbox_wkt_2d(bbox: &cityjson_lib::cityjson_types::v2_0::BBox) -> String {
     )
 }
 
-/// Merges one CityObject attribute map into an ordered inferred tree.
+/// Merges one `CityObject` attribute map into an ordered inferred tree.
 fn merge_attribute_map<'model>(
     schema: &mut StructSchema<'model>,
     attributes: &'model OwnedAttributes,
@@ -1164,7 +1174,7 @@ fn mark_all_nullable(schema: &mut StructSchema<'_>) {
 }
 
 /// Infers the logical type of one borrowed source value recursively.
-fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<LogicalType<'model>> {
+fn infer_type(value: &OwnedAttributeValue) -> Result<LogicalType<'_>> {
     Ok(match value {
         OwnedAttributeValue::Null => LogicalType::Null,
         OwnedAttributeValue::Bool(_) => LogicalType::Boolean,
@@ -1184,7 +1194,7 @@ fn infer_type<'model>(value: &'model OwnedAttributeValue) -> Result<LogicalType<
 }
 
 /// Infers a homogeneous list item type or falls back to JSON.
-fn infer_list_type<'model>(values: &'model [OwnedAttributeValue]) -> Result<LogicalType<'model>> {
+fn infer_list_type(values: &[OwnedAttributeValue]) -> Result<LogicalType<'_>> {
     let mut item_nullable = false;
     let mut item_type = LogicalType::Null;
     let mut saw_item = false;
@@ -1221,7 +1231,12 @@ fn merge_logical_type_with_value<'model>(
         (LogicalType::Boolean, OwnedAttributeValue::Bool(_))
         | (LogicalType::UInt64, OwnedAttributeValue::Unsigned(_))
         | (LogicalType::Int64, OwnedAttributeValue::Integer(_))
-        | (LogicalType::Float64, OwnedAttributeValue::Float(_))
+        | (
+            LogicalType::Float64,
+            OwnedAttributeValue::Float(_)
+            | OwnedAttributeValue::Unsigned(_)
+            | OwnedAttributeValue::Integer(_),
+        )
         | (LogicalType::Utf8, OwnedAttributeValue::String(_))
         | (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(_))
         | (LogicalType::Json, _) => {}
@@ -1232,10 +1247,6 @@ fn merge_logical_type_with_value<'model>(
         (LogicalType::UInt64 | LogicalType::Int64, OwnedAttributeValue::Float(_)) => {
             *current = LogicalType::Float64;
         }
-        (
-            LogicalType::Float64,
-            OwnedAttributeValue::Unsigned(_) | OwnedAttributeValue::Integer(_),
-        ) => {}
         (
             LogicalType::List {
                 item_nullable,
@@ -1438,12 +1449,16 @@ fn build_value<'schema, 'model>(
             })?))
         }
         (LogicalType::Float64, OwnedAttributeValue::Float(value)) => Ok(Value::Float64(*value)),
-        (LogicalType::Float64, OwnedAttributeValue::Unsigned(value)) => {
-            Ok(Value::Float64(*value as f64))
-        }
-        (LogicalType::Float64, OwnedAttributeValue::Integer(value)) => {
-            Ok(Value::Float64(*value as f64))
-        }
+        (LogicalType::Float64, OwnedAttributeValue::Unsigned(value)) => Ok(Value::Float64(
+            num_traits::ToPrimitive::to_f64(value).ok_or_else(|| {
+                anyhow::anyhow!("{path}: unsigned integer {value} cannot be represented as Float64")
+            })?,
+        )),
+        (LogicalType::Float64, OwnedAttributeValue::Integer(value)) => Ok(Value::Float64(
+            num_traits::ToPrimitive::to_f64(value).ok_or_else(|| {
+                anyhow::anyhow!("{path}: integer {value} cannot be represented as Float64")
+            })?,
+        )),
         (LogicalType::Utf8, OwnedAttributeValue::String(value)) => Ok(Value::Utf8(value)),
         (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(value)) => {
             Ok(Value::GeometryRef(*value))

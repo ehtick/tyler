@@ -1,15 +1,3 @@
-#![allow(
-    clippy::manual_is_multiple_of,
-    clippy::needless_as_bytes,
-    clippy::needless_borrows_for_generic_args,
-    clippy::to_string_trait_impl,
-    clippy::too_many_arguments,
-    clippy::unnecessary_fallible_conversions,
-    clippy::unnecessary_to_owned,
-    clippy::unnecessary_unwrap,
-    clippy::useless_vec
-)]
-
 pub mod gltf_writer;
 pub mod obj_writer;
 pub mod tabular;

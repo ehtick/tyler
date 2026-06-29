@@ -434,6 +434,33 @@ struct StructuralMetadataExtension {
     feature_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MeshoptCompressionKind {
+    Attributes,
+    Triangles,
+}
+
+impl MeshoptCompressionKind {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Attributes => "ATTRIBUTES",
+            Self::Triangles => "TRIANGLES",
+        }
+    }
+
+    fn filter(self) -> Option<&'static str> {
+        match self {
+            Self::Attributes | Self::Triangles => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MeshoptFallback {
+    byte_length: usize,
+    alignment: usize,
+}
+
 #[derive(Clone, Debug)]
 struct MeshoptBufferView {
     buffer: u32,
@@ -2261,13 +2288,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode quantized position stream")?;
             self.push_meshopt_buffer_view(
                 &position_bytes,
-                positions.len() * QUANTIZED_POSITION_STRIDE,
+                MeshoptFallback {
+                    byte_length: positions.len() * QUANTIZED_POSITION_STRIDE,
+                    alignment: std::mem::align_of::<i16>(),
+                },
                 Some(QUANTIZED_POSITION_STRIDE),
                 positions.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<i16>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2302,13 +2330,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode quantized normal stream")?;
             self.push_meshopt_buffer_view(
                 &normal_bytes,
-                normals.len() * QUANTIZED_NORMAL_STRIDE,
+                MeshoptFallback {
+                    byte_length: normals.len() * QUANTIZED_NORMAL_STRIDE,
+                    alignment: std::mem::align_of::<i8>(),
+                },
                 Some(QUANTIZED_NORMAL_STRIDE),
                 normals.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<i8>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2371,13 +2400,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode float position stream")?;
             self.push_meshopt_buffer_view(
                 &position_bytes,
-                positions.len() * position_stride,
+                MeshoptFallback {
+                    byte_length: positions.len() * position_stride,
+                    alignment: std::mem::align_of::<f32>(),
+                },
                 Some(position_stride),
                 positions.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<f32>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2412,13 +2442,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode float normal stream")?;
             self.push_meshopt_buffer_view(
                 &normal_bytes,
-                normals.len() * normal_stride,
+                MeshoptFallback {
+                    byte_length: normals.len() * normal_stride,
+                    alignment: std::mem::align_of::<f32>(),
+                },
                 Some(normal_stride),
                 normals.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<f32>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2482,13 +2513,15 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        MeshoptFallback {
+                            byte_length: padded_feature_ids.len()
+                                * FeatureIdBuffer::meshopt_byte_stride(),
+                            alignment: std::mem::align_of::<PaddedFeatureIdU8>(),
+                        },
                         Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
-                        "ATTRIBUTES",
-                        None,
-                        std::mem::align_of::<PaddedFeatureIdU8>(),
+                        MeshoptCompressionKind::Attributes,
                     )
                 } else {
                     self.push_buffer_view(
@@ -2512,13 +2545,15 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        MeshoptFallback {
+                            byte_length: padded_feature_ids.len()
+                                * FeatureIdBuffer::meshopt_byte_stride(),
+                            alignment: std::mem::align_of::<PaddedFeatureIdU16>(),
+                        },
                         Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
-                        "ATTRIBUTES",
-                        None,
-                        std::mem::align_of::<PaddedFeatureIdU16>(),
+                        MeshoptCompressionKind::Attributes,
                     )
                 } else {
                     self.push_buffer_view(
@@ -2557,13 +2592,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode index stream")?;
             self.push_meshopt_buffer_view(
                 &encoded_indices,
-                index_buffer.byte_length(),
+                MeshoptFallback {
+                    byte_length: index_buffer.byte_length(),
+                    alignment: index_buffer.byte_stride(),
+                },
                 None,
                 index_buffer.count(),
                 json::buffer::Target::ElementArrayBuffer,
-                "TRIANGLES",
-                None,
-                index_buffer.byte_stride(),
+                MeshoptCompressionKind::Triangles,
             )
         } else {
             match index_buffer {
@@ -2632,18 +2668,19 @@ impl BufferBuilder {
         data: &[T],
         meshopt_compression: bool,
     ) -> Result<json::Index<json::buffer::View>> {
-        if meshopt_compression && std::mem::size_of::<T>() % 4 == 0 {
+        if meshopt_compression && std::mem::size_of::<T>().is_multiple_of(4) {
             let encoded = encode_vertex_buffer(data)
                 .context("failed to meshopt-encode structural metadata column")?;
             Ok(self.push_meshopt_buffer_view(
                 &encoded,
-                std::mem::size_of_val(data),
+                MeshoptFallback {
+                    byte_length: std::mem::size_of_val(data),
+                    alignment: std::mem::align_of::<T>(),
+                },
                 Some(std::mem::size_of::<T>()),
                 data.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<T>(),
+                MeshoptCompressionKind::Attributes,
             ))
         } else {
             Ok(self.push_scalar_buffer_view(data, json::buffer::Target::ArrayBuffer))
@@ -2661,25 +2698,23 @@ impl BufferBuilder {
     fn push_meshopt_buffer_view(
         &mut self,
         compressed_data: &[u8],
-        fallback_byte_length: usize,
+        fallback: MeshoptFallback,
         byte_stride: Option<usize>,
         count: usize,
         target: json::buffer::Target,
-        mode: &'static str,
-        filter: Option<&'static str>,
-        fallback_alignment: usize,
+        compression: MeshoptCompressionKind,
     ) -> json::Index<json::buffer::View> {
         let compressed_byte_offset = self.bytes.len();
         let compressed_byte_length = compressed_data.len();
         self.bytes.extend_from_slice(compressed_data);
 
-        let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback_alignment);
-        self.fallback_buffer_length = fallback_byte_offset + fallback_byte_length;
+        let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback.alignment);
+        self.fallback_buffer_length = fallback_byte_offset + fallback.byte_length;
 
         let index = self.buffer_views.len();
         self.buffer_views.push(json::buffer::View {
             buffer: json::Index::new(1),
-            byte_length: json::validation::USize64(fallback_byte_length as u64),
+            byte_length: json::validation::USize64(fallback.byte_length as u64),
             byte_offset: Some(json::validation::USize64(fallback_byte_offset as u64)),
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
@@ -2691,10 +2726,10 @@ impl BufferBuilder {
             buffer: 0,
             byte_offset: compressed_byte_offset as u64,
             byte_length: compressed_byte_length as u64,
-            byte_stride: byte_stride.unwrap_or(fallback_alignment) as u64,
+            byte_stride: byte_stride.unwrap_or(fallback.alignment) as u64,
             count: count as u64,
-            mode,
-            filter,
+            mode: compression.mode(),
+            filter: compression.filter(),
         }));
 
         json::Index::new(u32::try_from(index).expect("buffer view index exceeds u32 range"))

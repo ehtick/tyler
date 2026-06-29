@@ -111,6 +111,21 @@ pub struct Cli {
     /// Compute smooth vertex normals.
     #[arg(long)]
     pub smooth_normals: bool,
+    /// Include CityObjects without dynamic TSV attribute values when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_null_rows: bool,
+    /// Include parent and child CityObject identifiers when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_hierarchy: bool,
+    /// Include the source CityJSON CityObject ordinal when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_cityjson_ordinal: bool,
+    /// Write root-level aggregate metadata.tsv when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_metadata: bool,
+    /// Split semantic surface assignments into semantics.tsv when the output format is TSV.
+    #[arg(long)]
+    pub tsv_split_semantics: bool,
     /// LoD to use in output for Building features
     #[arg(long)]
     pub lod_building: Option<String>,
@@ -259,6 +274,7 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
         ],
         is_present: cli_has_grid_minz,
     },
@@ -268,6 +284,7 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
         ],
         is_present: cli_has_grid_maxz,
     },
@@ -277,6 +294,7 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
         ],
         is_present: cli_has_3dtiles_implicit,
     },
@@ -286,8 +304,59 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
         ],
         is_present: cli_has_3dtiles_content_clip_to_tile_bounds,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-null-rows",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_null_rows,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-hierarchy",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_hierarchy,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-cityjson-ordinal",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_cityjson_ordinal,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-metadata",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_metadata,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-split-semantics",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_split_semantics,
     },
 ];
 
@@ -355,6 +424,26 @@ fn cli_has_3dtiles_content_clip_to_tile_bounds(cli: &Cli) -> bool {
     cli.cesium3dtiles_content_clip_to_tile_bounds
 }
 
+fn cli_has_tsv_include_null_rows(cli: &Cli) -> bool {
+    cli.tsv_include_null_rows
+}
+
+fn cli_has_tsv_include_hierarchy(cli: &Cli) -> bool {
+    cli.tsv_include_hierarchy
+}
+
+fn cli_has_tsv_include_cityjson_ordinal(cli: &Cli) -> bool {
+    cli.tsv_include_cityjson_ordinal
+}
+
+fn cli_has_tsv_include_metadata(cli: &Cli) -> bool {
+    cli.tsv_include_metadata
+}
+
+fn cli_has_tsv_split_semantics(cli: &Cli) -> bool {
+    cli.tsv_split_semantics
+}
+
 fn unique_output_formats(formats: &[crate::OutputFormatKind]) -> Vec<crate::OutputFormatKind> {
     let mut unique_formats = Vec::new();
     for &format in formats {
@@ -372,6 +461,7 @@ fn output_format_name(format: crate::OutputFormatKind) -> &'static str {
         crate::OutputFormatKind::Obj => "obj",
         crate::OutputFormatKind::Cityjson => "cityjson",
         crate::OutputFormatKind::Cityjsonseq => "cityjsonseq",
+        crate::OutputFormatKind::Tsv => "tsv",
     }
 }
 
@@ -584,6 +674,29 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_tsv_format_and_flags() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "tsv".to_string(),
+            "--tsv-include-null-rows".to_string(),
+            "--tsv-include-hierarchy".to_string(),
+            "--tsv-include-cityjson-ordinal".to_string(),
+            "--tsv-include-metadata".to_string(),
+            "--tsv-split-semantics".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Tsv);
+        assert!(cli.tsv_include_null_rows);
+        assert!(cli.tsv_include_hierarchy);
+        assert!(cli.tsv_include_cityjson_ordinal);
+        assert!(cli.tsv_include_metadata);
+        assert!(cli.tsv_split_semantics);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
     fn validation_accepts_multiple_formats_directly() {
         let cli = Cli::try_parse_from(dataset_args()).unwrap();
 
@@ -592,6 +705,7 @@ mod tests {
                 OutputFormatKind::Cesium3dTiles,
                 OutputFormatKind::Cityjson,
                 OutputFormatKind::Cityjsonseq,
+                OutputFormatKind::Tsv,
             ])
             .is_ok());
     }
@@ -605,9 +719,10 @@ mod tests {
             cli.no_effect_info_messages(&[
                 OutputFormatKind::Cityjson,
                 OutputFormatKind::Cityjsonseq,
+                OutputFormatKind::Tsv,
             ]),
             vec![
-                "--grid-minz has no effect for selected output formats: cityjson, cityjsonseq"
+                "--grid-minz has no effect for selected output formats: cityjson, cityjsonseq, tsv"
                     .to_string(),
             ]
         );
@@ -647,6 +762,48 @@ mod tests {
             vec![
                 "--3dtiles-implicit has no effect for selected output formats: obj".to_string(),
                 "--3dtiles-content-clip-to-tile-bounds has no effect for selected output formats: obj"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tsv_reports_3dtiles_only_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.cesium3dtiles_implicit = true;
+        cli.cesium3dtiles_content_clip_to_tile_bounds = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Tsv]),
+            vec![
+                "--3dtiles-implicit has no effect for selected output formats: tsv".to_string(),
+                "--3dtiles-content-clip-to-tile-bounds has no effect for selected output formats: tsv"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_tsv_reports_tsv_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.tsv_include_null_rows = true;
+        cli.tsv_include_hierarchy = true;
+        cli.tsv_include_cityjson_ordinal = true;
+        cli.tsv_include_metadata = true;
+        cli.tsv_split_semantics = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Cityjson]),
+            vec![
+                "--tsv-include-null-rows has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-hierarchy has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-cityjson-ordinal has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-metadata has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-split-semantics has no effect for selected output formats: cityjson"
                     .to_string(),
             ]
         );

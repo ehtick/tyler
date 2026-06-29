@@ -73,7 +73,7 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
     Ok(())
 }
 
-/// Writes CityObject rows as TSV.
+/// Writes `CityObject` rows as TSV.
 ///
 /// # Errors
 ///
@@ -286,20 +286,17 @@ pub fn write_split_semantics_tsv<W: Write>(
         }
 
         let mut record = semantic_assignment_cells(assignment, options.include_cityjson_ordinal);
-        match semantic {
-            Some(row) => {
-                let fixed = row.fixed();
-                record.push(fixed.semantic_type_name().to_string());
-                if options.include_hierarchy {
-                    record.push(optional_u64_cell(fixed.parent));
-                    record.push(serde_json::to_string(&fixed.children)?);
-                }
+        if let Some(row) = semantic {
+            let fixed = row.fixed();
+            record.push(fixed.semantic_type_name().to_string());
+            if options.include_hierarchy {
+                record.push(optional_u64_cell(fixed.parent));
+                record.push(serde_json::to_string(&fixed.children)?);
             }
-            None => {
-                record.push(String::new());
-                if options.include_hierarchy {
-                    record.extend([String::new(), String::new()]);
-                }
+        } else {
+            record.push(String::new());
+            if options.include_hierarchy {
+                record.extend([String::new(), String::new()]);
             }
         }
         record.extend(dynamic.into_iter().map(|cell| cell.text));

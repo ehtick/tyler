@@ -7,21 +7,22 @@ use cityjson_convert::{
 };
 use cityjson_lib::json;
 
-/// Locates the complete CityJSON 2.0 conformance fixture used by the public
+/// Locates the complete `CityJSON` 2.0 conformance fixture used by the public
 /// table test.
 ///
 /// The corpus checkout is intentionally external to this crate because the
-/// fixture is shared across CityJSON implementations. `CITYJSON_CORPUS_DIR` can
+/// fixture is shared across `CityJSON` implementations. `CITYJSON_CORPUS_DIR` can
 /// override the default sibling-checkout location.
 fn corpus_fixture() -> PathBuf {
-    let corpus_root = env::var_os("CITYJSON_CORPUS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let corpus_root = env::var_os("CITYJSON_CORPUS_DIR").map_or_else(
+        || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
                 .join("..")
                 .join("cityjson-corpus")
-        });
+        },
+        PathBuf::from,
+    );
     let fixture = corpus_root
         .join("cases")
         .join("conformance")
@@ -81,10 +82,10 @@ fn validate_value(cell: Value<'_, '_>) {
     }
 }
 
-/// Tabulates the complete CityJSON 2.0 conformance fixture and consumes every
+/// Tabulates the complete `CityJSON` 2.0 conformance fixture and consumes every
 /// row and value.
 ///
-/// Input: `cityjson_fake_complete`, which contains four CityObjects and covers
+/// Input: `cityjson_fake_complete`, which contains four `CityObjects` and covers
 /// fixed fields, attributes, custom members, nested values, lists, nulls,
 /// addresses, and stored geographical extents.
 ///
@@ -93,7 +94,7 @@ fn validate_value(cell: Value<'_, '_>) {
 /// nested values can be traversed; and representative fixed and dynamic values
 /// reach the expected row.
 ///
-/// Invariants protected: one row per CityObject in model order, positional
+/// Invariants protected: one row per `CityObject` in model order, positional
 /// schema/value alignment, and end-to-end convertibility of the complete fixture.
 #[test]
 fn tabulates_cityjson_fake_complete() {
@@ -137,7 +138,7 @@ fn tabulates_cityjson_fake_complete() {
 
     assert_eq!(
         rows[0].bbox,
-        Some([84710.1, 446846.0, -5.3, 84757.1, 446944.0, 40.9])
+        Some([84710.1, 446_846.0, -5.3, 84757.1, 446_944.0, 40.9])
     );
     assert!(matches!(
         rows[0].value(height).unwrap().unwrap(),
