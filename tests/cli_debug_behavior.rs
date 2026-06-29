@@ -209,7 +209,6 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
             "--tsv-include-null-rows",
             "--tsv-include-hierarchy",
             "--tsv-include-cityjson-ordinal",
-            "--tsv-include-metadata",
             "--tsv-split-semantics",
         ],
     );
@@ -247,6 +246,9 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     assert!(metadata_header.contains("geographical_extent_wkt"));
     assert!(metadata.lines().skip(1).any(|line| line.contains("t/")));
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
+    assert!(!output_dir
+        .join("metadata/cjindex-metadata.city.json")
+        .exists());
     assert!(!output_dir.join("tileset.json").exists());
 }
 

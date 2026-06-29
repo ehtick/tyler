@@ -120,9 +120,6 @@ pub struct Cli {
     /// Include the source CityJSON CityObject ordinal when the output format is TSV.
     #[arg(long)]
     pub tsv_include_cityjson_ordinal: bool,
-    /// Write root-level aggregate metadata.tsv when the output format is TSV.
-    #[arg(long)]
-    pub tsv_include_metadata: bool,
     /// Split semantic surface assignments into semantics.tsv when the output format is TSV.
     #[arg(long)]
     pub tsv_split_semantics: bool,
@@ -339,16 +336,6 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
         is_present: cli_has_tsv_include_cityjson_ordinal,
     },
     NoEffectInfoRule {
-        flag: "--tsv-include-metadata",
-        n_a_formats: &[
-            crate::OutputFormatKind::Cesium3dTiles,
-            crate::OutputFormatKind::Obj,
-            crate::OutputFormatKind::Cityjson,
-            crate::OutputFormatKind::Cityjsonseq,
-        ],
-        is_present: cli_has_tsv_include_metadata,
-    },
-    NoEffectInfoRule {
         flag: "--tsv-split-semantics",
         n_a_formats: &[
             crate::OutputFormatKind::Cesium3dTiles,
@@ -434,10 +421,6 @@ fn cli_has_tsv_include_hierarchy(cli: &Cli) -> bool {
 
 fn cli_has_tsv_include_cityjson_ordinal(cli: &Cli) -> bool {
     cli.tsv_include_cityjson_ordinal
-}
-
-fn cli_has_tsv_include_metadata(cli: &Cli) -> bool {
-    cli.tsv_include_metadata
 }
 
 fn cli_has_tsv_split_semantics(cli: &Cli) -> bool {
@@ -682,7 +665,6 @@ mod tests {
             "--tsv-include-null-rows".to_string(),
             "--tsv-include-hierarchy".to_string(),
             "--tsv-include-cityjson-ordinal".to_string(),
-            "--tsv-include-metadata".to_string(),
             "--tsv-split-semantics".to_string(),
         ]);
         let cli = Cli::try_parse_from(args).unwrap();
@@ -691,9 +673,20 @@ mod tests {
         assert!(cli.tsv_include_null_rows);
         assert!(cli.tsv_include_hierarchy);
         assert!(cli.tsv_include_cityjson_ordinal);
-        assert!(cli.tsv_include_metadata);
         assert!(cli.tsv_split_semantics);
         assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_tsv_include_metadata_flag() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "tsv".to_string(),
+            "--tsv-include-metadata".to_string(),
+        ]);
+
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]
@@ -789,7 +782,6 @@ mod tests {
         cli.tsv_include_null_rows = true;
         cli.tsv_include_hierarchy = true;
         cli.tsv_include_cityjson_ordinal = true;
-        cli.tsv_include_metadata = true;
         cli.tsv_split_semantics = true;
 
         assert_eq!(
@@ -800,8 +792,6 @@ mod tests {
                 "--tsv-include-hierarchy has no effect for selected output formats: cityjson"
                     .to_string(),
                 "--tsv-include-cityjson-ordinal has no effect for selected output formats: cityjson"
-                    .to_string(),
-                "--tsv-include-metadata has no effect for selected output formats: cityjson"
                     .to_string(),
                 "--tsv-split-semantics has no effect for selected output formats: cityjson"
                     .to_string(),

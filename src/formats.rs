@@ -1909,7 +1909,6 @@ pub mod cesium3dtiles {
             );
             let mut world = crate::parser::World::from_cjindex(
                 crate::parser::InputSource::from_cjindex_resolved(&resolved),
-                metadata_path,
                 feature_base_document,
                 200,
                 cityobject_types,

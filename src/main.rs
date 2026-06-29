@@ -104,7 +104,6 @@ struct DebugData {
 #[derive(Debug, Clone)]
 struct PreparedInput {
     source: parser::InputSource,
-    metadata_path: PathBuf,
     feature_base_document: Vec<u8>,
 }
 
@@ -243,7 +242,7 @@ fn build_tsv_export_options(cli: &crate::cli::Cli) -> cityjson_convert::TsvExpor
         include_null_rows: cli.tsv_include_null_rows,
         include_hierarchy: cli.tsv_include_hierarchy,
         include_cityjson_ordinal: cli.tsv_include_cityjson_ordinal,
-        include_metadata: cli.tsv_include_metadata,
+        include_metadata: false,
         split_semantics: cli.tsv_split_semantics,
     }
 }
@@ -409,10 +408,7 @@ fn compute_root_enu_frame(
     RootEnuFrame::from_bbox(&crs_from, &root_bbox)
 }
 
-fn prepare_input(
-    cli: &crate::cli::Cli,
-    output_dir: &Path,
-) -> Result<PreparedInput, Box<dyn std::error::Error>> {
+fn prepare_input(cli: &crate::cli::Cli) -> Result<PreparedInput, Box<dyn std::error::Error>> {
     let resolved = cityjson_index::resolve_dataset(&cli.input, None)?;
     let inspection = resolved.inspect()?;
     let mut city_index =
@@ -425,13 +421,8 @@ fn prepare_input(
         city_index.reindex()?;
     }
     let feature_base_document = derive_base_document(&city_index)?;
-    let metadata_dir = output_dir.join("metadata");
-    fs::create_dir_all(&metadata_dir)?;
-    let metadata_path = metadata_dir.join("cjindex-metadata.city.json");
-    fs::write(&metadata_path, &feature_base_document)?;
     Ok(PreparedInput {
         source: parser::InputSource::from_cjindex_resolved(&resolved),
-        metadata_path,
         feature_base_document,
     })
 }
@@ -1446,7 +1437,6 @@ struct TileWriteContext<'a> {
     include_parent_attributes: bool,
     cityjson_colors: BTreeMap<String, RGB>,
     tsv_export_options: cityjson_convert::TsvExportOptions,
-    tsv_include_metadata: bool,
     tsv_metadata_dir: PathBuf,
 }
 
@@ -2013,9 +2003,7 @@ impl OutputFormatBackend for TsvBackend {
         options.include_metadata = false;
         cityjson_convert::convert_to_tsv(model, &output_dir, &options)?;
 
-        if context.tsv_include_metadata {
-            write_tsv_metadata_fragment(job, model, context)?;
-        }
+        write_tsv_metadata_fragment(job, model, context)?;
 
         Ok(())
     }
@@ -2029,9 +2017,7 @@ impl OutputFormatBackend for TsvBackend {
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Skipped {} failed TSV tile outputs", failed_jobs.len());
-        if cli.tsv_include_metadata {
-            aggregate_tsv_metadata(&cli.output, successful_jobs)?;
-        }
+        aggregate_tsv_metadata(&cli.output, successful_jobs)?;
         Ok(())
     }
 
@@ -2209,7 +2195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (they don't implement Copy). When we move a value, we explicitly transfer
     // ownership of the value (eg cli.object_type).
     let prepared_input = if debug_data.world.is_none() {
-        Some(prepare_input(&cli, &cli.output)?)
+        Some(prepare_input(&cli)?)
     } else {
         None
     };
@@ -2224,7 +2210,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("prepared input must exist when world is built from source");
             let mut world = parser::World::from_cjindex(
                 prepared_input.source.clone(),
-                prepared_input.metadata_path.clone(),
                 prepared_input.feature_base_document.clone(),
                 grid_cellsize,
                 cityobject_types,
@@ -2344,7 +2329,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_parent_attributes: cli.include_parent_attributes,
             cityjson_colors: build_cityjson_object_colors(&cli),
             tsv_export_options: build_tsv_export_options(&cli),
-            tsv_include_metadata: cli.tsv_include_metadata,
             tsv_metadata_dir: cli.output.join(".tyler-tsv-metadata"),
         };
         let object_attribute_types = object_attribute_types.clone();
@@ -2511,7 +2495,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3072,7 +3055,6 @@ mod tests {
         let low_filter = build_feature_filter(low_types.as_ref(), &low_lods);
         let world_low = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path.clone(),
             feature_base_document.clone(),
             200,
             low_types,
@@ -3087,7 +3069,6 @@ mod tests {
         let high_filter = build_feature_filter(high_types.as_ref(), &high_lods);
         let world_high = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             high_types,
@@ -3448,7 +3429,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3503,7 +3483,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3565,7 +3544,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3616,7 +3594,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &lods);
         let Err(error) = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3684,7 +3661,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3730,7 +3706,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3782,7 +3757,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3879,7 +3853,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,

@@ -365,7 +365,6 @@ flags that do not change that backend's output at all.
 | `--tsv-*`     | `--tsv-include-null-rows`               | ignored | ignored  | ignored     | ignored | ignored | yes     |
 | `--tsv-*`     | `--tsv-include-hierarchy`               | ignored | ignored  | ignored     | ignored | ignored | yes     |
 | `--tsv-*`     | `--tsv-include-cityjson-ordinal`        | ignored | ignored  | ignored     | ignored | ignored | yes     |
-| `--tsv-*`     | `--tsv-include-metadata`                | ignored | ignored  | ignored     | ignored | ignored | yes     |
 | selector      | `--lod-*`                               | yes     | yes      | yes         | yes     | yes     | yes     |
 | selector      | `--color-*`                             | yes     | ignored  | ignored     | ignored | yes     | ignored |
 
