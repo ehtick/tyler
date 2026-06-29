@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use cityjson_convert::{
-    convert_to_cityjson, convert_to_cityjsonseq, convert_to_glb, convert_to_obj,
+    convert_to_cityjson, convert_to_cityjsonseq, convert_to_glb, convert_to_obj, convert_to_tsv,
     CityJsonSeqExportOptions, ExportOptions, GeometryPlacement, JsonExportOptions,
-    ObjExportOptions,
+    ObjExportOptions, TsvExportOptions,
 };
 use cityjson_lib::json;
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, ValueEnum};
 use log::info;
 
 const CJINDEX_PAGE_SIZE: usize = 65_536;
@@ -22,6 +22,7 @@ enum OutputFormat {
     Obj,
     Cityjson,
     Cityjsonseq,
+    Tsv,
 }
 
 #[derive(Parser, Debug)]
@@ -50,6 +51,35 @@ struct Cli {
     /// Metadata class name for `EXT_structural_metadata`.
     #[arg(long = "3dtiles-metadata-class", default_value = "cityobject")]
     metadata_class_name: String,
+    /// TSV row-shape options.
+    #[command(flatten)]
+    tsv_rows: TsvRowCliOptions,
+    /// TSV metadata and semantics options.
+    #[command(flatten)]
+    tsv_files: TsvFileCliOptions,
+}
+
+#[derive(Args, Debug, Default)]
+struct TsvRowCliOptions {
+    /// Include rows whose dynamic TSV attributes are all null.
+    #[arg(long = "tsv-include-null-rows", default_value_t = false)]
+    tsv_include_null_rows: bool,
+    /// Include parent/child hierarchy columns in TSV outputs.
+    #[arg(long = "tsv-include-hierarchy", default_value_t = false)]
+    tsv_include_hierarchy: bool,
+    /// Include the source `CityJSON` ordinal column in TSV outputs.
+    #[arg(long = "tsv-include-cityjson-ordinal", default_value_t = false)]
+    tsv_include_cityjson_ordinal: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct TsvFileCliOptions {
+    /// Write a separate TSV metadata file.
+    #[arg(long = "tsv-include-metadata", default_value_t = false)]
+    tsv_include_metadata: bool,
+    /// Write a separate TSV semantics file joined from primitive assignments.
+    #[arg(long = "tsv-split-semantics", default_value_t = false)]
+    tsv_split_semantics: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -102,6 +132,19 @@ fn main() -> anyhow::Result<()> {
                 &CityJsonSeqExportOptions::default(),
             )?;
             info!("CityJSONSeq written to {}", cli.output.display());
+        }
+        OutputFormat::Tsv => {
+            let model = json::from_file(&cli.input)?;
+            let options = TsvExportOptions {
+                include_null_rows: cli.tsv_rows.tsv_include_null_rows,
+                include_hierarchy: cli.tsv_rows.tsv_include_hierarchy,
+                include_cityjson_ordinal: cli.tsv_rows.tsv_include_cityjson_ordinal,
+                include_metadata: cli.tsv_files.tsv_include_metadata,
+                split_semantics: cli.tsv_files.tsv_split_semantics,
+            };
+            info!("Converting to TSV");
+            convert_to_tsv(&model, &cli.output, &options)?;
+            info!("TSV files written to {}", cli.output.display());
         }
     }
     Ok(())

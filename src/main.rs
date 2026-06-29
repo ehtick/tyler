@@ -76,6 +76,7 @@ use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
 use cityjson_lib::cityjson_types::v2_0::appearance::RGB;
+use cityjson_lib::cityjson_types::v2_0::BBox;
 use cityjson_lib::ops::Transformer;
 use clap::{Parser, ValueEnum};
 use log::{debug, info, log_enabled, warn, Level};
@@ -91,6 +92,7 @@ pub enum OutputFormatKind {
     Obj,
     Cityjson,
     Cityjsonseq,
+    Tsv,
 }
 
 #[derive(Default, Debug)]
@@ -103,7 +105,6 @@ struct DebugData {
 #[derive(Debug, Clone)]
 struct PreparedInput {
     source: parser::InputSource,
-    metadata_path: PathBuf,
     feature_base_document: Vec<u8>,
 }
 
@@ -234,6 +235,16 @@ fn build_glb_export_options(
         smooth_normals: cli.smooth_normals,
         quantize_geometry: true,
         meshopt_compression: true,
+    }
+}
+
+fn build_tsv_export_options(cli: &crate::cli::Cli) -> cityjson_convert::TsvExportOptions {
+    cityjson_convert::TsvExportOptions {
+        include_null_rows: cli.tsv_include_null_rows,
+        include_hierarchy: cli.tsv_include_hierarchy,
+        include_cityjson_ordinal: cli.tsv_include_cityjson_ordinal,
+        include_metadata: false,
+        split_semantics: cli.tsv_split_semantics,
     }
 }
 
@@ -398,10 +409,7 @@ fn compute_root_enu_frame(
     RootEnuFrame::from_bbox(&crs_from, &root_bbox)
 }
 
-fn prepare_input(
-    cli: &crate::cli::Cli,
-    output_dir: &Path,
-) -> Result<PreparedInput, Box<dyn std::error::Error>> {
+fn prepare_input(cli: &crate::cli::Cli) -> Result<PreparedInput, Box<dyn std::error::Error>> {
     let resolved = cityjson_index::resolve_dataset(&cli.input, None)?;
     let inspection = resolved.inspect()?;
     let mut city_index =
@@ -414,13 +422,8 @@ fn prepare_input(
         city_index.reindex()?;
     }
     let feature_base_document = derive_base_document(&city_index)?;
-    let metadata_dir = output_dir.join("metadata");
-    fs::create_dir_all(&metadata_dir)?;
-    let metadata_path = metadata_dir.join("cjindex-metadata.city.json");
-    fs::write(&metadata_path, &feature_base_document)?;
     Ok(PreparedInput {
         source: parser::InputSource::from_cjindex_resolved(&resolved),
-        metadata_path,
         feature_base_document,
     })
 }
@@ -1324,6 +1327,105 @@ fn cleanup_and_update_extents(
     Ok(model)
 }
 
+fn write_tsv_metadata_fragment(
+    job: &TileExportJob,
+    model: &cityjson_lib::CityModel,
+    context: &TileWriteContext<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(&context.tsv_metadata_dir)?;
+    let mut metadata_model = model.clone();
+    let source_node_id = job.source_node_id.as_ref().ok_or_else(|| {
+        format!(
+            "TSV tile {} is missing its source quadtree node",
+            job.content_tile_coord
+        )
+    })?;
+    let qtree_node_id = spatial_structs::QuadTreeNodeId::from(source_node_id);
+    let qtree_node = context.quadtree.node(&qtree_node_id).ok_or_else(|| {
+        format!(
+            "TSV tile {} references missing source quadtree node {}",
+            job.content_tile_coord, qtree_node_id
+        )
+    })?;
+    let extent = qtree_node.bbox(&context.world.grid);
+    metadata_model
+        .metadata_mut()
+        .set_geographical_extent(BBox::new(
+            extent[0], extent[1], extent[2], extent[3], extent[4], extent[5],
+        ));
+    let metadata = cityjson_convert::tabulate_model_metadata(&metadata_model)?;
+    let output = File::create(tsv_metadata_fragment_path(
+        &context.tsv_metadata_dir,
+        &job.content_tile_coord,
+    ))?;
+    cityjson_convert::write_metadata_tsv(&metadata, output)?;
+    Ok(())
+}
+
+fn aggregate_tsv_metadata(
+    output_dir: &Path,
+    successful_jobs: &[TileExportJob],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata_dir = output_dir.join(".tyler-tsv-metadata");
+    let output_file = output_dir.join("metadata.tsv");
+    let file = File::create(&output_file)?;
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(b'\t')
+        .terminator(csv::Terminator::Any(b'\n'))
+        .from_writer(file);
+    let mut wrote_header = false;
+
+    for job in successful_jobs {
+        let fragment_path = tsv_metadata_fragment_path(&metadata_dir, &job.content_tile_coord);
+        if !fragment_path.exists() {
+            continue;
+        }
+
+        let mut reader = csv::ReaderBuilder::new()
+            .delimiter(b'\t')
+            .has_headers(false)
+            .from_path(&fragment_path)?;
+        let mut records = reader.records();
+        let Some(header) = records.next().transpose()? else {
+            continue;
+        };
+
+        if !wrote_header {
+            let mut aggregate_header = csv::StringRecord::from(vec!["tile_id", "cityobjects_path"]);
+            aggregate_header.extend(header.iter());
+            writer.write_record(&aggregate_header)?;
+            wrote_header = true;
+        }
+
+        for record in records {
+            let record = record?;
+            let tile_id = job.content_tile_coord.to_string();
+            let cityobjects_path = format!("t/{tile_id}/cityobjects.tsv");
+            let mut aggregate_record = csv::StringRecord::from(vec![tile_id, cityobjects_path]);
+            aggregate_record.extend(record.iter());
+            writer.write_record(&aggregate_record)?;
+        }
+    }
+
+    if !wrote_header {
+        writer.write_record(["tile_id", "cityobjects_path"])?;
+    }
+    writer.flush()?;
+
+    if metadata_dir.exists() {
+        fs::remove_dir_all(metadata_dir)?;
+    }
+    info!("Wrote aggregate TSV metadata to {}", output_file.display());
+    Ok(())
+}
+
+fn tsv_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> PathBuf {
+    metadata_dir.join(format!(
+        "{}-{}-{}.tsv",
+        tile_coord.level, tile_coord.x, tile_coord.y
+    ))
+}
+
 fn write_debug_tile_input(
     path_features_input_dir: &Path,
     file_name: &str,
@@ -1349,6 +1451,8 @@ struct TileWriteContext<'a> {
     object_attribute_types: BTreeMap<String, ObjectAttributeType>,
     include_parent_attributes: bool,
     cityjson_colors: BTreeMap<String, RGB>,
+    tsv_export_options: cityjson_convert::TsvExportOptions,
+    tsv_metadata_dir: PathBuf,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1370,6 +1474,7 @@ enum PreparedOutput {
     Obj(TileFilesPreparedOutput),
     Cityjson(TileFilesPreparedOutput),
     Cityjsonseq(TileFilesPreparedOutput),
+    Tsv(TileFilesPreparedOutput),
 }
 
 impl PreparedOutput {
@@ -1378,7 +1483,8 @@ impl PreparedOutput {
             PreparedOutput::Cesium3dTiles(prepared) => &prepared.source_crs,
             PreparedOutput::Obj(prepared)
             | PreparedOutput::Cityjson(prepared)
-            | PreparedOutput::Cityjsonseq(prepared) => &prepared.source_crs,
+            | PreparedOutput::Cityjsonseq(prepared)
+            | PreparedOutput::Tsv(prepared) => &prepared.source_crs,
         }
     }
 
@@ -1387,7 +1493,8 @@ impl PreparedOutput {
             PreparedOutput::Cesium3dTiles(prepared) => Some(&prepared.root_enu_frame),
             PreparedOutput::Obj(_)
             | PreparedOutput::Cityjson(_)
-            | PreparedOutput::Cityjsonseq(_) => None,
+            | PreparedOutput::Cityjsonseq(_)
+            | PreparedOutput::Tsv(_) => None,
         }
     }
 }
@@ -1794,6 +1901,8 @@ impl OutputFormatBackend for CityjsonBackend {
 
 struct CityjsonseqBackend;
 
+struct TsvBackend;
+
 impl OutputFormatBackend for CityjsonseqBackend {
     fn prepare(
         &self,
@@ -1873,12 +1982,76 @@ impl OutputFormatBackend for CityjsonseqBackend {
     }
 }
 
+impl OutputFormatBackend for TsvBackend {
+    fn prepare(
+        &self,
+        _cli: &crate::cli::Cli,
+        world: &parser::World,
+        quadtree: &spatial_structs::QuadTree,
+        _grid_cellsize: u32,
+        _geometric_error_factor: f64,
+        _debug_data_output_path: &Path,
+    ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
+        Ok(PreparedOutput::Tsv(TileFilesPreparedOutput {
+            export_jobs: quadtree_leaf_tile_export_jobs(world, quadtree),
+            source_crs: format!("EPSG:{}", world.crs.to_epsg()?),
+        }))
+    }
+
+    fn jobs(&self, prepared: &PreparedOutput) -> Vec<TileExportJob> {
+        let PreparedOutput::Tsv(prepared) = prepared else {
+            return Vec::new();
+        };
+        prepared.export_jobs.clone()
+    }
+
+    fn write_tile(
+        &self,
+        job: &TileExportJob,
+        model: &cityjson_lib::CityModel,
+        context: &TileWriteContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let output_dir = context
+            .output_tiles_dir
+            .join(job.content_tile_coord.to_string());
+        let mut options = context.tsv_export_options.clone();
+        options.include_metadata = false;
+        cityjson_convert::convert_to_tsv(model, &output_dir, &options)?;
+
+        write_tsv_metadata_fragment(job, model, context)?;
+
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        cli: &crate::cli::Cli,
+        _quadtree: &spatial_structs::QuadTree,
+        successful_jobs: &[TileExportJob],
+        failed_jobs: &[TileExportJob],
+        _prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Skipped {} failed TSV tile outputs", failed_jobs.len());
+        aggregate_tsv_metadata(&cli.output, successful_jobs)?;
+        Ok(())
+    }
+
+    fn write_manifest_only(
+        &self,
+        _cli: &crate::cli::Cli,
+        _prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+}
+
 fn output_format_backend(kind: OutputFormatKind) -> Box<dyn OutputFormatBackend> {
     match kind {
         OutputFormatKind::Cesium3dTiles => Box::new(Cesium3dTilesBackend),
         OutputFormatKind::Obj => Box::new(ObjBackend),
         OutputFormatKind::Cityjson => Box::new(CityjsonBackend),
         OutputFormatKind::Cityjsonseq => Box::new(CityjsonseqBackend),
+        OutputFormatKind::Tsv => Box::new(TsvBackend),
     }
 }
 
@@ -2037,7 +2210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (they don't implement Copy). When we move a value, we explicitly transfer
     // ownership of the value (eg cli.object_type).
     let prepared_input = if debug_data.world.is_none() {
-        Some(prepare_input(&cli, &cli.output)?)
+        Some(prepare_input(&cli)?)
     } else {
         None
     };
@@ -2052,7 +2225,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("prepared input must exist when world is built from source");
             let mut world = parser::World::from_cjindex(
                 prepared_input.source.clone(),
-                prepared_input.metadata_path.clone(),
                 prepared_input.feature_base_document.clone(),
                 grid_cellsize,
                 cityobject_types,
@@ -2171,6 +2343,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             object_attribute_types: object_attribute_types.clone(),
             include_parent_attributes: cli.include_parent_attributes,
             cityjson_colors: build_cityjson_object_colors(&cli),
+            tsv_export_options: build_tsv_export_options(&cli),
+            tsv_metadata_dir: cli.output.join(".tyler-tsv-metadata"),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
@@ -2336,7 +2510,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -2897,7 +3070,6 @@ mod tests {
         let low_filter = build_feature_filter(low_types.as_ref(), &low_lods);
         let world_low = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path.clone(),
             feature_base_document.clone(),
             200,
             low_types,
@@ -2912,7 +3084,6 @@ mod tests {
         let high_filter = build_feature_filter(high_types.as_ref(), &high_lods);
         let world_high = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             high_types,
@@ -3273,7 +3444,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3328,7 +3498,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3390,7 +3559,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3441,7 +3609,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &lods);
         let Err(error) = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3509,7 +3676,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3555,7 +3721,6 @@ mod tests {
         let feature_filter = build_feature_filter(None, &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             None,
@@ -3607,7 +3772,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,
@@ -3704,7 +3868,6 @@ mod tests {
         let feature_filter = build_feature_filter(cityobject_types.as_ref(), &BTreeMap::new());
         let mut world = parser::World::from_cjindex(
             parser::InputSource::from_cjindex_resolved(&resolved),
-            metadata_path,
             feature_base_document,
             200,
             cityobject_types,

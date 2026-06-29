@@ -46,7 +46,6 @@ pub struct World {
     pub features: FeatureSet,
     pub feature_base_document: Vec<u8>,
     pub grid: crate::spatial_structs::SquareGrid,
-    pub path_metadata: PathBuf,
     pub input_source: InputSource,
 }
 
@@ -213,7 +212,6 @@ impl InputSource {
 impl World {
     pub fn from_cjindex(
         input_source: InputSource,
-        path_metadata: PathBuf,
         feature_base_document: Vec<u8>,
         cellsize: u32,
         cityobject_types: Option<Vec<CityObjectType>>,
@@ -300,7 +298,6 @@ impl World {
             feature_filter,
             grid,
             cityobject_types,
-            path_metadata,
             input_source,
         })
     }
