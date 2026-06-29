@@ -13,7 +13,7 @@ use cityjson_lib::json;
 /// The corpus checkout is intentionally external to this crate because the
 /// fixture is shared across `CityJSON` implementations. `CITYJSON_CORPUS_DIR` can
 /// override the default sibling-checkout location.
-fn corpus_fixture() -> PathBuf {
+fn corpus_fixture() -> Option<PathBuf> {
     let corpus_root = env::var_os("CITYJSON_CORPUS_DIR").map_or_else(
         || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,12 +30,7 @@ fn corpus_fixture() -> PathBuf {
         .join("cityjson_fake_complete")
         .join("cityjson_fake_complete.city.json");
 
-    assert!(
-        fixture.is_file(),
-        "cityjson-corpus not found at {}; set CITYJSON_CORPUS_DIR to the corpus checkout containing cases/conformance/v2_0/cityjson_fake_complete/cityjson_fake_complete.city.json",
-        corpus_root.display()
-    );
-    fixture
+    fixture.is_file().then_some(fixture)
 }
 
 /// Returns the schema index for a named dynamic column used by a test assertion.
@@ -92,13 +87,21 @@ fn validate_value(cell: Value<'_, '_>) {
 /// Assertions: tabulation succeeds; row count, order, and identifiers match the
 /// source model; every row has one resolvable value per schema column; all lazy
 /// nested values can be traversed; and representative fixed and dynamic values
-/// reach the expected row.
+/// reach the expected row. If the corpus checkout is absent, the test is skipped
+/// instead of failing the suite.
 ///
 /// Invariants protected: one row per `CityObject` in model order, positional
 /// schema/value alignment, and end-to-end convertibility of the complete fixture.
 #[test]
 fn tabulates_cityjson_fake_complete() {
-    let model = json::from_file(corpus_fixture()).expect("load cityjson_fake_complete fixture");
+    let Some(fixture) = corpus_fixture() else {
+        eprintln!(
+            "skipping tabulates_cityjson_fake_complete: set CITYJSON_CORPUS_DIR or checkout cityjson-corpus next to the workspace"
+        );
+        return;
+    };
+
+    let model = json::from_file(fixture).expect("load cityjson_fake_complete fixture");
     let table = tabulate_cityobjects(&model).expect("tabulate CityObjects");
     let rows = table.rows().collect::<Vec<_>>();
 
