@@ -32,6 +32,8 @@
   PROJ and bundled mode does not imply native PROJ networking.
 - CityJSON color editing support, including `--color-*` selectors for CityJSON
   and CityJSONSeq output.
+- TSV format output in tyler and cityjson-convert with `--format tsv`. Format specific parameters are set with `--tsv-*`.
+- Tabular projection for a CityModel, which supports TSV, GeoPackage and other tabular formats. Implemented in `cityjson-convert` `tabular` module.
 
 ### Fixed
 
