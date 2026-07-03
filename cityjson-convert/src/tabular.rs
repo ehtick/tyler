@@ -108,9 +108,10 @@
 //!
 //! Physical names start with the column origin and join path segments with `__`.
 //! Within a path segment, `%` is escaped as `%25` and literal `__` as `%5F%5F`.
-//! Conflicts are resolved deterministically with `__2`, `__3`, and later
-//! suffixes. Null-only fields do not produce columns. Attribute columns precede
-//! extra columns, and fields are ordered lexicographically at every map level.
+//! Conflicts are resolved case-insensitively and deterministically with `__2`,
+//! `__3`, and later suffixes. Null-only fields do not produce columns.
+//! Attribute columns precede extra columns, and fields are ordered
+//! lexicographically at every map level.
 //!
 //! # Invariants
 //!
@@ -122,7 +123,7 @@
 //! unrelated type. The table and every value derived from it are bounded by
 //! the lifetime of the source model.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
 
 use anyhow::{bail, Context, Result};
@@ -1776,6 +1777,7 @@ fn build_dynamic_schema<'model>(
     let mut columns = Vec::new();
     let mut path = Vec::new();
     let mut name_buffer = String::new();
+    let mut used_names = reserved_name_set(reserved_names);
     for (origin, schema) in groups {
         flatten_struct_schema(
             origin,
@@ -1784,7 +1786,7 @@ fn build_dynamic_schema<'model>(
             false,
             &mut name_buffer,
             &mut columns,
-            reserved_names,
+            &mut used_names,
         );
     }
     TableSchema { columns }
@@ -1798,7 +1800,7 @@ fn flatten_struct_schema<'model>(
     inherited_nullable: bool,
     name_buffer: &mut String,
     columns: &mut Vec<ColumnSchema<'model>>,
-    reserved_names: &[&str],
+    used_names: &mut HashSet<String>,
 ) {
     for field in schema.fields.into_values() {
         path.push(field.name);
@@ -1813,7 +1815,7 @@ fn flatten_struct_schema<'model>(
                     nullable,
                     name_buffer,
                     columns,
-                    reserved_names,
+                    used_names,
                 );
             }
             logical_type => {
@@ -1822,7 +1824,7 @@ fn flatten_struct_schema<'model>(
                 columns.push(ColumnSchema {
                     origin,
                     path: path.clone(),
-                    name: unique_column_name(name_buffer, columns, reserved_names),
+                    name: unique_column_name(name_buffer, used_names),
                     logical_type,
                     nullable,
                 });
@@ -1865,24 +1867,31 @@ fn push_escaped_path_segment(output: &mut String, segment: &str) {
     output.push_str(remainder);
 }
 
+fn reserved_name_set(reserved_names: &[&str]) -> HashSet<String> {
+    reserved_names
+        .iter()
+        .map(|name| column_name_key(name))
+        .collect()
+}
+
 /// Returns the first column name not used by fixed or dynamic columns.
-fn unique_column_name(base: &str, columns: &[ColumnSchema<'_>], reserved_names: &[&str]) -> String {
-    if !column_name_exists(base, columns, reserved_names) {
+fn unique_column_name(base: &str, used_names: &mut HashSet<String>) -> String {
+    if used_names.insert(column_name_key(base)) {
         return base.to_string();
     }
+
     let mut suffix = 2;
     loop {
         let candidate = format!("{base}__{suffix}");
-        if !column_name_exists(&candidate, columns, reserved_names) {
+        if used_names.insert(column_name_key(&candidate)) {
             return candidate;
         }
         suffix += 1;
     }
 }
 
-/// Reports whether a physical name is reserved or already emitted.
-fn column_name_exists(name: &str, columns: &[ColumnSchema<'_>], reserved_names: &[&str]) -> bool {
-    reserved_names.contains(&name) || columns.iter().any(|column| column.name == name)
+fn column_name_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 /// Follows a flattened column path through one optional source map.

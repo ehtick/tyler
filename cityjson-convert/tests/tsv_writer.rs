@@ -55,6 +55,44 @@ fn temp_output_dir(name: &str) -> PathBuf {
 }
 
 #[test]
+fn writes_cityobjects_tsv_with_case_insensitive_collisions() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{
+                        "eindRegistratie":"first",
+                        "eindregistratie":"second"
+                    }
+                }
+            },
+            "vertices":[]
+        }"#,
+    )
+    .expect("parse collision CityJSON");
+    let table = tabulate_cityobjects(&model).unwrap();
+
+    let mut bytes = Vec::new();
+    write_cityobjects_tsv(&table, &TsvWriteOptions::default(), &mut bytes).unwrap();
+    let rows = parse_tsv(&bytes);
+
+    assert_eq!(
+        rows[0],
+        [
+            "cityobject_id",
+            "cityobject_type",
+            "attributes__eindRegistratie",
+            "attributes__eindregistratie__2"
+        ]
+    );
+    assert_eq!(rows[1][2], "first");
+    assert_eq!(rows[1][3], "second");
+}
+
+#[test]
 fn omits_geometry_ref_attributes_from_cityobjects_tsv() {
     let mut model = json::from_slice(
         br#"{

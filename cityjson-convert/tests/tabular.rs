@@ -260,7 +260,7 @@ fn borrows_source_values_and_traverses_nested_values_lazily() {
 }
 
 #[test]
-fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
+fn tabulates_cityobject_extra_without_prefix_and_resolves_case_insensitive_collisions() {
     let model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -270,7 +270,7 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
                     "type":"Building",
                     "attributes":{"name":"Library"},
                     "name":"extra-name",
-                    "cityobject_id":"extra-id"
+                    "CityObject_ID":"extra-id"
                 }
             },
             "vertices":[]
@@ -280,7 +280,7 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
     let table = tabulate_cityobjects(&model).unwrap();
 
     let extra_name = column_index(&table, "name");
-    let fixed_conflict = column_index(&table, "cityobject_id__2");
+    let fixed_conflict = column_index(&table, "CityObject_ID__2");
     assert_eq!(
         table.schema().columns[extra_name].origin,
         ColumnOrigin::Extra
@@ -298,6 +298,40 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
     assert!(matches!(
         row.value(fixed_conflict).unwrap().unwrap(),
         Value::Utf8("extra-id")
+    ));
+}
+
+#[test]
+fn tabulates_cityobject_attributes_with_case_insensitive_collisions() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{
+                        "eindRegistratie":"first",
+                        "eindregistratie":"second"
+                    }
+                }
+            },
+            "vertices":[]
+        }"#,
+    )
+    .expect("parse collision CityJSON");
+    let table = tabulate_cityobjects(&model).unwrap();
+
+    let first = column_index(&table, "attributes__eindRegistratie");
+    let second = column_index(&table, "attributes__eindregistratie__2");
+    let row = table.rows().next().unwrap();
+    assert!(matches!(
+        row.value(first).unwrap().unwrap(),
+        Value::Utf8("first")
+    ));
+    assert!(matches!(
+        row.value(second).unwrap().unwrap(),
+        Value::Utf8("second")
     ));
 }
 

@@ -266,6 +266,65 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
 }
 
 #[test]
+fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{
+                        "eindRegistratie":"first",
+                        "eindregistratie":"second"
+                    },
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse collision CityJSON");
+    let output = stable_output_path("convert_to_gpkg_case_insensitive_collisions");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(&model, &output, &GpkgExportOptions::default())
+        .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    let column_names = conn
+        .prepare("SELECT name FROM pragma_table_info('building_multisurface') ORDER BY cid")
+        .expect("prepare column query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query column names")
+        .map(|row| row.expect("read column name"))
+        .collect::<Vec<_>>();
+    assert!(column_names.contains(&"attributes__eindRegistratie".to_string()));
+    assert!(column_names.contains(&"attributes__eindregistratie__2".to_string()));
+
+    let (first, second): (String, String) = conn
+        .query_row(
+            r#"SELECT "attributes__eindRegistratie", "attributes__eindregistratie__2" FROM building_multisurface LIMIT 1"#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read collision row");
+    assert_eq!(first, "first");
+    assert_eq!(second, "second");
+
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
 fn omits_geometry_ref_attributes_from_feature_layers() {
     let mut model = json::from_slice(
         br#"{
