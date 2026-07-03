@@ -22,6 +22,7 @@ const GPKG_USER_VERSION: i32 = 10300;
 const GPB_MAGIC: &[u8; 2] = b"GP";
 const GPKG_GEOM_COLUMN_NAME: &str = "geom";
 const GPKG_METADATA_STANDARD_URI: &str = "https://www.geopackage.org/spec/#extension_metadata";
+const GPKG_CRS_WKT_EXTENSION_URI: &str = "https://www.geopackage.org/spec/#extension_crs_wkt";
 const GPKG_METADATA_REFERENCE_SCOPE: &str = "dataset";
 const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
@@ -93,7 +94,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     let last_change: String = tx.query_row(SQLITE_LAST_CHANGE_SQL, [], |row| row.get(0))?;
 
     create_core_tables(&tx)?;
-    insert_standard_spatial_ref_systems(&tx, resolved_srs.srs_id, &resolved_srs.label)?;
+    insert_standard_spatial_ref_systems(&tx, &resolved_srs)?;
 
     let mut used_table_names = HashSet::new();
     let mut feature_layers: BTreeMap<String, FeatureLayerState> = BTreeMap::new();
@@ -114,13 +115,13 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
         &mut relations,
     )?;
 
-    create_relation_table(&tx)?;
+    create_relation_table(&tx, &last_change)?;
     insert_cityobject_relations(&tx, &relations)?;
 
     if let Some((semantics_table, assignment_table)) = semantics {
-        create_semantics_table(&tx, semantics_table.schema())?;
+        create_semantics_table(&tx, semantics_table.schema(), &last_change)?;
         insert_semantics_rows(&tx, &semantics_table)?;
-        create_semantic_relations_table(&tx)?;
+        create_semantic_relations_table(&tx, &last_change)?;
         insert_semantic_relations(&tx, &assignment_table)?;
     }
 
@@ -224,6 +225,7 @@ fn export_feature_layers(
 struct ResolvedSrs {
     srs_id: i32,
     label: String,
+    definition: String,
 }
 
 fn resolve_srs(model: &CityModel, options: &GpkgExportOptions) -> Result<ResolvedSrs> {
@@ -231,10 +233,7 @@ fn resolve_srs(model: &CityModel, options: &GpkgExportOptions) -> Result<Resolve
         if let Some(reference_system) = metadata.reference_system() {
             let reference_system = reference_system.to_string();
             if let Some(srs_id) = parse_epsg_srs_id(&reference_system) {
-                return Ok(ResolvedSrs {
-                    srs_id,
-                    label: reference_system,
-                });
+                return resolved_epsg_srs(srs_id, reference_system);
             }
         }
     }
@@ -248,10 +247,73 @@ fn resolve_srs(model: &CityModel, options: &GpkgExportOptions) -> Result<Resolve
         bail!("could not parse EPSG code from --gpkg-output-crs value {output_crs:?}");
     };
 
+    resolved_epsg_srs(srs_id, output_crs.clone())
+}
+
+fn resolved_epsg_srs(srs_id: i32, label: String) -> Result<ResolvedSrs> {
+    let definition = epsg_wkt_definition(srs_id)
+        .with_context(|| format!("resolve EPSG:{srs_id} WKT definition for GeoPackage SRS"))?;
     Ok(ResolvedSrs {
         srs_id,
-        label: output_crs.clone(),
+        label,
+        definition,
     })
+}
+
+#[cfg(any(feature = "proj-system", feature = "proj-bundled"))]
+fn epsg_wkt_definition(srs_id: i32) -> Result<String> {
+    use std::ffi::{CStr, CString};
+
+    use proj_sys::{
+        proj_as_wkt, proj_context_create, proj_context_destroy, proj_create_from_database,
+        proj_destroy, PJ_CATEGORY_PJ_CATEGORY_CRS, PJ_WKT_TYPE_PJ_WKT2_2019,
+    };
+
+    let auth_name = CString::new("EPSG")?;
+    let code = CString::new(srs_id.to_string())?;
+    let ctx = unsafe { proj_context_create() };
+    if ctx.is_null() {
+        bail!("PROJ could not create a context");
+    }
+
+    let object = unsafe {
+        proj_create_from_database(
+            ctx,
+            auth_name.as_ptr(),
+            code.as_ptr(),
+            PJ_CATEGORY_PJ_CATEGORY_CRS,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if object.is_null() {
+        unsafe { proj_context_destroy(ctx) };
+        bail!("EPSG:{srs_id} was not found in the PROJ database");
+    }
+
+    let wkt = unsafe { proj_as_wkt(ctx, object, PJ_WKT_TYPE_PJ_WKT2_2019, std::ptr::null()) };
+    let result = if wkt.is_null() {
+        Err(anyhow::anyhow!(
+            "PROJ could not export EPSG:{srs_id} as WKT2"
+        ))
+    } else {
+        Ok(unsafe { CStr::from_ptr(wkt) }.to_str()?.to_string())
+    };
+
+    unsafe {
+        proj_destroy(object);
+        proj_context_destroy(ctx);
+    }
+    result
+}
+
+#[cfg(not(any(feature = "proj-system", feature = "proj-bundled")))]
+fn epsg_wkt_definition(srs_id: i32) -> Result<String> {
+    if srs_id == 4326 {
+        Ok("GEOGCS[\"WGS 84\",DATUM[\"World Geodetic System 1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]".to_string())
+    } else {
+        bail!("GeoPackage SRS WKT export for EPSG:{srs_id} requires the proj-system or proj-bundled feature")
+    }
 }
 
 fn parse_epsg_srs_id(value: &str) -> Option<i32> {
@@ -283,7 +345,8 @@ fn create_core_tables(tx: &Transaction<'_>) -> Result<()> {
             organization TEXT NOT NULL,
             organization_coordsys_id INTEGER NOT NULL,
             definition TEXT NOT NULL,
-            description TEXT NOT NULL
+            description TEXT NOT NULL,
+            definition_12_063 TEXT NOT NULL
         );
         CREATE TABLE gpkg_contents (
             table_name TEXT NOT NULL PRIMARY KEY,
@@ -318,22 +381,24 @@ fn create_core_tables(tx: &Transaction<'_>) -> Result<()> {
         )",
         [],
     )?;
+    tx.execute(
+        "INSERT INTO gpkg_extensions (
+            table_name, column_name, extension_name, definition, scope
+         ) VALUES ('gpkg_spatial_ref_sys', 'definition_12_063', 'gpkg_crs_wkt', ?1, 'read-write')",
+        params![GPKG_CRS_WKT_EXTENSION_URI],
+    )?;
     Ok(())
 }
 
-fn insert_standard_spatial_ref_systems(
-    tx: &Transaction<'_>,
-    custom_srs_id: i32,
-    custom_label: &str,
-) -> Result<()> {
-    let wgs84_wkt = "GEOGCS[\"WGS 84\",DATUM[\"World Geodetic System 1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]";
+fn insert_standard_spatial_ref_systems(tx: &Transaction<'_>, custom: &ResolvedSrs) -> Result<()> {
+    let wgs84_definition = epsg_wkt_definition(4326).context("resolve EPSG:4326 WKT definition")?;
     for (srs_name, srs_id, organization, organization_coordsys_id, definition, description) in [
         (
             "Undefined Cartesian",
             -1,
             "NONE",
             -1,
-            "undefined",
+            "undefined".to_string(),
             "undefined cartesian coordinate reference system",
         ),
         (
@@ -341,7 +406,7 @@ fn insert_standard_spatial_ref_systems(
             0,
             "NONE",
             0,
-            "undefined",
+            "undefined".to_string(),
             "undefined geographic coordinate reference system",
         ),
         (
@@ -349,22 +414,23 @@ fn insert_standard_spatial_ref_systems(
             4326,
             "EPSG",
             4326,
-            wgs84_wkt,
+            wgs84_definition,
             "WGS 84 geodetic coordinate reference system",
         ),
         (
-            custom_label,
-            custom_srs_id,
+            custom.label.as_str(),
+            custom.srs_id,
             "EPSG",
-            custom_srs_id,
-            "undefined",
-            custom_label,
+            custom.srs_id,
+            custom.definition.clone(),
+            custom.label.as_str(),
         ),
     ] {
         tx.execute(
             "INSERT OR IGNORE INTO gpkg_spatial_ref_sys (
-                srs_name, srs_id, organization, organization_coordsys_id, definition, description
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                srs_name, srs_id, organization, organization_coordsys_id,
+                definition, description, definition_12_063
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 srs_name,
                 srs_id,
@@ -372,6 +438,7 @@ fn insert_standard_spatial_ref_systems(
                 organization_coordsys_id,
                 definition,
                 description,
+                definition,
             ],
         )?;
     }
@@ -393,7 +460,11 @@ fn create_feature_table(
         "cityobject_type TEXT NOT NULL".to_string(),
         "geometry_type TEXT NOT NULL".to_string(),
         "lod TEXT".to_string(),
-        format!("{} BLOB NOT NULL", quote_ident(GPKG_GEOM_COLUMN_NAME)),
+        format!(
+            "{} {} NOT NULL",
+            quote_ident(GPKG_GEOM_COLUMN_NAME),
+            geometry_type_name
+        ),
     ];
     columns.extend(cityobjects.schema().columns.iter().map(|column| {
         format!(
@@ -438,7 +509,7 @@ fn create_address_table(
         "id INTEGER PRIMARY KEY".to_string(),
         "cityobject_id TEXT NOT NULL".to_string(),
         "cityobject_type TEXT NOT NULL".to_string(),
-        format!("{} BLOB", quote_ident(GPKG_GEOM_COLUMN_NAME)),
+        format!("{} MULTIPOINT", quote_ident(GPKG_GEOM_COLUMN_NAME)),
     ];
     columns.extend(addresses.schema().columns.iter().map(|column| {
         format!(
@@ -569,11 +640,12 @@ fn insert_feature_row(
             .map(|value| sqlite_value_from_tabular_value(model, value?))
             .collect::<Result<Vec<_>>>()?,
     );
-    tx.execute(insert_sql, params_from_iter(params))?;
+    let mut statement = tx.prepare_cached(insert_sql)?;
+    statement.execute(params_from_iter(params))?;
     Ok(())
 }
 
-fn create_relation_table(tx: &Transaction<'_>) -> Result<()> {
+fn create_relation_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE cityobject_relations (
             parent_cityobject_id TEXT NOT NULL,
@@ -581,7 +653,12 @@ fn create_relation_table(tx: &Transaction<'_>) -> Result<()> {
             PRIMARY KEY (parent_cityobject_id, child_cityobject_id)
         );",
     )?;
-    Ok(())
+    register_attribute_table(
+        tx,
+        "cityobject_relations",
+        "cityobject_relations",
+        last_change,
+    )
 }
 
 fn insert_cityobject_relations(
@@ -597,7 +674,11 @@ fn insert_cityobject_relations(
     Ok(())
 }
 
-fn create_semantics_table(tx: &Transaction<'_>, schema: &crate::TableSchema<'_>) -> Result<()> {
+fn create_semantics_table(
+    tx: &Transaction<'_>,
+    schema: &crate::TableSchema<'_>,
+    last_change: &str,
+) -> Result<()> {
     let mut columns = vec![
         "semantic_id INTEGER PRIMARY KEY".to_string(),
         "semantic_type TEXT NOT NULL".to_string(),
@@ -612,7 +693,7 @@ fn create_semantics_table(tx: &Transaction<'_>, schema: &crate::TableSchema<'_>)
         )
     }));
     tx.execute_batch(&format!("CREATE TABLE semantics ({});", columns.join(", ")))?;
-    Ok(())
+    register_attribute_table(tx, "semantics", "semantics", last_change)
 }
 
 fn insert_semantics_rows(tx: &Transaction<'_>, semantics: &SemanticTable<'_>) -> Result<()> {
@@ -662,7 +743,7 @@ fn semantic_insert_sql(schema: &crate::TableSchema<'_>) -> String {
     )
 }
 
-fn create_semantic_relations_table(tx: &Transaction<'_>) -> Result<()> {
+fn create_semantic_relations_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE semantic_relations (
             semantic_id INTEGER,
@@ -680,6 +761,21 @@ fn create_semantic_relations_table(tx: &Transaction<'_>) -> Result<()> {
             shell_ix INTEGER,
             surface_ix INTEGER
         );",
+    )?;
+    register_attribute_table(tx, "semantic_relations", "semantic_relations", last_change)
+}
+
+fn register_attribute_table(
+    tx: &Transaction<'_>,
+    table_name: &str,
+    description: &str,
+    last_change: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO gpkg_contents (
+            table_name, data_type, identifier, description, last_change
+         ) VALUES (?1, 'attributes', ?2, ?3, ?4)",
+        params![table_name, table_name, description, last_change],
     )?;
     Ok(())
 }
@@ -946,8 +1042,8 @@ fn wrap_geopackage_binary(
     }
     out.push(flags);
     out.extend_from_slice(&srs_id.to_le_bytes());
-    if let Some(envelope) = envelope {
-        for value in envelope {
+    if let Some([min_x, min_y, min_z, max_x, max_y, max_z]) = envelope {
+        for value in [min_x, max_x, min_y, max_y, min_z, max_z] {
             out.extend_from_slice(&value.to_le_bytes());
         }
     }

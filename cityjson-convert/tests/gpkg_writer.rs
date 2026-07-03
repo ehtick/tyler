@@ -40,6 +40,23 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     .is_ok()
 }
 
+fn table_column_type(conn: &Connection, table: &str, column: &str) -> String {
+    conn.query_row(
+        &format!("SELECT type FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |row| row.get(0),
+    )
+    .expect("read column type")
+}
+
+fn read_gpb_envelope(blob: &[u8]) -> [f64; 6] {
+    let mut values = [0.0; 6];
+    for (ix, chunk) in blob[8..56].chunks_exact(8).enumerate() {
+        values[ix] = f64::from_le_bytes(chunk.try_into().expect("envelope value bytes"));
+    }
+    values
+}
+
 fn read_blob_prefix(conn: &Connection, table: &str) -> Vec<u8> {
     conn.query_row(
         &format!("SELECT geom FROM \"{table}\" LIMIT 1"),
@@ -119,6 +136,10 @@ fn assert_building_layer_metadata(conn: &Connection) {
         .expect("read geometry column metadata");
     assert_eq!(geometry_type_name, "MULTIPOLYGON");
     assert_eq!((z, m), (1, 0));
+    assert_eq!(
+        table_column_type(conn, "building_multisurface", "geom"),
+        "MULTIPOLYGON"
+    );
 
     let (min_x, min_y, max_x, max_y): (f64, f64, f64, f64) = conn
         .query_row(
@@ -140,10 +161,44 @@ fn assert_building_blob_header(conn: &Connection) {
         i32::from_le_bytes(blob[4..8].try_into().expect("srs id bytes")),
         7415
     );
+    assert_eq!(read_gpb_envelope(&blob), [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
     assert_eq!(
         u32::from_le_bytes(blob[57..61].try_into().expect("wkb type bytes")),
         1006
     );
+}
+
+fn assert_crs_wkt_metadata(conn: &Connection) {
+    let (definition, definition_12_063): (String, String) = conn
+        .query_row(
+            "SELECT definition, definition_12_063 FROM gpkg_spatial_ref_sys WHERE srs_id = 7415",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read CRS definition");
+    assert_ne!(definition, "undefined");
+    assert_eq!(definition, definition_12_063);
+    assert!(definition.contains("EPSG"));
+
+    let extension_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM gpkg_extensions WHERE extension_name = 'gpkg_crs_wkt' AND table_name = 'gpkg_spatial_ref_sys' AND column_name = 'definition_12_063'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read CRS WKT extension row");
+    assert_eq!(extension_count, 1);
+}
+
+fn assert_attribute_table_registered(conn: &Connection, table_name: &str) {
+    let data_type: String = conn
+        .query_row(
+            "SELECT data_type FROM gpkg_contents WHERE table_name = ?1",
+            [table_name],
+            |row| row.get(0),
+        )
+        .expect("read gpkg_contents row");
+    assert_eq!(data_type, "attributes");
 }
 
 fn assert_single_cityobject_relation(conn: &Connection) {
@@ -182,7 +237,9 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
     assert_layers_relations_metadata_tables(&conn);
     assert_building_layer_metadata(&conn);
     assert_building_blob_header(&conn);
+    assert_crs_wkt_metadata(&conn);
     assert_single_cityobject_relation(&conn);
+    assert_attribute_table_registered(&conn, "cityobject_relations");
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");
@@ -250,6 +307,8 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
     assert!(table_exists(&conn, "semantic_relations"));
     assert_eq!(table_row_count(&conn, "semantics"), 2);
     assert_eq!(table_row_count(&conn, "semantic_relations"), 3);
+    assert_attribute_table_registered(&conn, "semantics");
+    assert_attribute_table_registered(&conn, "semantic_relations");
 
     let inserted_lod: String = conn
         .query_row(
@@ -461,6 +520,7 @@ fn converts_split_address_to_multipoint_feature_layer() {
         )
         .expect("read address geometry column metadata");
     assert_eq!(geometry_type_name, "MULTIPOINT");
+    assert_eq!(table_column_type(&conn, "addresses", "geom"), "MULTIPOINT");
 
     let (street, blob): (String, Vec<u8>) = conn
         .query_row("SELECT street, geom FROM addresses LIMIT 1", [], |row| {
