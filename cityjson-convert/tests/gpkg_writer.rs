@@ -49,9 +49,8 @@ fn read_blob_prefix(conn: &Connection, table: &str) -> Vec<u8> {
     .expect("read geometry blob")
 }
 
-#[test]
-fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
-    let model = json::from_slice(
+fn layers_relations_metadata_model() -> cityjson_lib::CityModel {
+    json::from_slice(
         br#"{
             "type":"CityJSON",
             "version":"2.0",
@@ -76,19 +75,91 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
                     }]
                 }
             },
-            "vertices":[
-                [0,0,0],
-                [1,0,0],
-                [0,1,0],
-                [1,1,0]
-            ],
+            "vertices":[[0,0,0],[1,0,0],[0,1,0],[1,1,0]],
             "metadata":{
                 "identifier":"dataset-1",
                 "referenceSystem":"https://www.opengis.net/def/crs/EPSG/0/7415"
             }
         }"#,
     )
-    .expect("parse inline CityJSON");
+    .expect("parse inline CityJSON")
+}
+
+fn assert_layers_relations_metadata_tables(conn: &Connection) {
+    let tables = read_table_names(conn);
+    for expected in [
+        "gpkg_contents",
+        "gpkg_geometry_columns",
+        "gpkg_metadata",
+        "gpkg_metadata_reference",
+        "gpkg_spatial_ref_sys",
+        "cityobject_relations",
+        "building_multisurface",
+        "buildingroom_multisurface",
+    ] {
+        assert!(
+            tables.iter().any(|table| table == expected),
+            "missing table {expected}"
+        );
+    }
+
+    assert_eq!(table_row_count(conn, "cityobject_relations"), 1);
+    assert_eq!(table_row_count(conn, "gpkg_metadata"), 1);
+    assert_eq!(table_row_count(conn, "gpkg_metadata_reference"), 1);
+    assert_eq!(table_row_count(conn, "building_multisurface"), 1);
+}
+
+fn assert_building_layer_metadata(conn: &Connection) {
+    let (geometry_type_name, z, m): (String, i64, i64) = conn
+        .query_row(
+            "SELECT geometry_type_name, z, m FROM gpkg_geometry_columns WHERE table_name = 'building_multisurface'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read geometry column metadata");
+    assert_eq!(geometry_type_name, "MULTIPOLYGON");
+    assert_eq!((z, m), (1, 0));
+
+    let (min_x, min_y, max_x, max_y): (f64, f64, f64, f64) = conn
+        .query_row(
+            "SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name = 'building_multisurface'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read layer extent");
+    assert_eq!((min_x, min_y, max_x, max_y), (0.0, 0.0, 1.0, 1.0));
+}
+
+fn assert_building_blob_header(conn: &Connection) {
+    let blob = read_blob_prefix(conn, "building_multisurface");
+    assert_eq!(&blob[0..2], b"GP");
+    assert_eq!(blob[2], 0);
+    assert_eq!(blob[3] & 0b0000_0001, 0b0000_0001);
+    assert_eq!(blob[3] & 0b0000_0100, 0b0000_0100);
+    assert_eq!(
+        i32::from_le_bytes(blob[4..8].try_into().expect("srs id bytes")),
+        7415
+    );
+    assert_eq!(
+        u32::from_le_bytes(blob[57..61].try_into().expect("wkb type bytes")),
+        1006
+    );
+}
+
+fn assert_single_cityobject_relation(conn: &Connection) {
+    let relation: (String, String) = conn
+        .query_row(
+            "SELECT parent_cityobject_id, child_cityobject_id FROM cityobject_relations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read relation row");
+    assert_eq!(relation, ("building".to_string(), "room".to_string()));
+}
+
+#[test]
+fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
+    let model = layers_relations_metadata_model();
     let output = stable_output_path("convert_to_gpkg_layers_relations_metadata");
     if output.exists() {
         fs::remove_file(&output).expect("remove previous output");
@@ -108,69 +179,10 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
     .expect("GeoPackage conversion should succeed");
 
     let conn = Connection::open(&output).expect("open GeoPackage");
-    let tables = read_table_names(&conn);
-    for expected in [
-        "gpkg_contents",
-        "gpkg_geometry_columns",
-        "gpkg_metadata",
-        "gpkg_metadata_reference",
-        "gpkg_spatial_ref_sys",
-        "cityobject_relations",
-        "building_multisurface",
-        "buildingroom_multisurface",
-    ] {
-        assert!(
-            tables.iter().any(|table| table == expected),
-            "missing table {expected}"
-        );
-    }
-
-    assert_eq!(table_row_count(&conn, "cityobject_relations"), 1);
-    assert_eq!(table_row_count(&conn, "gpkg_metadata"), 1);
-    assert_eq!(table_row_count(&conn, "gpkg_metadata_reference"), 1);
-    assert_eq!(table_row_count(&conn, "building_multisurface"), 1);
-
-    let (geometry_type_name, z, m): (String, i64, i64) = conn
-        .query_row(
-            "SELECT geometry_type_name, z, m FROM gpkg_geometry_columns WHERE table_name = 'building_multisurface'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .expect("read geometry column metadata");
-    assert_eq!(geometry_type_name, "MULTIPOLYGON");
-    assert_eq!((z, m), (1, 0));
-
-    let (min_x, min_y, max_x, max_y): (f64, f64, f64, f64) = conn
-        .query_row(
-            "SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name = 'building_multisurface'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .expect("read layer extent");
-    assert_eq!((min_x, min_y, max_x, max_y), (0.0, 0.0, 1.0, 1.0));
-
-    let blob = read_blob_prefix(&conn, "building_multisurface");
-    assert_eq!(&blob[0..2], b"GP");
-    assert_eq!(blob[2], 0);
-    assert_eq!(blob[3] & 0b0000_0001, 0b0000_0001);
-    assert_eq!(blob[3] & 0b0000_0100, 0b0000_0100);
-    assert_eq!(
-        i32::from_le_bytes(blob[4..8].try_into().expect("srs id bytes")),
-        7415
-    );
-    assert_eq!(
-        u32::from_le_bytes(blob[57..61].try_into().expect("wkb type bytes")),
-        1006
-    );
-
-    let relation: (String, String) = conn
-        .query_row(
-            "SELECT parent_cityobject_id, child_cityobject_id FROM cityobject_relations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read relation row");
-    assert_eq!(relation, ("building".to_string(), "room".to_string()));
+    assert_layers_relations_metadata_tables(&conn);
+    assert_building_layer_metadata(&conn);
+    assert_building_blob_header(&conn);
+    assert_single_cityobject_relation(&conn);
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");

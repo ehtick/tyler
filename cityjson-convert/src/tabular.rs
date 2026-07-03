@@ -750,7 +750,7 @@ pub fn value_to_text_cell(model: &CityModel, value: Value<'_, '_>) -> Result<Tex
 
 /// Serializes a logical tabular value to compact JSON-compatible data.
 ///
-/// This is intentionally a tabular serializer, not CityJSON document
+/// This is intentionally a tabular serializer, not `CityJSON` document
 /// serialization. In particular, geometry references are emitted as hex ISO WKB.
 ///
 /// # Errors
@@ -764,9 +764,9 @@ pub fn value_to_json(model: &CityModel, value: Value<'_, '_>) -> Result<JsonValu
         Value::Boolean(value) => JsonValue::Bool(value),
         Value::UInt64(value) => JsonValue::Number(value.into()),
         Value::Int64(value) => JsonValue::Number(value.into()),
-        Value::Float64(value) => serde_json::Number::from_f64(value)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
+        Value::Float64(value) => {
+            serde_json::Number::from_f64(value).map_or(JsonValue::Null, JsonValue::Number)
+        }
         Value::Utf8(value) => JsonValue::String(value.to_string()),
         Value::GeometryRef(value) => JsonValue::String(geometry_ref_to_wkb_hex(model, value)?),
         Value::List(values) => {
@@ -791,7 +791,7 @@ pub fn value_to_json(model: &CityModel, value: Value<'_, '_>) -> Result<JsonValu
 /// Serializes a source attribute value using the tabular JSON fallback contract.
 ///
 /// Geometry-valued attributes become hex ISO WKB strings. This differs from
-/// `cityjson-json`, which serializes those values for CityJSON documents.
+/// `cityjson-json`, which serializes those values for `CityJSON` documents.
 ///
 /// # Errors
 ///
@@ -802,13 +802,12 @@ pub fn attribute_value_to_json(
     value: &OwnedAttributeValue,
 ) -> Result<JsonValue> {
     Ok(match value {
-        OwnedAttributeValue::Null => JsonValue::Null,
         OwnedAttributeValue::Bool(value) => JsonValue::Bool(*value),
         OwnedAttributeValue::Unsigned(value) => JsonValue::Number((*value).into()),
         OwnedAttributeValue::Integer(value) => JsonValue::Number((*value).into()),
-        OwnedAttributeValue::Float(value) => serde_json::Number::from_f64(*value)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
+        OwnedAttributeValue::Float(value) => {
+            serde_json::Number::from_f64(*value).map_or(JsonValue::Null, JsonValue::Number)
+        }
         OwnedAttributeValue::String(value) => JsonValue::String(value.clone()),
         OwnedAttributeValue::Vec(values) => JsonValue::Array(
             values
@@ -823,7 +822,10 @@ pub fn attribute_value_to_json(
             }
             JsonValue::Object(fields)
         }
-        OwnedAttributeValue::Geometry(_) => JsonValue::Null,
+        OwnedAttributeValue::Geometry(value) => {
+            JsonValue::String(geometry_ref_to_wkb_hex(model, *value)?)
+        }
+        OwnedAttributeValue::Null => JsonValue::Null,
         unsupported => bail!("unsupported attribute value variant {unsupported}"),
     })
 }
@@ -957,10 +959,7 @@ pub fn metadata_to_compact_json(
             contact_object.insert("role".to_string(), JsonValue::String(role.to_string()));
         }
         if let Some(website) = contact.website().as_ref() {
-            contact_object.insert(
-                "website".to_string(),
-                JsonValue::String(website.to_string()),
-            );
+            contact_object.insert("website".to_string(), JsonValue::String(website.clone()));
         }
         if let Some(kind) = contact.contact_type() {
             contact_object.insert(
@@ -969,12 +968,12 @@ pub fn metadata_to_compact_json(
             );
         }
         if let Some(phone) = contact.phone().as_ref() {
-            contact_object.insert("phone".to_string(), JsonValue::String(phone.to_string()));
+            contact_object.insert("phone".to_string(), JsonValue::String(phone.clone()));
         }
         if let Some(organization) = contact.organization().as_ref() {
             contact_object.insert(
                 "organization".to_string(),
-                JsonValue::String(organization.to_string()),
+                JsonValue::String(organization.clone()),
             );
         }
         object.insert(
@@ -1322,9 +1321,9 @@ impl<'model> SemanticRow<'model> {
     }
 }
 
-fn cityobject_address<'model>(
-    object: &'model cityjson_lib::cityjson_types::v2_0::CityObject<OwnedStringStorage>,
-) -> Result<Option<&'model HashMap<String, OwnedAttributeValue>>> {
+fn cityobject_address(
+    object: &cityjson_lib::cityjson_types::v2_0::CityObject<OwnedStringStorage>,
+) -> Result<Option<&HashMap<String, OwnedAttributeValue>>> {
     let Some(value) = object.extra().and_then(|extra| extra.get("address")) else {
         return Ok(None);
     };
@@ -1670,13 +1669,12 @@ fn mark_all_nullable(schema: &mut StructSchema<'_>) {
 /// Infers the logical type of one borrowed source value recursively.
 fn infer_type(value: &OwnedAttributeValue) -> Result<LogicalType<'_>> {
     Ok(match value {
-        OwnedAttributeValue::Null => LogicalType::Null,
         OwnedAttributeValue::Bool(_) => LogicalType::Boolean,
         OwnedAttributeValue::Unsigned(_) => LogicalType::UInt64,
         OwnedAttributeValue::Integer(_) => LogicalType::Int64,
         OwnedAttributeValue::Float(_) => LogicalType::Float64,
         OwnedAttributeValue::String(_) => LogicalType::Utf8,
-        OwnedAttributeValue::Geometry(_) => LogicalType::Null,
+        OwnedAttributeValue::Null | OwnedAttributeValue::Geometry(_) => LogicalType::Null,
         OwnedAttributeValue::Vec(values) => infer_list_type(values)?,
         OwnedAttributeValue::Map(values) => {
             let mut schema = StructSchema::default();

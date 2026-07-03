@@ -84,28 +84,40 @@ struct TsvFileCliOptions {
     /// Write a separate TSV semantics file joined from primitive assignments.
     #[arg(long = "tsv-split-semantics", default_value_t = false)]
     tsv_split_semantics: bool,
-    /// Write CityObject extra.address values to addresses.tsv.
+    /// Write `CityObject` extra.address values to addresses.tsv.
     #[arg(long = "tsv-split-address", default_value_t = false)]
     tsv_split_address: bool,
 }
 
 #[derive(Args, Debug, Default)]
 struct GpkgCliOptions {
-    // Split GeoPackage layers by LoD.
-    #[arg(long = "gpkg-split-lod", default_value_t = false)]
-    gpkg_split_lod: bool,
-    // Write semantic tables alongside feature tables.
-    #[arg(long = "gpkg-split-semantics", default_value_t = false)]
-    gpkg_split_semantics: bool,
-    // Write CityObject extra.address values to a separate feature layer.
-    #[arg(long = "gpkg-split-address", default_value_t = false)]
-    gpkg_split_address: bool,
-    // Include source CityJSON metadata through the GeoPackage metadata extension.
-    #[arg(long = "gpkg-include-metadata", default_value_t = false)]
-    gpkg_include_metadata: bool,
+    #[command(flatten)]
+    layers: GpkgLayerCliOptions,
+    #[command(flatten)]
+    metadata: GpkgMetadataCliOptions,
     // Optional target CRS metadata label when the source metadata lacks a parseable EPSG code.
     #[arg(long = "gpkg-output-crs")]
-    gpkg_output_crs: Option<String>,
+    output_crs: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgLayerCliOptions {
+    // Split GeoPackage layers by LoD.
+    #[arg(long = "gpkg-split-lod", default_value_t = false)]
+    lod_layers: bool,
+    // Write semantic tables alongside feature tables.
+    #[arg(long = "gpkg-split-semantics", default_value_t = false)]
+    semantics_tables: bool,
+    // Write CityObject extra.address values to a separate feature layer.
+    #[arg(long = "gpkg-split-address", default_value_t = false)]
+    address_layer: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgMetadataCliOptions {
+    // Include source CityJSON metadata through the GeoPackage metadata extension.
+    #[arg(long = "gpkg-include-metadata", default_value_t = false)]
+    include_source: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -162,11 +174,11 @@ fn main() -> anyhow::Result<()> {
         OutputFormat::Gpkg => {
             let model = read_model(&cli.input)?;
             let options = GpkgExportOptions {
-                split_lod: cli.gpkg.gpkg_split_lod,
-                split_semantics: cli.gpkg.gpkg_split_semantics,
-                split_address: cli.gpkg.gpkg_split_address,
-                include_metadata: cli.gpkg.gpkg_include_metadata,
-                output_crs: cli.gpkg.gpkg_output_crs.clone(),
+                split_lod: cli.gpkg.layers.lod_layers,
+                split_semantics: cli.gpkg.layers.semantics_tables,
+                split_address: cli.gpkg.layers.address_layer,
+                include_metadata: cli.gpkg.metadata.include_source,
+                output_crs: cli.gpkg.output_crs.clone(),
             };
             info!("Converting to GeoPackage");
             cityjson_convert::convert_to_gpkg(&model, &cli.output, &options)?;

@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
@@ -24,7 +25,7 @@ const GPKG_METADATA_STANDARD_URI: &str = "https://www.geopackage.org/spec/#exten
 const GPKG_METADATA_REFERENCE_SCOPE: &str = "dataset";
 const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct GpkgExportOptions {
     pub split_lod: bool,
@@ -34,30 +35,18 @@ pub struct GpkgExportOptions {
     pub output_crs: Option<String>,
 }
 
-impl Default for GpkgExportOptions {
-    fn default() -> Self {
-        Self {
-            split_lod: false,
-            split_semantics: false,
-            split_address: false,
-            include_metadata: false,
-            output_crs: None,
-        }
-    }
-}
-
 #[derive(Debug)]
 struct FeatureLayerState {
     insert_sql: String,
     extent: Option<[f64; 6]>,
 }
 
-/// Converts a `CityJSON` model to a GeoPackage file.
+/// Converts a `CityJSON` model to a `GeoPackage` file.
 ///
 /// # Errors
 ///
 /// Returns an error when the output directory cannot be created, metadata or
-/// geometry cannot be resolved, or the GeoPackage cannot be written.
+/// geometry cannot be resolved, or the `GeoPackage` cannot be written.
 pub fn convert_to_gpkg<P: AsRef<Path>>(
     model: &CityModel,
     output: P,
@@ -110,66 +99,20 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     let mut feature_layers: BTreeMap<String, FeatureLayerState> = BTreeMap::new();
     let mut relations = BTreeSet::new();
 
-    for (cityobject_ix, (_, cityobject)) in model.cityobjects().iter().enumerate() {
-        let row = &cityobject_rows[cityobject_ix];
-        collect_cityobject_relations(row, &mut relations)?;
-
-        let Some(geometry_handles) = cityobject.geometry() else {
-            continue;
-        };
-
-        for geometry_handle in geometry_handles.iter().copied() {
-            let geometry = model.resolve_geometry(geometry_handle)?;
-            let Some(boundary) = geometry.boundaries() else {
-                continue;
-            };
-
-            let encoded = encode_geometry_blob(
-                model,
-                geometry.type_geometry(),
-                boundary,
-                resolved_srs.srs_id,
-            )?;
-            let layer_table_name = layer_table_name(
-                row.cityobject_type_name().to_string(),
-                geometry.type_geometry().to_string(),
-                geometry.lod().map(ToString::to_string),
-                options.split_lod,
-                &mut used_table_names,
-            );
-            if !feature_layers.contains_key(&layer_table_name) {
-                create_feature_table(
-                    &tx,
-                    &layer_table_name,
-                    &cityobjects,
-                    resolved_srs.srs_id,
-                    geometry.type_geometry(),
-                    &last_change,
-                )?;
-                feature_layers.insert(
-                    layer_table_name.clone(),
-                    FeatureLayerState {
-                        insert_sql: feature_insert_sql(&layer_table_name, cityobjects.schema()),
-                        extent: None,
-                    },
-                );
-            }
-
-            let state = feature_layers
-                .get_mut(&layer_table_name)
-                .expect("layer exists");
-            state.extent = union_bbox(state.extent, encoded.envelope);
-            insert_feature_row(
-                &tx,
-                &state.insert_sql,
-                model,
-                row,
-                geometry.type_geometry(),
-                geometry.lod().map(ToString::to_string),
-                encoded.blob,
-            )?;
-        }
-    }
+    export_feature_layers(
+        &FeatureLayerExport {
+            tx: &tx,
+            model,
+            cityobjects: &cityobjects,
+            cityobject_rows: &cityobject_rows,
+            srs_id: resolved_srs.srs_id,
+            split_lod: options.split_lod,
+            last_change: &last_change,
+        },
+        &mut used_table_names,
+        &mut feature_layers,
+        &mut relations,
+    )?;
 
     create_relation_table(&tx)?;
     insert_cityobject_relations(&tx, &relations)?;
@@ -201,6 +144,79 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     update_feature_layer_extents(&tx, &feature_layers)?;
 
     tx.commit()?;
+    Ok(())
+}
+
+struct FeatureLayerExport<'tx, 'conn, 'model, 'rows> {
+    tx: &'tx Transaction<'conn>,
+    model: &'model CityModel,
+    cityobjects: &'rows CityObjectTable<'model>,
+    cityobject_rows: &'rows [CityObjectRow<'rows, 'model>],
+    srs_id: i32,
+    split_lod: bool,
+    last_change: &'tx str,
+}
+
+fn export_feature_layers(
+    export: &FeatureLayerExport<'_, '_, '_, '_>,
+    used_table_names: &mut HashSet<String>,
+    feature_layers: &mut BTreeMap<String, FeatureLayerState>,
+    relations: &mut BTreeSet<(String, String)>,
+) -> Result<()> {
+    for (cityobject_ix, (_, cityobject)) in export.model.cityobjects().iter().enumerate() {
+        let row = &export.cityobject_rows[cityobject_ix];
+        collect_cityobject_relations(row, relations)?;
+
+        let Some(geometry_handles) = cityobject.geometry() else {
+            continue;
+        };
+
+        for geometry_handle in geometry_handles.iter().copied() {
+            let geometry = export.model.resolve_geometry(geometry_handle)?;
+            let Some(boundary) = geometry.boundaries() else {
+                continue;
+            };
+
+            let geometry_type = *geometry.type_geometry();
+            let encoded =
+                encode_geometry_blob(export.model, geometry_type, boundary, export.srs_id)?;
+            let layer_table_name = layer_table_name(
+                &row.cityobject_type_name().to_string(),
+                &geometry_type.to_string(),
+                geometry.lod(),
+                export.split_lod,
+                used_table_names,
+            );
+            let state = match feature_layers.entry(layer_table_name) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let table_name = entry.key().clone();
+                    create_feature_table(
+                        export.tx,
+                        &table_name,
+                        export.cityobjects,
+                        export.srs_id,
+                        geometry_type,
+                        export.last_change,
+                    )?;
+                    entry.insert(FeatureLayerState {
+                        insert_sql: feature_insert_sql(&table_name, export.cityobjects.schema()),
+                        extent: None,
+                    })
+                }
+            };
+            state.extent = union_bbox(state.extent, encoded.envelope);
+            insert_feature_row(
+                export.tx,
+                &state.insert_sql,
+                export.model,
+                row,
+                geometry_type,
+                geometry.lod().map(ToString::to_string),
+                encoded.blob,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -367,7 +383,7 @@ fn create_feature_table(
     table_name: &str,
     cityobjects: &CityObjectTable<'_>,
     srs_id: i32,
-    geometry_type: &GeometryType,
+    geometry_type: GeometryType,
     last_change: &str,
 ) -> Result<()> {
     let geometry_type_name = gpkg_geometry_type_name(geometry_type);
@@ -492,9 +508,7 @@ fn insert_address_rows(
         let mut params = vec![
             SqlValue::Text(fixed.cityobject_id.to_string()),
             SqlValue::Text(fixed.cityobject_type_name().to_string()),
-            encoded
-                .map(|encoded| SqlValue::Blob(encoded.blob))
-                .unwrap_or(SqlValue::Null),
+            encoded.map_or(SqlValue::Null, |encoded| SqlValue::Blob(encoded.blob)),
         ];
         params.extend(
             row.values()
@@ -539,7 +553,7 @@ fn insert_feature_row(
     insert_sql: &str,
     model: &CityModel,
     row: &CityObjectRow<'_, '_>,
-    geometry_type: &GeometryType,
+    geometry_type: GeometryType,
     lod: Option<String>,
     geom_blob: Vec<u8>,
 ) -> Result<()> {
@@ -547,7 +561,7 @@ fn insert_feature_row(
         SqlValue::Text(row.cityobject_id.to_string()),
         SqlValue::Text(row.cityobject_type_name().to_string()),
         SqlValue::Text(geometry_type.to_string()),
-        lod.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+        lod.map_or(SqlValue::Null, SqlValue::Text),
         SqlValue::Blob(geom_blob),
     ];
     params.extend(
@@ -607,12 +621,11 @@ fn insert_semantics_rows(tx: &Transaction<'_>, semantics: &SemanticTable<'_>) ->
     for row in semantics.rows() {
         let fixed = row.fixed();
         let mut params = vec![
-            SqlValue::Integer(fixed.semantic_id as i64),
+            SqlValue::Integer(sqlite_integer(fixed.semantic_id, "semantic_id")?),
             SqlValue::Text(fixed.semantic_type_name().to_string()),
-            fixed
-                .parent
-                .map(|value| SqlValue::Integer(value as i64))
-                .unwrap_or(SqlValue::Null),
+            fixed.parent.map_or(Ok(SqlValue::Null), |value| {
+                sqlite_integer(value, "parent").map(SqlValue::Integer)
+            })?,
             SqlValue::Text(serde_json::to_string(&fixed.children)?),
         ];
         params.extend(
@@ -683,24 +696,43 @@ fn insert_semantic_relations(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for row in assignments.rows() {
+        let semantic_id = optional_sqlite_integer(row.semantic_id, "semantic_id")?;
+        let cityobject_ix = sqlite_integer(row.cityobject_ix, "cityobject_ix")?;
+        let geometry_ix = sqlite_integer(row.geometry_ix, "geometry_ix")?;
+        let primitive_ix = sqlite_integer(row.primitive_ix, "primitive_ix")?;
+        let point_ix = optional_sqlite_integer(row.point_ix, "point_ix")?;
+        let linestring_ix = optional_sqlite_integer(row.linestring_ix, "linestring_ix")?;
+        let solid_ix = optional_sqlite_integer(row.solid_ix, "solid_ix")?;
+        let shell_ix = optional_sqlite_integer(row.shell_ix, "shell_ix")?;
+        let surface_ix = optional_sqlite_integer(row.surface_ix, "surface_ix")?;
+
         statement.execute(params![
-            row.semantic_id.map(|value| value as i64),
+            semantic_id,
             row.cityobject_id,
-            row.cityobject_ix as i64,
-            row.geometry_ix as i64,
+            cityobject_ix,
+            geometry_ix,
             row.geometry_type.to_string(),
             row.geometry_lod.clone(),
-            row.geometry_is_instance as i64,
+            i64::from(row.geometry_is_instance),
             row.primitive_type.to_string(),
-            row.primitive_ix as i64,
-            row.point_ix.map(|value| value as i64),
-            row.linestring_ix.map(|value| value as i64),
-            row.solid_ix.map(|value| value as i64),
-            row.shell_ix.map(|value| value as i64),
-            row.surface_ix.map(|value| value as i64),
+            primitive_ix,
+            point_ix,
+            linestring_ix,
+            solid_ix,
+            shell_ix,
+            surface_ix,
         ])?;
     }
     Ok(())
+}
+
+fn sqlite_integer(value: u64, column: &str) -> Result<i64> {
+    i64::try_from(value)
+        .with_context(|| format!("{column} value {value} does not fit in SQLite INTEGER"))
+}
+
+fn optional_sqlite_integer(value: Option<u64>, column: &str) -> Result<Option<i64>> {
+    value.map(|value| sqlite_integer(value, column)).transpose()
 }
 
 fn create_metadata_tables(tx: &Transaction<'_>) -> Result<()> {
@@ -828,16 +860,16 @@ fn encode_address_geometry_blob(
     let Some(boundary) = geometry.boundaries() else {
         bail!("address.location geometry handle {geometry_handle:?} resolves to a geometry without boundaries");
     };
-    encode_geometry_blob(model, geometry.type_geometry(), boundary, srs_id)
+    encode_geometry_blob(model, *geometry.type_geometry(), boundary, srs_id)
 }
 
 fn encode_geometry_blob(
     model: &CityModel,
-    geometry_type: &GeometryType,
+    geometry_type: GeometryType,
     boundary: &Boundary<u32>,
     srs_id: i32,
 ) -> Result<EncodedGeometry> {
-    if matches!(*geometry_type, GeometryType::GeometryInstance) {
+    if matches!(geometry_type, GeometryType::GeometryInstance) {
         bail!("GeometryInstance should have been resolved before GeoPackage export");
     }
 
@@ -847,7 +879,7 @@ fn encode_geometry_blob(
     let envelope = calculate_envelope(model, boundary)?;
 
     Ok(EncodedGeometry {
-        blob: wrap_geopackage_binary(payload, envelope, envelope.is_none(), srs_id),
+        blob: wrap_geopackage_binary(&payload, envelope, envelope.is_none(), srs_id),
         envelope,
     })
 }
@@ -896,12 +928,12 @@ fn update_envelope(envelope: &mut Option<[f64; 6]>, coordinate: [f64; 3]) {
     }
 }
 fn wrap_geopackage_binary(
-    payload: Vec<u8>,
+    payload: &[u8],
     envelope: Option<[f64; 6]>,
     empty: bool,
     srs_id: i32,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + envelope.map(|_| 48).unwrap_or(0) + payload.len());
+    let mut out = Vec::with_capacity(8 + envelope.map_or(0, |_| 48) + payload.len());
     out.extend_from_slice(GPB_MAGIC);
     out.push(0);
 
@@ -919,41 +951,36 @@ fn wrap_geopackage_binary(
             out.extend_from_slice(&value.to_le_bytes());
         }
     }
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     out
 }
 
-fn gpkg_geometry_type_name(geometry_type: &GeometryType) -> &'static str {
-    match *geometry_type {
+fn gpkg_geometry_type_name(geometry_type: GeometryType) -> &'static str {
+    match geometry_type {
         GeometryType::MultiPoint => "MULTIPOINT",
         GeometryType::MultiLineString => "MULTILINESTRING",
-        GeometryType::MultiSurface
-        | GeometryType::CompositeSurface
-        | GeometryType::Solid
-        | GeometryType::MultiSolid
-        | GeometryType::CompositeSolid => "MULTIPOLYGON",
         GeometryType::GeometryInstance => "GEOMETRYCOLLECTION",
         _ => "MULTIPOLYGON",
     }
 }
 
 fn layer_table_name(
-    cityobject_type: String,
-    geometry_family: String,
-    lod: Option<String>,
+    cityobject_type: &str,
+    geometry_family: &str,
+    lod: Option<impl ToString>,
     split_lod: bool,
     used_names: &mut HashSet<String>,
 ) -> String {
     let mut base = format!(
         "{}_{}",
-        sanitize_identifier(&cityobject_type),
-        sanitize_identifier(&geometry_family)
+        sanitize_identifier(cityobject_type),
+        sanitize_identifier(geometry_family)
     );
     if split_lod {
-        let lod = lod
-            .as_deref()
-            .map(sanitize_lod_fragment)
-            .unwrap_or_else(|| "none".to_string());
+        let lod = lod.map_or_else(
+            || "none".to_string(),
+            |lod| sanitize_lod_fragment(&lod.to_string()),
+        );
         base.push_str("_lod");
         base.push_str(&lod);
     }
@@ -989,7 +1016,7 @@ fn unique_identifier(base: String, used_names: &mut HashSet<String>) -> String {
 
     let mut index = 2usize;
     loop {
-        let candidate = format!("{}_{}", base, index);
+        let candidate = format!("{base}_{index}");
         if used_names.insert(candidate.clone()) {
             return candidate;
         }
@@ -1035,8 +1062,8 @@ fn sqlite_type_decl(logical_type: &LogicalType<'_>) -> &'static str {
         LogicalType::Boolean | LogicalType::UInt64 | LogicalType::Int64 => "INTEGER",
         LogicalType::GeometryRef => "BLOB",
         LogicalType::Float64 => "REAL",
-        LogicalType::Utf8 => "TEXT",
-        LogicalType::Json
+        LogicalType::Utf8
+        | LogicalType::Json
         | LogicalType::Null
         | LogicalType::List { .. }
         | LogicalType::Struct(_) => "TEXT",
@@ -1046,7 +1073,7 @@ fn sqlite_type_decl(logical_type: &LogicalType<'_>) -> &'static str {
 fn sqlite_value_from_tabular_value(model: &CityModel, value: Value<'_, '_>) -> Result<SqlValue> {
     Ok(match value {
         Value::Null => SqlValue::Null,
-        Value::Boolean(value) => SqlValue::Integer(if value { 1 } else { 0 }),
+        Value::Boolean(value) => SqlValue::Integer(i64::from(value)),
         Value::UInt64(value) => match i64::try_from(value) {
             Ok(value) => SqlValue::Integer(value),
             Err(_) => SqlValue::Text(value.to_string()),
@@ -1110,7 +1137,7 @@ mod tests {
     #[test]
     fn wraps_geopackage_binary_with_header_and_optional_envelope() {
         let blob = wrap_geopackage_binary(
-            vec![1, 2, 3],
+            &[1, 2, 3],
             Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             false,
             7415,

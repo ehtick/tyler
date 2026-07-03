@@ -723,6 +723,47 @@ fn omits_geometry_ref_attributes_from_cityobject_schema() {
 }
 
 #[test]
+fn serializes_geometry_attribute_values_as_wkb_hex_json() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let expected = bytes_to_hex(
+        &cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
+            .expect("encode geometry as WKB"),
+    );
+
+    let json = cityjson_convert::tabular::attribute_value_to_json(
+        &model,
+        &OwnedAttributeValue::Geometry(geometry_handle),
+    )
+    .expect("serialize geometry attribute");
+
+    assert_eq!(json, serde_json::Value::String(expected));
+}
+
+#[test]
 fn tabulates_address_location_separately_from_dynamic_address_columns() {
     let mut model = json::from_slice(
         br#"{
