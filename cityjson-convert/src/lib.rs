@@ -1,4 +1,5 @@
 pub mod gltf_writer;
+pub mod gpkg_writer;
 pub mod obj_writer;
 pub mod tabular;
 #[path = "triangle-mesh.rs"]
@@ -11,6 +12,7 @@ pub use tabular::{
     LogicalType, MetadataRow, MetadataRowRef, MetadataTable, PrimitiveType, SemanticAssignmentRow,
     SemanticAssignmentTable, SemanticRow, SemanticRowRef, SemanticTable, TableSchema, Value,
 };
+pub use gpkg_writer::{convert_to_gpkg, GpkgExportOptions};
 pub use tsv_writer::{
     convert_to_tsv, write_cityobjects_tsv, write_metadata_tsv, write_semantic_assignments_tsv,
     write_semantic_definitions_tsv, write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,

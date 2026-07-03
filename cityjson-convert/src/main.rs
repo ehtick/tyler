@@ -6,7 +6,7 @@ use anyhow::{bail, Context};
 use cityjson_convert::{
     convert_to_cityjson, convert_to_cityjsonseq, convert_to_glb, convert_to_obj, convert_to_tsv,
     CityJsonSeqExportOptions, ExportOptions, GeometryPlacement, JsonExportOptions,
-    ObjExportOptions, TsvExportOptions,
+    ObjExportOptions, TsvExportOptions, GpkgExportOptions,
 };
 use cityjson_lib::json;
 use clap::{Args, Parser, ValueEnum};
@@ -23,6 +23,7 @@ enum OutputFormat {
     Cityjson,
     Cityjsonseq,
     Tsv,
+    Gpkg,
 }
 
 #[derive(Parser, Debug)]
@@ -51,6 +52,9 @@ struct Cli {
     /// Metadata class name for `EXT_structural_metadata`.
     #[arg(long = "3dtiles-metadata-class", default_value = "cityobject")]
     metadata_class_name: String,
+    // GeoPackage options.
+    #[command(flatten)]
+    gpkg: GpkgCliOptions,
     /// TSV row-shape options.
     #[command(flatten)]
     tsv_rows: TsvRowCliOptions,
@@ -80,6 +84,22 @@ struct TsvFileCliOptions {
     /// Write a separate TSV semantics file joined from primitive assignments.
     #[arg(long = "tsv-split-semantics", default_value_t = false)]
     tsv_split_semantics: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgCliOptions {
+    // Split GeoPackage layers by LoD.
+    #[arg(long = "gpkg-split-lod", default_value_t = false)]
+    gpkg_split_lod: bool,
+    // Write semantic tables alongside feature tables.
+    #[arg(long = "gpkg-split-semantics", default_value_t = false)]
+    gpkg_split_semantics: bool,
+    // Include source CityJSON metadata through the GeoPackage metadata extension.
+    #[arg(long = "gpkg-include-metadata", default_value_t = false)]
+    gpkg_include_metadata: bool,
+    // Optional target CRS metadata label when the source metadata lacks a parseable EPSG code.
+    #[arg(long = "gpkg-output-crs")]
+    gpkg_output_crs: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -132,6 +152,18 @@ fn main() -> anyhow::Result<()> {
                 &CityJsonSeqExportOptions::default(),
             )?;
             info!("CityJSONSeq written to {}", cli.output.display());
+        }
+        OutputFormat::Gpkg => {
+            let model = read_model(&cli.input)?;
+            let options = GpkgExportOptions {
+                split_lod: cli.gpkg.gpkg_split_lod,
+                split_semantics: cli.gpkg.gpkg_split_semantics,
+                include_metadata: cli.gpkg.gpkg_include_metadata,
+                output_crs: cli.gpkg.gpkg_output_crs.clone(),
+            };
+            info!("Converting to GeoPackage");
+            cityjson_convert::convert_to_gpkg(&model, &cli.output, &options)?;
+            info!("GeoPackage written to {}", cli.output.display());
         }
         OutputFormat::Tsv => {
             let model = json::from_file(&cli.input)?;

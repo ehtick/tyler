@@ -36,14 +36,9 @@ hierarchy are written as separate attributes tables.
 
 ### Coordinates and CRS
 
-CityJSON coordinates are transformed before export:
-
-```text
-real_world_coordinate = vertex * transform.scale + transform.translate
-```
-
-The GeoPackage stores real-world XYZ coordinates directly. The CityJSON
-`transform` object is not written because it has already been applied.
+The GeoPackage stores real-world XYZ coordinates directly.
+The CityJSON `transform` object is not written because it has already been applied when
+deserializing a CityJSON document into a `CityModel`.
 
 The GeoPackage uses one CRS for all feature layers. The CRS is stored in
 `gpkg_spatial_ref_sys` and referenced by `gpkg_geometry_columns`. If the input
