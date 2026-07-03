@@ -325,6 +325,63 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
 }
 
 #[test]
+fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building-1":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                },
+                "building-2":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[3,4,5,3]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0],[2,0,0],[3,0,0],[2,1,0]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let output = stable_output_path("convert_to_gpkg_reuses_feature_layer");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(
+        &model,
+        &output,
+        &GpkgExportOptions {
+            split_lod: true,
+            split_semantics: false,
+            split_address: false,
+            include_metadata: false,
+            output_crs: None,
+        },
+    )
+    .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    assert!(table_exists(&conn, "building_multisurface_lod1"));
+    assert!(!table_exists(&conn, "building_multisurface_lod1_2"));
+    assert_eq!(table_row_count(&conn, "building_multisurface_lod1"), 2);
+
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
 fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
     let model = json::from_slice(
         br#"{

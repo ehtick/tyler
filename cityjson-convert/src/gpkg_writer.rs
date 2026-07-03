@@ -42,6 +42,8 @@ struct FeatureLayerState {
     extent: Option<[f64; 6]>,
 }
 
+type FeatureLayerKey = (String, String, Option<String>);
+
 /// Converts a `CityJSON` model to a `GeoPackage` file.
 ///
 /// # Errors
@@ -97,6 +99,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     insert_standard_spatial_ref_systems(&tx, &resolved_srs)?;
 
     let mut used_table_names = HashSet::new();
+    let mut feature_layer_names = BTreeMap::new();
     let mut feature_layers: BTreeMap<String, FeatureLayerState> = BTreeMap::new();
     let mut relations = BTreeSet::new();
 
@@ -111,6 +114,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             last_change: &last_change,
         },
         &mut used_table_names,
+        &mut feature_layer_names,
         &mut feature_layers,
         &mut relations,
     )?;
@@ -161,6 +165,7 @@ struct FeatureLayerExport<'tx, 'conn, 'model, 'rows> {
 fn export_feature_layers(
     export: &FeatureLayerExport<'_, '_, '_, '_>,
     used_table_names: &mut HashSet<String>,
+    feature_layer_names: &mut BTreeMap<FeatureLayerKey, String>,
     feature_layers: &mut BTreeMap<String, FeatureLayerState>,
     relations: &mut BTreeSet<(String, String)>,
 ) -> Result<()> {
@@ -181,13 +186,26 @@ fn export_feature_layers(
             let geometry_type = *geometry.type_geometry();
             let encoded =
                 encode_geometry_blob(export.model, geometry_type, boundary, export.srs_id)?;
-            let layer_table_name = layer_table_name(
-                &row.cityobject_type_name().to_string(),
-                &geometry_type.to_string(),
-                geometry.lod(),
-                export.split_lod,
-                used_table_names,
+            let cityobject_type = row.cityobject_type_name().to_string();
+            let geometry_family = geometry_type.to_string();
+            let lod = geometry.lod().map(ToString::to_string);
+            let layer_key = (
+                cityobject_type.clone(),
+                geometry_family.clone(),
+                lod.clone(),
             );
+            let layer_table_name = feature_layer_names
+                .entry(layer_key)
+                .or_insert_with(|| {
+                    let base = layer_table_name_base(
+                        &cityobject_type,
+                        &geometry_family,
+                        lod.as_deref(),
+                        export.split_lod,
+                    );
+                    unique_identifier(base, used_table_names)
+                })
+                .clone();
             let state = match feature_layers.entry(layer_table_name) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
@@ -1060,12 +1078,11 @@ fn gpkg_geometry_type_name(geometry_type: GeometryType) -> &'static str {
     }
 }
 
-fn layer_table_name(
+fn layer_table_name_base(
     cityobject_type: &str,
     geometry_family: &str,
     lod: Option<impl ToString>,
     split_lod: bool,
-    used_names: &mut HashSet<String>,
 ) -> String {
     let mut base = format!(
         "{}_{}",
@@ -1080,7 +1097,7 @@ fn layer_table_name(
         base.push_str("_lod");
         base.push_str(&lod);
     }
-    unique_identifier(base, used_names)
+    base
 }
 
 fn sanitize_lod_fragment(value: &str) -> String {
