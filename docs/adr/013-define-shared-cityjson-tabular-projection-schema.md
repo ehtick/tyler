@@ -221,10 +221,13 @@ cityobjects.attributes.tags: List<Utf8>
 cityobjects.attributes.mixed: Json
 ```
 
-Addresses use the same projection rules as other attributes. A stable address
-object can therefore produce typed projected fields. It only becomes compact
-JSON text when the address path is inferred as logical `Json` or when a physical
-format cannot represent a projected field directly.
+Geometry-valued attribute values are ignored by normal tabular serializers.
+The only supported geometry-valued attribute path is `CityObject.extra.address.location`,
+which must reference a `MultiPoint` geometry. When address splitting is enabled,
+addresses are written to a separate address output: TSV uses a `location_wkb`
+hex ISO WKB column, and GeoPackage uses a registered `MULTIPOINT` geometry
+layer. Non-geometry address fields use the same flattened projection rules as
+other dynamic values, excluding the `location` field from ordinary columns.
 
 #### 3DBAG
 

@@ -177,6 +177,104 @@ impl<'model> CityObjectTable<'model> {
     }
 }
 
+/// Borrowed address table with one row per `CityObject.extra.address` object.
+#[derive(Debug)]
+pub struct AddressTable<'model> {
+    model: &'model CityModel,
+    rows: Vec<AddressRow<'model>>,
+    schema: TableSchema<'model>,
+}
+
+impl<'model> AddressTable<'model> {
+    /// Returns the source model backing this borrowed table.
+    #[must_use]
+    pub fn model(&self) -> &'model CityModel {
+        self.model
+    }
+
+    /// Returns the flattened schema for address fields except `location`.
+    #[must_use]
+    pub fn schema(&self) -> &TableSchema<'model> {
+        &self.schema
+    }
+
+    /// Iterates address rows in source `CityObject` order.
+    pub fn rows(&self) -> impl Iterator<Item = AddressRowRef<'_, 'model>> {
+        self.rows.iter().map(|row| AddressRowRef {
+            row,
+            columns: &self.schema.columns,
+        })
+    }
+}
+
+/// Fixed address row fields plus the borrowed nested address object.
+#[derive(Clone, Debug)]
+pub struct AddressRow<'model> {
+    pub cityobject_id: &'model str,
+    pub cityobject_ix: u64,
+    cityobject_type: &'model CityObjectType<OwnedStringStorage>,
+    address: &'model HashMap<String, OwnedAttributeValue>,
+}
+
+impl AddressRow<'_> {
+    /// Returns the owning `CityObject` type using its `CityJSON` display spelling.
+    #[must_use]
+    pub fn cityobject_type_name(&self) -> impl Display + '_ {
+        self.cityobject_type
+    }
+
+    /// Returns the optional `address.location` geometry handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `location` exists but is not a geometry value.
+    pub fn location(&self) -> Result<Option<GeometryHandle>> {
+        match self.address.get("location") {
+            None | Some(OwnedAttributeValue::Null) => Ok(None),
+            Some(OwnedAttributeValue::Geometry(handle)) => Ok(Some(*handle)),
+            Some(other) => bail!(
+                "address.location for CityObject {} must be a geometry value, found {other}",
+                self.cityobject_id
+            ),
+        }
+    }
+}
+
+/// Borrowed address row bound to shared dynamic address columns.
+#[derive(Clone, Copy, Debug)]
+pub struct AddressRowRef<'table, 'model> {
+    row: &'table AddressRow<'model>,
+    columns: &'table [ColumnSchema<'model>],
+}
+
+impl<'table, 'model> AddressRowRef<'table, 'model> {
+    #[must_use]
+    pub fn fixed(&self) -> &'table AddressRow<'model> {
+        self.row
+    }
+
+    #[must_use]
+    pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
+        self.columns
+            .get(index)
+            .map(|column| self.value_for_column(column))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
+        self.columns
+            .iter()
+            .map(|column| self.value_for_column(column))
+    }
+
+    fn value_for_column<'row>(
+        &'row self,
+        column: &'row ColumnSchema<'model>,
+    ) -> Result<Value<'row, 'model>> {
+        let value = resolve_path_in_map(Some(self.row.address), &column.path, &column.name)?;
+        build_value(value, &column.logical_type, column.nullable, &column.name)
+    }
+}
+
 /// Ordered dynamic-column schema shared by every row.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableSchema<'model> {
@@ -725,9 +823,7 @@ pub fn attribute_value_to_json(
             }
             JsonValue::Object(fields)
         }
-        OwnedAttributeValue::Geometry(value) => {
-            JsonValue::String(geometry_ref_to_wkb_hex(model, *value)?)
-        }
+        OwnedAttributeValue::Geometry(_) => JsonValue::Null,
         unsupported => bail!("unsupported attribute value variant {unsupported}"),
     })
 }
@@ -748,6 +844,44 @@ pub fn geometry_ref_to_wkb(model: &CityModel, value: GeometryHandle) -> Result<V
     boundary
         .to_wkb(model.vertices())
         .with_context(|| format!("encode geometry attribute handle {value:?} as WKB"))
+}
+
+/// Resolves an address location geometry handle and returns raw ISO WKB bytes.
+///
+/// # Errors
+///
+/// Returns an error when the handle is dangling, does not resolve to a
+/// `MultiPoint`, has no boundaries, or WKB conversion fails.
+pub fn geometry_ref_to_multipoint_wkb(model: &CityModel, value: GeometryHandle) -> Result<Vec<u8>> {
+    let geometry = model
+        .resolve_geometry(value)
+        .with_context(|| format!("resolve address.location geometry handle {value:?}"))?;
+    if !matches!(geometry.type_geometry(), GeometryType::MultiPoint) {
+        bail!(
+            "address.location geometry handle {value:?} must resolve to MultiPoint, found {}",
+            geometry.type_geometry()
+        );
+    }
+    let Some(boundary) = geometry.boundaries() else {
+        bail!(
+            "address.location geometry handle {value:?} resolves to a geometry without boundaries"
+        );
+    };
+    boundary
+        .to_wkb(model.vertices())
+        .with_context(|| format!("encode address.location geometry handle {value:?} as WKB"))
+}
+
+/// Resolves an address location geometry handle and returns hex ISO WKB.
+///
+/// # Errors
+///
+/// Returns an error when [`geometry_ref_to_multipoint_wkb`] fails.
+pub fn geometry_ref_to_multipoint_wkb_hex(
+    model: &CityModel,
+    value: GeometryHandle,
+) -> Result<String> {
+    Ok(bytes_to_hex(&geometry_ref_to_multipoint_wkb(model, value)?))
 }
 
 fn geometry_ref_to_wkb_hex(model: &CityModel, value: GeometryHandle) -> Result<String> {
@@ -940,6 +1074,47 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
                 "bbox",
                 "parents",
                 "children",
+            ],
+        ),
+    })
+}
+
+/// Infers the address schema and returns one borrowed row per `extra.address`.
+///
+/// # Errors
+///
+/// Returns an error when an `address` member is present but is not an object, or
+/// when an address value variant cannot be represented by the table vocabulary.
+pub fn tabulate_addresses(model: &CityModel) -> Result<AddressTable<'_>> {
+    let mut rows = Vec::new();
+    for (cityobject_ix, (_, object)) in model.cityobjects().iter().enumerate() {
+        let Some(address) = cityobject_address(object)? else {
+            continue;
+        };
+        rows.push(AddressRow {
+            cityobject_id: object.id(),
+            cityobject_ix: cityobject_ix as u64,
+            cityobject_type: object.type_cityobject(),
+            address,
+        });
+    }
+
+    let mut schema = StructSchema::default();
+    for (row_ix, row) in rows.iter().enumerate() {
+        merge_address_values(&mut schema, row.address, row_ix)?;
+    }
+
+    Ok(AddressTable {
+        model,
+        rows,
+        schema: build_dynamic_schema(
+            [(ColumnOrigin::Extra, schema)],
+            &[
+                "cityobject_id",
+                "cityobject_ix",
+                "cityobject_type",
+                "location_wkb",
+                "geom",
             ],
         ),
     })
@@ -1145,6 +1320,41 @@ impl<'model> SemanticRow<'model> {
             attributes: semantic.attributes(),
         }
     }
+}
+
+fn cityobject_address<'model>(
+    object: &'model cityjson_lib::cityjson_types::v2_0::CityObject<OwnedStringStorage>,
+) -> Result<Option<&'model HashMap<String, OwnedAttributeValue>>> {
+    let Some(value) = object.extra().and_then(|extra| extra.get("address")) else {
+        return Ok(None);
+    };
+    match value {
+        OwnedAttributeValue::Null => Ok(None),
+        OwnedAttributeValue::Map(values) => Ok(Some(values)),
+        other => bail!(
+            "address member for CityObject {} must be an object, found {other}",
+            object.id()
+        ),
+    }
+}
+
+fn merge_address_values<'model>(
+    schema: &mut StructSchema<'model>,
+    values: &'model HashMap<String, OwnedAttributeValue>,
+    seen_rows: usize,
+) -> Result<()> {
+    for field in schema.fields.values_mut() {
+        if !values.contains_key(field.name) || field.name == "location" {
+            field.nullable = true;
+        }
+    }
+    for (name, value) in values {
+        if name == "location" {
+            continue;
+        }
+        merge_field(schema, name, value, seen_rows)?;
+    }
+    Ok(())
 }
 
 fn infer_attribute_schema<'model>(
@@ -1466,7 +1676,7 @@ fn infer_type(value: &OwnedAttributeValue) -> Result<LogicalType<'_>> {
         OwnedAttributeValue::Integer(_) => LogicalType::Int64,
         OwnedAttributeValue::Float(_) => LogicalType::Float64,
         OwnedAttributeValue::String(_) => LogicalType::Utf8,
-        OwnedAttributeValue::Geometry(_) => LogicalType::GeometryRef,
+        OwnedAttributeValue::Geometry(_) => LogicalType::Null,
         OwnedAttributeValue::Vec(values) => infer_list_type(values)?,
         OwnedAttributeValue::Map(values) => {
             let mut schema = StructSchema::default();
@@ -1507,7 +1717,10 @@ fn merge_logical_type_with_value<'model>(
     current: &mut LogicalType<'model>,
     value: &'model OwnedAttributeValue,
 ) -> Result<()> {
-    if matches!(value, OwnedAttributeValue::Null) {
+    if matches!(
+        value,
+        OwnedAttributeValue::Null | OwnedAttributeValue::Geometry(_)
+    ) {
         return Ok(());
     }
     match (&mut *current, value) {
@@ -1522,7 +1735,6 @@ fn merge_logical_type_with_value<'model>(
             | OwnedAttributeValue::Integer(_),
         )
         | (LogicalType::Utf8, OwnedAttributeValue::String(_))
-        | (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(_))
         | (LogicalType::Json, _) => {}
         (LogicalType::UInt64, OwnedAttributeValue::Integer(_))
         | (LogicalType::Int64, OwnedAttributeValue::Unsigned(_)) => {
@@ -1684,9 +1896,31 @@ fn resolve_path<'model>(
     let Some((first, remaining)) = path.split_first() else {
         bail!("{column_name}: empty source path");
     };
-    let Some(mut value) = attributes.and_then(|attributes| attributes.get(first)) else {
+    let Some(value) = attributes.and_then(|attributes| attributes.get(first)) else {
         return Ok(None);
     };
+    resolve_remaining_path(value, remaining, column_name)
+}
+
+fn resolve_path_in_map<'model>(
+    values: Option<&'model HashMap<String, OwnedAttributeValue>>,
+    path: &[&str],
+    column_name: &str,
+) -> Result<Option<&'model OwnedAttributeValue>> {
+    let Some((first, remaining)) = path.split_first() else {
+        bail!("{column_name}: empty source path");
+    };
+    let Some(value) = values.and_then(|values| values.get(*first)) else {
+        return Ok(None);
+    };
+    resolve_remaining_path(value, remaining, column_name)
+}
+
+fn resolve_remaining_path<'model>(
+    mut value: &'model OwnedAttributeValue,
+    remaining: &[&str],
+    column_name: &str,
+) -> Result<Option<&'model OwnedAttributeValue>> {
     for segment in remaining {
         match value {
             OwnedAttributeValue::Null => return Ok(None),
@@ -1717,8 +1951,11 @@ fn build_value<'schema, 'model>(
         }
         bail!("{path}: missing non-nullable value");
     };
-    if matches!(value, OwnedAttributeValue::Null) {
-        if nullable {
+    if matches!(
+        value,
+        OwnedAttributeValue::Null | OwnedAttributeValue::Geometry(_)
+    ) {
+        if nullable || matches!(value, OwnedAttributeValue::Geometry(_)) {
             return Ok(Value::Null);
         }
         bail!("{path}: null in non-nullable value");
@@ -1744,9 +1981,6 @@ fn build_value<'schema, 'model>(
             })?,
         )),
         (LogicalType::Utf8, OwnedAttributeValue::String(value)) => Ok(Value::Utf8(value)),
-        (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(value)) => {
-            Ok(Value::GeometryRef(*value))
-        }
         (LogicalType::Json, value) => Ok(Value::Json(value)),
         (
             LogicalType::List {

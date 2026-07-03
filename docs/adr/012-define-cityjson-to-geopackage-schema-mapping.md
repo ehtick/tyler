@@ -158,17 +158,19 @@ The intended scalar mapping is:
 | `Int64`       | `INTEGER`       |
 | `Float64`     | `REAL`          |
 | `Utf8`        | `TEXT`          |
-| `GeometryRef` | `TEXT`          |
+| `GeometryRef` | ignored in normal attribute columns |
 | `Json`        | `TEXT`          |
 
 `Null` contributes nullability but does not by itself require a non-null
 physical type. Extension-defined CityObject types are exported like normal
 CityObject types.
 
-CityJSON addresses use the same projection rules as other attributes. A stable
-address object can produce typed flattened address columns. It only becomes
-compact JSON `TEXT` when the address path is inferred as logical `Json` or
-cannot be represented by the GeoPackage physical rules.
+Geometry-valued attribute values are ignored in normal GeoPackage feature
+attribute columns. The only supported geometry-valued attribute path is
+`CityObject.extra.address.location`, which must reference a `MultiPoint`.
+When `--gpkg-split-address` is set, create an `addresses` feature layer with a
+registered `MULTIPOINT` `geom` column and flattened dynamic address columns for
+all address members except `location`.
 
 ### CityObject Hierarchy
 

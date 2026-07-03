@@ -9,10 +9,11 @@ use cityjson_lib::CityModel;
 use csv::Terminator;
 
 use crate::{
-    tabular::{value_to_text_cell, TextCell},
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, CityObjectTable, IdList, MetadataRow, MetadataTable, SemanticAssignmentRow,
-    SemanticAssignmentTable, SemanticTable, Value,
+    tabular::{geometry_ref_to_multipoint_wkb_hex, value_to_text_cell, TextCell},
+    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
+    tabulate_semantic_assignments, tabulate_semantics, AddressTable, CityObjectTable, IdList,
+    MetadataRow, MetadataTable, SemanticAssignmentRow, SemanticAssignmentTable, SemanticTable,
+    Value,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -23,6 +24,7 @@ pub struct TsvExportOptions {
     pub include_cityjson_ordinal: bool,
     pub include_metadata: bool,
     pub split_semantics: bool,
+    pub split_address: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,6 +62,12 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
         let metadata = tabulate_model_metadata(model)?;
         let mut file = File::create(output_dir.join("metadata.tsv"))?;
         write_metadata_tsv(&metadata, &mut file)?;
+    }
+
+    if options.split_address {
+        let addresses = tabulate_addresses(model)?;
+        let mut file = File::create(output_dir.join("addresses.tsv"))?;
+        write_addresses_tsv(&addresses, &write_options, &mut file)?;
     }
 
     if options.split_semantics {
@@ -122,6 +130,58 @@ pub fn write_cityobjects_tsv<W: Write>(
             record.push(id_list_cell(&row.children()?)?);
         }
         record.extend(dynamic.into_iter().map(|cell| cell.text));
+        tsv.write_record(record)?;
+    }
+
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes address rows as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails or address values cannot be resolved.
+pub fn write_addresses_tsv<W: Write>(
+    table: &AddressTable<'_>,
+    options: &TsvWriteOptions,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    let mut header = vec!["cityobject_id".to_string(), "cityobject_type".to_string()];
+    if options.include_cityjson_ordinal {
+        header.push("cityobject_ix".to_string());
+    }
+    header.push("location_wkb".to_string());
+    header.extend(
+        table
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.clone()),
+    );
+    tsv.write_record(header)?;
+
+    for row in table.rows() {
+        let fixed = row.fixed();
+        let mut record = vec![
+            fixed.cityobject_id.to_string(),
+            fixed.cityobject_type_name().to_string(),
+        ];
+        if options.include_cityjson_ordinal {
+            record.push(fixed.cityobject_ix.to_string());
+        }
+        let location = fixed
+            .location()?
+            .map(|handle| geometry_ref_to_multipoint_wkb_hex(table.model(), handle))
+            .transpose()?
+            .unwrap_or_default();
+        record.push(location);
+        record.extend(
+            dynamic_cells(table.model(), row.values())?
+                .into_iter()
+                .map(|cell| cell.text),
+        );
         tsv.write_record(record)?;
     }
 

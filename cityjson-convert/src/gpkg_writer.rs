@@ -11,9 +11,9 @@ use rusqlite::{params, params_from_iter, Connection, Transaction};
 
 use crate::{
     tabular::{geometry_ref_to_wkb, metadata_to_compact_json, value_to_json},
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, CityObjectRow, CityObjectTable, LogicalType, MetadataTable,
-    SemanticAssignmentTable, SemanticTable, Value,
+    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
+    tabulate_semantic_assignments, tabulate_semantics, AddressTable, CityObjectRow,
+    CityObjectTable, LogicalType, MetadataTable, SemanticAssignmentTable, SemanticTable, Value,
 };
 
 const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
@@ -29,6 +29,7 @@ const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now
 pub struct GpkgExportOptions {
     pub split_lod: bool,
     pub split_semantics: bool,
+    pub split_address: bool,
     pub include_metadata: bool,
     pub output_crs: Option<String>,
 }
@@ -38,6 +39,7 @@ impl Default for GpkgExportOptions {
         Self {
             split_lod: false,
             split_semantics: false,
+            split_address: false,
             include_metadata: false,
             output_crs: None,
         }
@@ -78,6 +80,11 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             tabulate_semantics(model)?,
             tabulate_semantic_assignments(model)?,
         ))
+    } else {
+        None
+    };
+    let addresses = if options.split_address {
+        Some(tabulate_addresses(model)?)
     } else {
         None
     };
@@ -172,6 +179,18 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
         insert_semantics_rows(&tx, &semantics_table)?;
         create_semantic_relations_table(&tx)?;
         insert_semantic_relations(&tx, &assignment_table)?;
+    }
+
+    if let Some(address_table) = addresses {
+        create_address_table(&tx, &address_table, resolved_srs.srs_id, &last_change)?;
+        let extent = insert_address_rows(&tx, &address_table, resolved_srs.srs_id)?;
+        feature_layers.insert(
+            "addresses".to_string(),
+            FeatureLayerState {
+                insert_sql: String::new(),
+                extent,
+            },
+        );
     }
 
     if let Some(metadata_table) = metadata {
@@ -391,6 +410,100 @@ fn create_feature_table(
         ],
     )?;
     Ok(())
+}
+
+fn create_address_table(
+    tx: &Transaction<'_>,
+    addresses: &AddressTable<'_>,
+    srs_id: i32,
+    last_change: &str,
+) -> Result<()> {
+    let mut columns = vec![
+        "id INTEGER PRIMARY KEY".to_string(),
+        "cityobject_id TEXT NOT NULL".to_string(),
+        "cityobject_type TEXT NOT NULL".to_string(),
+        format!("{} BLOB", quote_ident(GPKG_GEOM_COLUMN_NAME)),
+    ];
+    columns.extend(addresses.schema().columns.iter().map(|column| {
+        format!(
+            "{} {}",
+            quote_ident(&column.name),
+            sqlite_type_decl(&column.logical_type)
+        )
+    }));
+
+    tx.execute_batch(&format!("CREATE TABLE addresses ({});", columns.join(", ")))?;
+    tx.execute(
+        "INSERT INTO gpkg_contents (
+            table_name, data_type, identifier, description, last_change, srs_id
+         ) VALUES ('addresses', 'features', 'addresses', 'addresses', ?1, ?2)",
+        params![last_change, srs_id],
+    )?;
+    tx.execute(
+        "INSERT INTO gpkg_geometry_columns (
+            table_name, column_name, geometry_type_name, srs_id, z, m
+         ) VALUES ('addresses', ?1, 'MULTIPOINT', ?2, 1, 0)",
+        params![GPKG_GEOM_COLUMN_NAME, srs_id],
+    )?;
+    Ok(())
+}
+
+fn address_insert_sql(schema: &crate::TableSchema<'_>) -> String {
+    let mut columns = vec![
+        quote_ident("cityobject_id"),
+        quote_ident("cityobject_type"),
+        quote_ident(GPKG_GEOM_COLUMN_NAME),
+    ];
+    columns.extend(
+        schema
+            .columns
+            .iter()
+            .map(|column| quote_ident(&column.name)),
+    );
+    let placeholders = (0..columns.len())
+        .map(|_| "?".to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO addresses ({}) VALUES ({})",
+        columns.join(", "),
+        placeholders
+    )
+}
+
+fn insert_address_rows(
+    tx: &Transaction<'_>,
+    addresses: &AddressTable<'_>,
+    srs_id: i32,
+) -> Result<Option<[f64; 6]>> {
+    let insert_sql = address_insert_sql(addresses.schema());
+    let mut statement = tx.prepare(&insert_sql)?;
+    let mut extent = None;
+    for row in addresses.rows() {
+        let fixed = row.fixed();
+        let encoded = fixed
+            .location()?
+            .map(|handle| encode_address_geometry_blob(addresses.model(), handle, srs_id))
+            .transpose()?;
+        extent = union_bbox(
+            extent,
+            encoded.as_ref().and_then(|encoded| encoded.envelope),
+        );
+        let mut params = vec![
+            SqlValue::Text(fixed.cityobject_id.to_string()),
+            SqlValue::Text(fixed.cityobject_type_name().to_string()),
+            encoded
+                .map(|encoded| SqlValue::Blob(encoded.blob))
+                .unwrap_or(SqlValue::Null),
+        ];
+        params.extend(
+            row.values()
+                .map(|value| sqlite_value_from_tabular_value(addresses.model(), value?))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        statement.execute(params_from_iter(params))?;
+    }
+    Ok(extent)
 }
 
 fn feature_insert_sql(table_name: &str, schema: &crate::TableSchema<'_>) -> String {
@@ -696,6 +809,26 @@ fn collect_cityobject_relations(
         relations.insert((cityobject_id.clone(), child.to_string()));
     }
     Ok(())
+}
+
+fn encode_address_geometry_blob(
+    model: &CityModel,
+    geometry_handle: cityjson_lib::cityjson_types::resources::handles::GeometryHandle,
+    srs_id: i32,
+) -> Result<EncodedGeometry> {
+    let geometry = model
+        .resolve_geometry(geometry_handle)
+        .with_context(|| format!("resolve address.location geometry handle {geometry_handle:?}"))?;
+    if !matches!(geometry.type_geometry(), GeometryType::MultiPoint) {
+        bail!(
+            "address.location geometry handle {geometry_handle:?} must resolve to MultiPoint, found {}",
+            geometry.type_geometry()
+        );
+    }
+    let Some(boundary) = geometry.boundaries() else {
+        bail!("address.location geometry handle {geometry_handle:?} resolves to a geometry without boundaries");
+    };
+    encode_geometry_blob(model, geometry.type_geometry(), boundary, srs_id)
 }
 
 fn encode_geometry_blob(

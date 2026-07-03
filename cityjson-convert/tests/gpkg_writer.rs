@@ -100,6 +100,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
         &GpkgExportOptions {
             split_lod: false,
             split_semantics: false,
+            split_address: false,
             include_metadata: true,
             output_crs: None,
         },
@@ -224,6 +225,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
         &GpkgExportOptions {
             split_lod: true,
             split_semantics: true,
+            split_address: false,
             include_metadata: false,
             output_crs: None,
         },
@@ -252,7 +254,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
 }
 
 #[test]
-fn converts_geometry_ref_attributes_to_raw_wkb_blobs() {
+fn omits_geometry_ref_attributes_from_feature_layers() {
     let mut model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -288,10 +290,8 @@ fn converts_geometry_ref_attributes_to_raw_wkb_blobs() {
         "location".to_string(),
         OwnedAttributeValue::Geometry(geometry_handle),
     );
-    let expected_wkb = cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
-        .expect("encode geometry attribute as WKB");
 
-    let output = stable_output_path("convert_to_gpkg_geometry_ref_attribute");
+    let output = stable_output_path("convert_to_gpkg_omits_geometry_ref_attribute");
     if output.exists() {
         fs::remove_file(&output).expect("remove previous output");
     }
@@ -300,25 +300,104 @@ fn converts_geometry_ref_attributes_to_raw_wkb_blobs() {
         .expect("GeoPackage conversion should succeed");
 
     let conn = Connection::open(&output).expect("open GeoPackage");
-    let declared_type: String = conn
+    let has_column: i64 = conn
         .query_row(
-            "SELECT type FROM pragma_table_info('building_multisurface') WHERE name = 'attributes__location'",
+            "SELECT COUNT(*) FROM pragma_table_info('building_multisurface') WHERE name = 'attributes__location'",
             [],
             |row| row.get(0),
         )
-        .expect("read geometry attribute column type");
-    assert_eq!(declared_type, "BLOB");
+        .expect("read feature columns");
+    assert_eq!(has_column, 0);
 
-    let (attribute_blob, feature_blob): (Vec<u8>, Vec<u8>) = conn
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
+fn converts_split_address_to_multipoint_feature_layer() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiPoint",
+                        "lod":"1",
+                        "boundaries":[0]
+                    }]
+                }
+            },
+            "vertices":[[4,5,6]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.extra_mut().insert(
+        "address".to_string(),
+        OwnedAttributeValue::Map(std::collections::HashMap::from([
+            (
+                "location".to_string(),
+                OwnedAttributeValue::Geometry(geometry_handle),
+            ),
+            (
+                "street".to_string(),
+                OwnedAttributeValue::String("Main Street".to_string()),
+            ),
+        ])),
+    );
+
+    let output = stable_output_path("convert_to_gpkg_split_address");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(
+        &model,
+        &output,
+        &GpkgExportOptions {
+            split_lod: false,
+            split_semantics: false,
+            split_address: true,
+            include_metadata: false,
+            output_crs: None,
+        },
+    )
+    .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    assert!(table_exists(&conn, "addresses"));
+    assert_eq!(table_row_count(&conn, "addresses"), 1);
+    let geometry_type_name: String = conn
         .query_row(
-            "SELECT attributes__location, geom FROM building_multisurface LIMIT 1",
+            "SELECT geometry_type_name FROM gpkg_geometry_columns WHERE table_name = 'addresses'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
-        .expect("read geometry attribute and feature blobs");
-    assert_eq!(attribute_blob, expected_wkb);
-    assert_eq!(&feature_blob[0..2], b"GP");
-    assert_ne!(feature_blob, attribute_blob);
+        .expect("read address geometry column metadata");
+    assert_eq!(geometry_type_name, "MULTIPOINT");
+
+    let (street, blob): (String, Vec<u8>) = conn
+        .query_row("SELECT street, geom FROM addresses LIMIT 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("read address row");
+    assert_eq!(street, "Main Street");
+    assert_eq!(&blob[0..2], b"GP");
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");

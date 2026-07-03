@@ -2,8 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
+    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
+    tabulate_semantic_assignments, tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType,
+    TableSchema, Value,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -676,7 +677,7 @@ fn tabulates_resolved_geometry_instance_semantic_assignments() {
 }
 
 #[test]
-fn serializes_geometry_ref_attribute_as_wkb_text() {
+fn omits_geometry_ref_attributes_from_cityobject_schema() {
     let mut model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -712,20 +713,83 @@ fn serializes_geometry_ref_attribute_as_wkb_text() {
         OwnedAttributeValue::Geometry(geometry_handle),
     );
 
-    let expected_wkb = cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
-        .expect("encode geometry attribute as WKB");
     let table = tabulate_cityobjects(&model).expect("tabulate CityObjects");
-    let column = column_index(&table, "attributes__location");
-    assert_eq!(
-        table.schema().columns[column].logical_type,
-        LogicalType::GeometryRef
+
+    assert!(table
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.name != "attributes__location"));
+}
+
+#[test]
+fn tabulates_address_location_separately_from_dynamic_address_columns() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiPoint",
+                        "lod":"1",
+                        "boundaries":[0]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.extra_mut().insert(
+        "address".to_string(),
+        OwnedAttributeValue::Map(std::collections::HashMap::from([
+            (
+                "location".to_string(),
+                OwnedAttributeValue::Geometry(geometry_handle),
+            ),
+            (
+                "street".to_string(),
+                OwnedAttributeValue::String("Main Street".to_string()),
+            ),
+        ])),
     );
 
-    let row = table.rows().next().expect("row");
-    let value = row.value(column).expect("value").expect("resolve value");
-    let cell = cityjson_convert::tabular::value_to_text_cell(table.model(), value)
-        .expect("serialize geometry ref as text");
+    let expected_wkb =
+        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(&model, geometry_handle)
+            .expect("encode address location as WKB");
+    let table = tabulate_addresses(&model).expect("tabulate addresses");
+    let rows = table.rows().collect::<Vec<_>>();
+    let street_column = schema_column_index(table.schema(), "street");
 
-    assert_eq!(cell.text, bytes_to_hex(&expected_wkb));
-    assert_ne!(cell.text, "0");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].fixed().location().unwrap(), Some(geometry_handle));
+    assert_eq!(
+        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(table.model(), geometry_handle)
+            .unwrap(),
+        expected_wkb
+    );
+    assert!(matches!(
+        rows[0].value(street_column).unwrap().unwrap(),
+        Value::Utf8("Main Street")
+    ));
+    assert!(table
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.name != "location"));
+    assert_ne!(bytes_to_hex(&expected_wkb), "0");
 }

@@ -2,9 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    convert_to_tsv, tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, write_cityobjects_tsv, write_metadata_tsv, write_semantic_assignments_tsv,
-    write_semantic_definitions_tsv, write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
+    convert_to_tsv, tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
+    tabulate_semantic_assignments, tabulate_semantics, write_addresses_tsv, write_cityobjects_tsv,
+    write_metadata_tsv, write_semantic_assignments_tsv, write_semantic_definitions_tsv,
+    write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -54,7 +55,7 @@ fn temp_output_dir(name: &str) -> PathBuf {
 }
 
 #[test]
-fn writes_geometry_ref_attributes_as_hex_wkb() {
+fn omits_geometry_ref_attributes_from_cityobjects_tsv() {
     let mut model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -90,19 +91,92 @@ fn writes_geometry_ref_attributes_as_hex_wkb() {
         OwnedAttributeValue::Geometry(geometry_handle),
     );
 
-    let expected_wkb = cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
-        .expect("encode geometry attribute as WKB");
     let table = tabulate_cityobjects(&model).expect("tabulate CityObjects");
     let mut bytes = Vec::new();
     write_cityobjects_tsv(&table, &TsvWriteOptions::default(), &mut bytes).unwrap();
     let rows = parse_tsv(&bytes);
-    let column = rows[0]
-        .iter()
-        .position(|name| name == "attributes__location")
-        .expect("geometry attribute column");
 
-    assert_eq!(rows[1][column], bytes_to_hex(&expected_wkb));
-    assert_ne!(rows[1][column], "0");
+    assert!(!rows[0].contains(&"attributes__location".to_string()));
+}
+
+#[test]
+fn writes_split_address_tsv_with_multipoint_wkb_and_dynamic_columns() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiPoint",
+                        "lod":"1",
+                        "boundaries":[0]
+                    }]
+                }
+            },
+            "vertices":[[4,5,6]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.extra_mut().insert(
+        "address".to_string(),
+        OwnedAttributeValue::Map(std::collections::HashMap::from([
+            (
+                "location".to_string(),
+                OwnedAttributeValue::Geometry(geometry_handle),
+            ),
+            (
+                "street".to_string(),
+                OwnedAttributeValue::String("Main Street".to_string()),
+            ),
+            (
+                "houseNumber".to_string(),
+                OwnedAttributeValue::String("7".to_string()),
+            ),
+        ])),
+    );
+
+    let expected_wkb =
+        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(&model, geometry_handle)
+            .expect("encode address location as WKB");
+    let table = tabulate_addresses(&model).expect("tabulate addresses");
+    let mut bytes = Vec::new();
+    write_addresses_tsv(
+        &table,
+        &TsvWriteOptions {
+            include_null_rows: false,
+            include_hierarchy: false,
+            include_cityjson_ordinal: true,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+    let rows = parse_tsv(&bytes);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], "cityobject_id");
+    assert_eq!(rows[0][2], "cityobject_ix");
+    assert!(rows[0].contains(&"location_wkb".to_string()));
+    assert!(rows[0].contains(&"street".to_string()));
+    assert!(rows[0].contains(&"houseNumber".to_string()));
+    let location_ix = rows[0]
+        .iter()
+        .position(|name| name == "location_wkb")
+        .expect("location_wkb column");
+    assert_eq!(rows[1][location_ix], bytes_to_hex(&expected_wkb));
 }
 
 #[test]
@@ -336,6 +410,7 @@ fn converts_model_to_tsv_directory_outputs() {
             include_cityjson_ordinal: true,
             include_metadata: true,
             split_semantics: true,
+            split_address: true,
         },
     )
     .unwrap();
@@ -343,6 +418,7 @@ fn converts_model_to_tsv_directory_outputs() {
     assert!(dir.join("cityobjects.tsv").is_file());
     assert!(dir.join("metadata.tsv").is_file());
     assert!(dir.join("semantics.tsv").is_file());
+    assert!(dir.join("addresses.tsv").is_file());
 
     fs::remove_dir_all(dir).unwrap();
 }
