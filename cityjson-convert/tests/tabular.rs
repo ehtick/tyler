@@ -5,7 +5,18 @@ use cityjson_convert::{
     tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
     tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
 };
+use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
 
 /// Locates the complete `CityJSON` 2.0 conformance fixture used by the public
 /// table test.
@@ -662,4 +673,59 @@ fn tabulates_resolved_geometry_instance_semantic_assignments() {
             assert_eq!(rows[0].semantic_id, Some(0));
         },
     );
+}
+
+#[test]
+fn serializes_geometry_ref_attribute_as_wkb_text() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.attributes_mut().insert(
+        "location".to_string(),
+        OwnedAttributeValue::Geometry(geometry_handle),
+    );
+
+    let expected_wkb = cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
+        .expect("encode geometry attribute as WKB");
+    let table = tabulate_cityobjects(&model).expect("tabulate CityObjects");
+    let column = column_index(&table, "attributes__location");
+    assert_eq!(
+        table.schema().columns[column].logical_type,
+        LogicalType::GeometryRef
+    );
+
+    let row = table.rows().next().expect("row");
+    let value = row.value(column).expect("value").expect("resolve value");
+    let cell = cityjson_convert::tabular::value_to_text_cell(table.model(), value)
+        .expect("serialize geometry ref as text");
+
+    assert_eq!(cell.text, bytes_to_hex(&expected_wkb));
+    assert_ne!(cell.text, "0");
 }

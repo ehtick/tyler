@@ -5,12 +5,11 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::CityModel;
 use csv::Terminator;
-use serde_json::{json, Map};
 
 use crate::{
+    tabular::{value_to_text_cell, TextCell},
     tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
     tabulate_semantics, CityObjectTable, IdList, MetadataRow, MetadataTable, SemanticAssignmentRow,
     SemanticAssignmentTable, SemanticTable, Value,
@@ -101,7 +100,7 @@ pub fn write_cityobjects_tsv<W: Write>(
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let dynamic = dynamic_cells(row.values()).with_context(|| {
+        let dynamic = dynamic_cells(table.model(), row.values()).with_context(|| {
             format!(
                 "resolve dynamic values for CityObject {}",
                 row.cityobject_id
@@ -150,7 +149,7 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
     for row in table.rows() {
         let mut record = metadata_fixed_cells(row.fixed())?;
         record.extend(
-            dynamic_cells(row.values())?
+            dynamic_cells(table.model(), row.values())?
                 .into_iter()
                 .map(|cell| cell.text),
         );
@@ -186,7 +185,7 @@ pub fn write_semantic_definitions_tsv<W: Write>(
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let dynamic = dynamic_cells(row.values())?;
+        let dynamic = dynamic_cells(table.model(), row.values())?;
         if !options.include_null_rows && all_null(&dynamic) {
             continue;
         }
@@ -273,7 +272,7 @@ pub fn write_split_semantics_tsv<W: Write>(
             .semantic_id
             .and_then(|semantic_id| semantic_by_id.get(&semantic_id).copied());
         let dynamic = match semantic {
-            Some(row) => dynamic_cells(row.values()).with_context(|| {
+            Some(row) => dynamic_cells(semantics.model(), row.values()).with_context(|| {
                 format!(
                     "resolve dynamic values for semantic {}",
                     row.fixed().semantic_id
@@ -314,122 +313,27 @@ fn tsv_writer<W: Write>(writer: W) -> csv::Writer<W> {
         .from_writer(writer)
 }
 
-#[derive(Clone, Debug)]
-struct Cell {
-    text: String,
-    is_null: bool,
-}
-
 fn dynamic_cells<'value, 'model: 'value>(
+    model: &'model CityModel,
     values: impl IntoIterator<Item = Result<Value<'value, 'model>>>,
-) -> Result<Vec<Cell>> {
+) -> Result<Vec<TextCell>> {
     values
         .into_iter()
-        .map(|value| Cell::try_from(value?))
+        .map(|value| value_to_text_cell(model, value?))
         .collect::<Result<Vec<_>>>()
 }
 
-fn null_cells(count: usize) -> Vec<Cell> {
+fn null_cells(count: usize) -> Vec<TextCell> {
     (0..count)
-        .map(|_| Cell {
+        .map(|_| TextCell {
             text: String::new(),
             is_null: true,
         })
         .collect()
 }
 
-fn all_null(cells: &[Cell]) -> bool {
+fn all_null(cells: &[TextCell]) -> bool {
     cells.iter().all(|cell| cell.is_null)
-}
-
-impl TryFrom<Value<'_, '_>> for Cell {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Value<'_, '_>) -> Result<Self> {
-        Ok(match value {
-            Value::Null => Self {
-                text: String::new(),
-                is_null: true,
-            },
-            Value::Boolean(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::UInt64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Int64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Float64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Utf8(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            nested => Self {
-                text: serde_json::to_string(&value_to_json(nested)?)?,
-                is_null: false,
-            },
-        })
-    }
-}
-
-fn value_to_json(value: Value<'_, '_>) -> Result<serde_json::Value> {
-    Ok(match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(value) => json!(value),
-        Value::UInt64(value) => json!(value),
-        Value::Int64(value) => json!(value),
-        Value::Float64(value) => json!(value),
-        Value::Utf8(value) => json!(value),
-        Value::GeometryRef(value) => json!(value.raw_parts().0),
-        Value::Json(value) => attribute_value_to_json(value)?,
-        Value::List(values) => {
-            let mut items = Vec::with_capacity(values.len());
-            for item in values.iter() {
-                items.push(value_to_json(item?)?);
-            }
-            serde_json::Value::Array(items)
-        }
-        Value::Struct(values) => {
-            let mut fields = Map::new();
-            for field in values.fields() {
-                let (name, value) = field?;
-                fields.insert(name.to_string(), value_to_json(value)?);
-            }
-            serde_json::Value::Object(fields)
-        }
-    })
-}
-
-fn attribute_value_to_json(value: &OwnedAttributeValue) -> Result<serde_json::Value> {
-    Ok(match value {
-        OwnedAttributeValue::Null => serde_json::Value::Null,
-        OwnedAttributeValue::Bool(value) => json!(value),
-        OwnedAttributeValue::Unsigned(value) => json!(value),
-        OwnedAttributeValue::Integer(value) => json!(value),
-        OwnedAttributeValue::Float(value) => json!(value),
-        OwnedAttributeValue::String(value) => json!(value),
-        OwnedAttributeValue::Vec(values) => values
-            .iter()
-            .map(attribute_value_to_json)
-            .collect::<Result<Vec<_>>>()?
-            .into(),
-        OwnedAttributeValue::Map(values) => {
-            let mut fields = Map::new();
-            for (name, value) in values {
-                fields.insert(name.clone(), attribute_value_to_json(value)?);
-            }
-            serde_json::Value::Object(fields)
-        }
-        OwnedAttributeValue::Geometry(value) => json!(value.raw_parts().0),
-        unsupported => anyhow::bail!("unsupported attribute value variant {unsupported}"),
-    })
 }
 
 fn id_list_cell(ids: &IdList<'_>) -> Result<String> {

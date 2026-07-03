@@ -125,7 +125,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson_types::resources::handles::{
     CityObjectHandle, GeometryHandle, SemanticHandle,
 };
@@ -135,6 +135,7 @@ use cityjson_lib::cityjson_types::v2_0::{
     SemanticType,
 };
 use cityjson_lib::CityModel;
+use serde_json::{Map, Value as JsonValue};
 
 #[derive(Debug)]
 pub struct CityObjectTable<'model> {
@@ -143,6 +144,12 @@ pub struct CityObjectTable<'model> {
 }
 
 impl<'model> CityObjectTable<'model> {
+    /// Returns the source model backing this borrowed table.
+    #[must_use]
+    pub fn model(&self) -> &'model CityModel {
+        self.model
+    }
+
     /// Returns the shared flattened schema used by every row.
     #[must_use]
     pub fn schema(&self) -> &TableSchema<'model> {
@@ -365,11 +372,18 @@ impl<'model> IdList<'model> {
 /// One-row logical metadata table for a `CityJSON` model.
 #[derive(Debug)]
 pub struct MetadataTable<'model> {
+    model: &'model CityModel,
     rows: Vec<MetadataRow<'model>>,
     schema: TableSchema<'model>,
 }
 
 impl<'model> MetadataTable<'model> {
+    /// Returns the source model backing this borrowed table.
+    #[must_use]
+    pub fn model(&self) -> &'model CityModel {
+        self.model
+    }
+
     /// Returns the flattened schema for metadata `extra` fields.
     #[must_use]
     pub fn schema(&self) -> &TableSchema<'model> {
@@ -434,11 +448,18 @@ impl<'table, 'model> MetadataRowRef<'table, 'model> {
 /// Borrowed semantic-definition table with one row per semantic object.
 #[derive(Debug)]
 pub struct SemanticTable<'model> {
+    model: &'model CityModel,
     rows: Vec<SemanticRow<'model>>,
     schema: TableSchema<'model>,
 }
 
 impl<'model> SemanticTable<'model> {
+    /// Returns the source model backing this borrowed table.
+    #[must_use]
+    pub fn model(&self) -> &'model CityModel {
+        self.model
+    }
+
     /// Returns the flattened schema for semantic attributes.
     #[must_use]
     pub fn schema(&self) -> &TableSchema<'model> {
@@ -574,6 +595,267 @@ pub enum Value<'schema, 'model> {
     Json(&'model OwnedAttributeValue),
 }
 
+/// Text cell produced from a tabular value for delimiter-based writers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextCell {
+    pub text: String,
+    pub is_null: bool,
+}
+
+/// Serializes a logical tabular value to the shared compact text-cell contract.
+///
+/// Scalar values are written directly. Nested values, heterogeneous JSON
+/// fallbacks, and geometry references inside nested values are encoded as compact
+/// JSON text. Geometry references are encoded as hex ISO WKB.
+///
+/// # Errors
+///
+/// Returns an error when a lazy nested value cannot be resolved, a geometry
+/// reference cannot be encoded as WKB, or an unsupported source attribute variant
+/// is encountered.
+pub fn value_to_text_cell(model: &CityModel, value: Value<'_, '_>) -> Result<TextCell> {
+    Ok(match value {
+        Value::Null => TextCell {
+            text: String::new(),
+            is_null: true,
+        },
+        Value::Boolean(value) => TextCell {
+            text: value.to_string(),
+            is_null: false,
+        },
+        Value::UInt64(value) => TextCell {
+            text: value.to_string(),
+            is_null: false,
+        },
+        Value::Int64(value) => TextCell {
+            text: value.to_string(),
+            is_null: false,
+        },
+        Value::Float64(value) => TextCell {
+            text: value.to_string(),
+            is_null: false,
+        },
+        Value::Utf8(value) => TextCell {
+            text: value.to_string(),
+            is_null: false,
+        },
+        Value::GeometryRef(value) => TextCell {
+            text: geometry_ref_to_wkb_hex(model, value)?,
+            is_null: false,
+        },
+        nested => TextCell {
+            text: serde_json::to_string(&value_to_json(model, nested)?)?,
+            is_null: false,
+        },
+    })
+}
+
+/// Serializes a logical tabular value to compact JSON-compatible data.
+///
+/// This is intentionally a tabular serializer, not CityJSON document
+/// serialization. In particular, geometry references are emitted as hex ISO WKB.
+///
+/// # Errors
+///
+/// Returns an error when a lazy nested value cannot be resolved, a geometry
+/// reference cannot be encoded as WKB, or an unsupported source attribute variant
+/// is encountered.
+pub fn value_to_json(model: &CityModel, value: Value<'_, '_>) -> Result<JsonValue> {
+    Ok(match value {
+        Value::Null => JsonValue::Null,
+        Value::Boolean(value) => JsonValue::Bool(value),
+        Value::UInt64(value) => JsonValue::Number(value.into()),
+        Value::Int64(value) => JsonValue::Number(value.into()),
+        Value::Float64(value) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Value::Utf8(value) => JsonValue::String(value.to_string()),
+        Value::GeometryRef(value) => JsonValue::String(geometry_ref_to_wkb_hex(model, value)?),
+        Value::List(values) => {
+            let mut items = Vec::with_capacity(values.len());
+            for item in values.iter() {
+                items.push(value_to_json(model, item?)?);
+            }
+            JsonValue::Array(items)
+        }
+        Value::Struct(values) => {
+            let mut fields = Map::new();
+            for field in values.fields() {
+                let (name, value) = field?;
+                fields.insert(name.to_string(), value_to_json(model, value)?);
+            }
+            JsonValue::Object(fields)
+        }
+        Value::Json(value) => attribute_value_to_json(model, value)?,
+    })
+}
+
+/// Serializes a source attribute value using the tabular JSON fallback contract.
+///
+/// Geometry-valued attributes become hex ISO WKB strings. This differs from
+/// `cityjson-json`, which serializes those values for CityJSON documents.
+///
+/// # Errors
+///
+/// Returns an error when the attribute variant is unsupported by the tabular
+/// representation or a geometry reference cannot be encoded as WKB.
+pub fn attribute_value_to_json(
+    model: &CityModel,
+    value: &OwnedAttributeValue,
+) -> Result<JsonValue> {
+    Ok(match value {
+        OwnedAttributeValue::Null => JsonValue::Null,
+        OwnedAttributeValue::Bool(value) => JsonValue::Bool(*value),
+        OwnedAttributeValue::Unsigned(value) => JsonValue::Number((*value).into()),
+        OwnedAttributeValue::Integer(value) => JsonValue::Number((*value).into()),
+        OwnedAttributeValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        OwnedAttributeValue::String(value) => JsonValue::String(value.clone()),
+        OwnedAttributeValue::Vec(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(|value| attribute_value_to_json(model, value))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        OwnedAttributeValue::Map(values) => {
+            let mut fields = Map::new();
+            for (name, value) in values {
+                fields.insert(name.clone(), attribute_value_to_json(model, value)?);
+            }
+            JsonValue::Object(fields)
+        }
+        OwnedAttributeValue::Geometry(value) => {
+            JsonValue::String(geometry_ref_to_wkb_hex(model, *value)?)
+        }
+        unsupported => bail!("unsupported attribute value variant {unsupported}"),
+    })
+}
+
+/// Resolves a geometry attribute handle and returns raw ISO WKB bytes.
+///
+/// # Errors
+///
+/// Returns an error when the handle is dangling, resolves to a geometry without
+/// boundaries, or WKB conversion fails.
+pub fn geometry_ref_to_wkb(model: &CityModel, value: GeometryHandle) -> Result<Vec<u8>> {
+    let geometry = model
+        .resolve_geometry(value)
+        .with_context(|| format!("resolve geometry attribute handle {value:?}"))?;
+    let Some(boundary) = geometry.boundaries() else {
+        bail!("geometry attribute handle {value:?} resolves to a geometry without boundaries");
+    };
+    boundary
+        .to_wkb(model.vertices())
+        .with_context(|| format!("encode geometry attribute handle {value:?} as WKB"))
+}
+
+fn geometry_ref_to_wkb_hex(model: &CityModel, value: GeometryHandle) -> Result<String> {
+    Ok(bytes_to_hex(&geometry_ref_to_wkb(model, value)?))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+/// Serializes model metadata to compact JSON for metadata-extension payloads.
+///
+/// # Errors
+///
+/// Returns an error when metadata `extra` contains an unsupported attribute
+/// variant.
+pub fn metadata_to_compact_json(
+    model: &CityModel,
+    metadata: &Metadata<OwnedStringStorage>,
+) -> Result<String> {
+    let mut object = Map::new();
+    if let Some(identifier) = metadata.identifier() {
+        object.insert(
+            "identifier".to_string(),
+            JsonValue::String(identifier.to_string()),
+        );
+    }
+    if let Some(reference_date) = metadata.reference_date() {
+        object.insert(
+            "referenceDate".to_string(),
+            JsonValue::String(reference_date.to_string()),
+        );
+    }
+    if let Some(reference_system) = metadata.reference_system() {
+        object.insert(
+            "referenceSystem".to_string(),
+            JsonValue::String(reference_system.to_string()),
+        );
+    }
+    if let Some(title) = metadata.title() {
+        object.insert("title".to_string(), JsonValue::String(title.to_string()));
+    }
+    if let Some(extent) = metadata.geographical_extent() {
+        object.insert(
+            "geographicalExtent".to_string(),
+            JsonValue::Array(
+                extent
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(JsonValue::from)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(contact) = metadata.point_of_contact() {
+        let mut contact_object = Map::new();
+        contact_object.insert(
+            "contactName".to_string(),
+            JsonValue::String(contact.contact_name().to_string()),
+        );
+        contact_object.insert(
+            "emailAddress".to_string(),
+            JsonValue::String(contact.email_address().to_string()),
+        );
+        if let Some(role) = contact.role() {
+            contact_object.insert("role".to_string(), JsonValue::String(role.to_string()));
+        }
+        if let Some(website) = contact.website().as_ref() {
+            contact_object.insert(
+                "website".to_string(),
+                JsonValue::String(website.to_string()),
+            );
+        }
+        if let Some(kind) = contact.contact_type() {
+            contact_object.insert(
+                "contactType".to_string(),
+                JsonValue::String(kind.to_string()),
+            );
+        }
+        if let Some(phone) = contact.phone().as_ref() {
+            contact_object.insert("phone".to_string(), JsonValue::String(phone.to_string()));
+        }
+        if let Some(organization) = contact.organization().as_ref() {
+            contact_object.insert(
+                "organization".to_string(),
+                JsonValue::String(organization.to_string()),
+            );
+        }
+        object.insert(
+            "pointOfContact".to_string(),
+            JsonValue::Object(contact_object),
+        );
+    }
+    if let Some(extra) = metadata.extra() {
+        for (name, value) in extra.iter() {
+            object.insert(format!("+{name}"), attribute_value_to_json(model, value)?);
+        }
+    }
+    Ok(serde_json::to_string(&JsonValue::Object(object))?)
+}
+
 /// Lazy borrowed list value.
 #[derive(Debug)]
 pub struct ListValue<'schema, 'model> {
@@ -676,6 +958,7 @@ pub fn tabulate_model_metadata(model: &CityModel) -> Result<MetadataTable<'_>> {
         .unwrap_or_default();
     let extra = infer_attribute_schema([row.extra])?;
     Ok(MetadataTable {
+        model,
         rows: vec![row],
         schema: build_dynamic_schema(
             [(ColumnOrigin::MetadataExtra, extra)],
@@ -715,6 +998,7 @@ pub fn tabulate_semantics(model: &CityModel) -> Result<SemanticTable<'_>> {
         .map(|(handle, semantic)| SemanticRow::from_semantic(handle, semantic))
         .collect();
     Ok(SemanticTable {
+        model,
         rows,
         schema: build_dynamic_schema(
             [(ColumnOrigin::SemanticAttributes, attributes)],
