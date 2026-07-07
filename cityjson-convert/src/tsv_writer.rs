@@ -8,7 +8,7 @@ use cityjson_lib::CityModel;
 use csv::Terminator;
 
 use crate::{
-    tabular::{geometry_ref_to_multipoint_wkb_hex, value_to_text_cell, TextCell},
+    tabular::{value_to_text_cell, TextCell},
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow, MetadataTable,
@@ -23,7 +23,7 @@ pub struct TsvExportOptions {
     pub include_cityjson_ordinal: bool,
     pub include_metadata: bool,
     pub include_semantics: bool,
-    pub split_address: bool,
+    pub include_address: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,7 +73,7 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
         write_metadata_tsv(&metadata, &mut file)?;
     }
 
-    if options.split_address {
+    if options.include_address {
         let addresses = tabulate_addresses(model)?;
         let mut file = File::create(output_dir.join("addresses.tsv"))?;
         write_addresses_tsv(&addresses, &write_options, &mut file)?;
@@ -181,15 +181,11 @@ pub fn write_semantic_hierarchy_tsv<W: Write>(
 /// Returns an error when writing fails or address values cannot be resolved.
 pub fn write_addresses_tsv<W: Write>(
     table: &AddressTable<'_>,
-    options: &TsvWriteOptions,
+    _options: &TsvWriteOptions,
     writer: W,
 ) -> Result<()> {
     let mut tsv = tsv_writer(writer);
     let mut header = vec!["cityobject_id".to_string(), "cityobject_type".to_string()];
-    if options.include_cityjson_ordinal {
-        header.push("cityobject_ix".to_string());
-    }
-    header.push("location_wkb".to_string());
     header.extend(
         table
             .schema()
@@ -205,15 +201,6 @@ pub fn write_addresses_tsv<W: Write>(
             fixed.cityobject_id.to_string(),
             fixed.cityobject_type_name().to_string(),
         ];
-        if options.include_cityjson_ordinal {
-            record.push(fixed.cityobject_ix.to_string());
-        }
-        let location = fixed
-            .location()?
-            .map(|handle| geometry_ref_to_multipoint_wkb_hex(table.model(), handle))
-            .transpose()?
-            .unwrap_or_default();
-        record.push(location);
         record.extend(
             dynamic_cells(table.model(), row.values())?
                 .into_iter()

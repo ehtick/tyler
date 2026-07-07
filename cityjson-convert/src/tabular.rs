@@ -1269,15 +1269,14 @@ pub fn tabulate_cityobject_hierarchy(model: &CityModel) -> Result<CityObjectHier
 pub fn tabulate_addresses(model: &CityModel) -> Result<AddressTable<'_>> {
     let mut rows = Vec::new();
     for (cityobject_ix, (_, object)) in model.cityobjects().iter().enumerate() {
-        let Some(address) = cityobject_address(object)? else {
-            continue;
-        };
-        rows.push(AddressRow {
-            cityobject_id: object.id(),
-            cityobject_ix: cityobject_ix as u64,
-            cityobject_type: object.type_cityobject(),
-            address,
-        });
+        for address in cityobject_addresses(object)? {
+            rows.push(AddressRow {
+                cityobject_id: object.id(),
+                cityobject_ix: cityobject_ix as u64,
+                cityobject_type: object.type_cityobject(),
+                address,
+            });
+        }
     }
 
     let mut schema = StructSchema::default();
@@ -1290,13 +1289,7 @@ pub fn tabulate_addresses(model: &CityModel) -> Result<AddressTable<'_>> {
         rows,
         schema: build_dynamic_schema(
             [(ColumnOrigin::Extra, schema)],
-            &[
-                "cityobject_id",
-                "cityobject_ix",
-                "cityobject_type",
-                "location_wkb",
-                "geom",
-            ],
+            &["cityobject_id", "cityobject_ix", "cityobject_type", "geom"],
         ),
     })
 }
@@ -1662,17 +1655,28 @@ impl<'model> SemanticRow<'model> {
     }
 }
 
-fn cityobject_address(
+fn cityobject_addresses(
     object: &cityjson_lib::cityjson_types::v2_0::CityObject<OwnedStringStorage>,
-) -> Result<Option<&HashMap<String, OwnedAttributeValue>>> {
+) -> Result<Vec<&HashMap<String, OwnedAttributeValue>>> {
     let Some(value) = object.extra().and_then(|extra| extra.get("address")) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     match value {
-        OwnedAttributeValue::Null => Ok(None),
-        OwnedAttributeValue::Map(values) => Ok(Some(values)),
+        OwnedAttributeValue::Null => Ok(Vec::new()),
+        OwnedAttributeValue::Vec(values) => values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| match value {
+                OwnedAttributeValue::Null => None,
+                OwnedAttributeValue::Map(values) => Some(Ok(values)),
+                other => Some(Err(anyhow::anyhow!(
+                    "address[{index}] member for CityObject {} must be an object, found {other}",
+                    object.id()
+                ))),
+            })
+            .collect(),
         other => bail!(
-            "address member for CityObject {} must be an object, found {other}",
+            "address member for CityObject {} must be an array, found {other}",
             object.id()
         ),
     }

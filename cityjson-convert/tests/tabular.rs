@@ -867,16 +867,22 @@ fn tabulates_address_location_separately_from_dynamic_address_columns() {
         .expect("cityobject");
     cityobject.extra_mut().insert(
         "address".to_string(),
-        OwnedAttributeValue::Map(std::collections::HashMap::from([
-            (
-                "location".to_string(),
-                OwnedAttributeValue::Geometry(geometry_handle),
-            ),
-            (
+        OwnedAttributeValue::Vec(vec![
+            OwnedAttributeValue::Map(std::collections::HashMap::from([
+                (
+                    "location".to_string(),
+                    OwnedAttributeValue::Geometry(geometry_handle),
+                ),
+                (
+                    "street".to_string(),
+                    OwnedAttributeValue::String("Main Street".to_string()),
+                ),
+            ])),
+            OwnedAttributeValue::Map(std::collections::HashMap::from([(
                 "street".to_string(),
-                OwnedAttributeValue::String("Main Street".to_string()),
-            ),
-        ])),
+                OwnedAttributeValue::String("Second Street".to_string()),
+            )])),
+        ]),
     );
 
     let expected_wkb =
@@ -886,8 +892,9 @@ fn tabulates_address_location_separately_from_dynamic_address_columns() {
     let rows = table.rows().collect::<Vec<_>>();
     let street_column = schema_column_index(table.schema(), "street");
 
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].fixed().location().unwrap(), Some(geometry_handle));
+    assert_eq!(rows[1].fixed().location().unwrap(), None);
     assert_eq!(
         cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(table.model(), geometry_handle)
             .unwrap(),
@@ -896,6 +903,10 @@ fn tabulates_address_location_separately_from_dynamic_address_columns() {
     assert!(matches!(
         rows[0].value(street_column).unwrap().unwrap(),
         Value::Utf8("Main Street")
+    ));
+    assert!(matches!(
+        rows[1].value(street_column).unwrap().unwrap(),
+        Value::Utf8("Second Street")
     ));
     assert!(table
         .schema()

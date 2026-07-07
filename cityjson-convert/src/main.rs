@@ -85,8 +85,8 @@ struct TsvFileCliOptions {
     #[arg(long = "tsv-include-semantics", default_value_t = false)]
     tsv_include_semantics: bool,
     /// Write `CityObject` extra.address values to addresses.tsv.
-    #[arg(long = "tsv-split-address", default_value_t = false)]
-    tsv_split_address: bool,
+    #[arg(long = "tsv-include-address", default_value_t = false)]
+    tsv_include_address: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -112,7 +112,7 @@ struct GpkgLayerCliOptions {
     #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
     hierarchy_tables: bool,
     // Write CityObject extra.address values to a separate feature layer.
-    #[arg(long = "gpkg-split-address", default_value_t = false)]
+    #[arg(long = "gpkg-include-address", default_value_t = false)]
     address_layer: bool,
 }
 
@@ -179,7 +179,7 @@ fn main() -> anyhow::Result<()> {
             let options = GpkgExportOptions {
                 split_lod: cli.gpkg.layers.lod_layers,
                 include_semantics: cli.gpkg.layers.semantics_tables,
-                split_address: cli.gpkg.layers.address_layer,
+                include_address: cli.gpkg.layers.address_layer,
                 include_hierarchy: cli.gpkg.layers.hierarchy_tables,
                 include_metadata: cli.gpkg.metadata.include_source,
                 output_crs: cli.gpkg.output_crs.clone(),
@@ -196,7 +196,7 @@ fn main() -> anyhow::Result<()> {
                 include_cityjson_ordinal: cli.tsv_rows.tsv_include_cityjson_ordinal,
                 include_metadata: cli.tsv_files.tsv_include_metadata,
                 include_semantics: cli.tsv_files.tsv_include_semantics,
-                split_address: cli.tsv_files.tsv_split_address,
+                include_address: cli.tsv_files.tsv_include_address,
             };
             info!("Converting to TSV");
             convert_to_tsv(&model, &cli.output, &options)?;

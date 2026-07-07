@@ -34,7 +34,7 @@ const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now
 pub struct GpkgExportOptions {
     pub split_lod: bool,
     pub include_semantics: bool,
-    pub split_address: bool,
+    pub include_address: bool,
     pub include_hierarchy: bool,
     pub include_metadata: bool,
     pub output_crs: Option<String>,
@@ -84,7 +84,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     } else {
         None
     };
-    let addresses = if options.split_address {
+    let addresses = if options.include_address {
         Some(tabulate_addresses(model)?)
     } else {
         None
@@ -541,7 +541,6 @@ fn create_address_table(
         "id INTEGER PRIMARY KEY".to_string(),
         "cityobject_id TEXT NOT NULL".to_string(),
         "cityobject_type TEXT NOT NULL".to_string(),
-        format!("{} MULTIPOINT", quote_ident(GPKG_GEOM_COLUMN_NAME)),
     ];
     columns.extend(addresses.schema().columns.iter().map(|column| {
         format!(
@@ -550,6 +549,7 @@ fn create_address_table(
             sqlite_type_decl(&column.logical_type)
         )
     }));
+    columns.push(format!("{} MULTIPOINT", quote_ident(GPKG_GEOM_COLUMN_NAME)));
 
     tx.execute_batch(&format!("CREATE TABLE addresses ({});", columns.join(", ")))?;
     tx.execute(
@@ -568,17 +568,14 @@ fn create_address_table(
 }
 
 fn address_insert_sql(schema: &crate::TableSchema<'_>) -> String {
-    let mut columns = vec![
-        quote_ident("cityobject_id"),
-        quote_ident("cityobject_type"),
-        quote_ident(GPKG_GEOM_COLUMN_NAME),
-    ];
+    let mut columns = vec![quote_ident("cityobject_id"), quote_ident("cityobject_type")];
     columns.extend(
         schema
             .columns
             .iter()
             .map(|column| quote_ident(&column.name)),
     );
+    columns.push(quote_ident(GPKG_GEOM_COLUMN_NAME));
     let placeholders = (0..columns.len())
         .map(|_| "?".to_string())
         .collect::<Vec<_>>()
@@ -611,13 +608,13 @@ fn insert_address_rows(
         let mut params = vec![
             SqlValue::Text(fixed.cityobject_id.to_string()),
             SqlValue::Text(fixed.cityobject_type_name().to_string()),
-            encoded.map_or(SqlValue::Null, |encoded| SqlValue::Blob(encoded.blob)),
         ];
         params.extend(
             row.values()
                 .map(|value| sqlite_value_from_tabular_value(addresses.model(), value?))
                 .collect::<Result<Vec<_>>>()?,
         );
+        params.push(encoded.map_or(SqlValue::Null, |encoded| SqlValue::Blob(encoded.blob)));
         statement.execute(params_from_iter(params))?;
     }
     Ok(extent)

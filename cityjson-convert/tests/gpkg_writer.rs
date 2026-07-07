@@ -228,7 +228,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
         &GpkgExportOptions {
             split_lod: false,
             include_semantics: false,
-            split_address: false,
+            include_address: false,
             include_hierarchy: true,
             include_metadata: true,
             output_crs: None,
@@ -297,7 +297,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
         &GpkgExportOptions {
             split_lod: true,
             include_semantics: true,
-            split_address: false,
+            include_address: false,
             include_hierarchy: true,
             include_metadata: false,
             output_crs: None,
@@ -376,7 +376,7 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
         &GpkgExportOptions {
             split_lod: true,
             include_semantics: false,
-            split_address: false,
+            include_address: false,
             include_hierarchy: false,
             include_metadata: false,
             output_crs: None,
@@ -515,7 +515,7 @@ fn omits_geometry_ref_attributes_from_feature_layers() {
 }
 
 #[test]
-fn converts_split_address_to_multipoint_feature_layer() {
+fn converts_include_address_to_multipoint_feature_layer() {
     let mut model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -549,19 +549,21 @@ fn converts_split_address_to_multipoint_feature_layer() {
         .expect("cityobject");
     cityobject.extra_mut().insert(
         "address".to_string(),
-        OwnedAttributeValue::Map(std::collections::HashMap::from([
-            (
-                "location".to_string(),
-                OwnedAttributeValue::Geometry(geometry_handle),
-            ),
-            (
-                "street".to_string(),
-                OwnedAttributeValue::String("Main Street".to_string()),
-            ),
-        ])),
+        OwnedAttributeValue::Vec(vec![OwnedAttributeValue::Map(
+            std::collections::HashMap::from([
+                (
+                    "location".to_string(),
+                    OwnedAttributeValue::Geometry(geometry_handle),
+                ),
+                (
+                    "street".to_string(),
+                    OwnedAttributeValue::String("Main Street".to_string()),
+                ),
+            ]),
+        )]),
     );
 
-    let output = stable_output_path("convert_to_gpkg_split_address");
+    let output = stable_output_path("convert_to_gpkg_include_address");
     if output.exists() {
         fs::remove_file(&output).expect("remove previous output");
     }
@@ -572,7 +574,7 @@ fn converts_split_address_to_multipoint_feature_layer() {
         &GpkgExportOptions {
             split_lod: false,
             include_semantics: false,
-            split_address: true,
+            include_address: true,
             include_hierarchy: false,
             include_metadata: false,
             output_crs: None,

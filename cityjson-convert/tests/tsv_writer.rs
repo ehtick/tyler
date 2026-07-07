@@ -10,16 +10,6 @@ use cityjson_convert::{
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
 fn parse_tsv(bytes: &[u8]) -> Vec<Vec<String>> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -138,7 +128,7 @@ fn omits_geometry_ref_attributes_from_cityobjects_tsv() {
 }
 
 #[test]
-fn writes_split_address_tsv_with_multipoint_wkb_and_dynamic_columns() {
+fn writes_include_address_tsv_with_dynamic_columns() {
     let mut model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -171,25 +161,24 @@ fn writes_split_address_tsv_with_multipoint_wkb_and_dynamic_columns() {
         .expect("cityobject");
     cityobject.extra_mut().insert(
         "address".to_string(),
-        OwnedAttributeValue::Map(std::collections::HashMap::from([
-            (
-                "location".to_string(),
-                OwnedAttributeValue::Geometry(geometry_handle),
-            ),
-            (
-                "street".to_string(),
-                OwnedAttributeValue::String("Main Street".to_string()),
-            ),
-            (
-                "houseNumber".to_string(),
-                OwnedAttributeValue::String("7".to_string()),
-            ),
-        ])),
+        OwnedAttributeValue::Vec(vec![OwnedAttributeValue::Map(
+            std::collections::HashMap::from([
+                (
+                    "location".to_string(),
+                    OwnedAttributeValue::Geometry(geometry_handle),
+                ),
+                (
+                    "street".to_string(),
+                    OwnedAttributeValue::String("Main Street".to_string()),
+                ),
+                (
+                    "houseNumber".to_string(),
+                    OwnedAttributeValue::String("7".to_string()),
+                ),
+            ]),
+        )]),
     );
 
-    let expected_wkb =
-        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(&model, geometry_handle)
-            .expect("encode address location as WKB");
     let table = tabulate_addresses(&model).expect("tabulate addresses");
     let mut bytes = Vec::new();
     write_addresses_tsv(
@@ -205,16 +194,13 @@ fn writes_split_address_tsv_with_multipoint_wkb_and_dynamic_columns() {
     let rows = parse_tsv(&bytes);
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], "cityobject_id");
-    assert_eq!(rows[0][2], "cityobject_ix");
-    assert!(rows[0].contains(&"location_wkb".to_string()));
-    assert!(rows[0].contains(&"street".to_string()));
-    assert!(rows[0].contains(&"houseNumber".to_string()));
-    let location_ix = rows[0]
-        .iter()
-        .position(|name| name == "location_wkb")
-        .expect("location_wkb column");
-    assert_eq!(rows[1][location_ix], bytes_to_hex(&expected_wkb));
+    assert_eq!(
+        rows[0],
+        ["cityobject_id", "cityobject_type", "houseNumber", "street"]
+    );
+    assert_eq!(rows[1], ["building", "Building", "7", "Main Street"]);
+    assert!(!rows[0].contains(&"location".to_string()));
+    assert!(!rows[0].contains(&"geom".to_string()));
 }
 
 #[test]
@@ -425,7 +411,7 @@ fn converts_model_to_tsv_directory_outputs() {
             include_cityjson_ordinal: true,
             include_metadata: true,
             include_semantics: true,
-            split_address: true,
+            include_address: true,
         },
     )
     .unwrap();
