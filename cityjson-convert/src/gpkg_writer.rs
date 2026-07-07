@@ -11,12 +11,13 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, Transaction};
 
 use crate::{
-    tabular::{geometry_ref_to_wkb, metadata_to_compact_json, value_to_json},
+    tabular::{
+        geometry_ref_to_wkb, metadata_to_compact_json, semantic_primitive_geometry, value_to_json,
+    },
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
-    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
-    tabulate_semantics, AddressTable, CityObjectHierarchyTable, CityObjectRow, CityObjectTable,
-    LogicalType, MetadataTable, SemanticAssignmentTable, SemanticHierarchyTable, SemanticTable,
-    Value,
+    tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
+    AddressTable, CityObjectHierarchyTable, CityObjectRow, CityObjectTable, LogicalType,
+    MetadataTable, SemanticHierarchyTable, SemanticPrimitiveTable, Value,
 };
 
 const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
@@ -32,7 +33,7 @@ const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now
 #[allow(clippy::struct_excessive_bools)]
 pub struct GpkgExportOptions {
     pub split_lod: bool,
-    pub split_semantics: bool,
+    pub include_semantics: bool,
     pub split_address: bool,
     pub include_hierarchy: bool,
     pub include_metadata: bool,
@@ -78,11 +79,8 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     } else {
         None
     };
-    let semantics = if options.split_semantics {
-        Some((
-            tabulate_semantics(model)?,
-            tabulate_semantic_assignments(model)?,
-        ))
+    let semantics = if options.include_semantics {
+        Some(tabulate_semantic_primitives(model)?)
     } else {
         None
     };
@@ -135,11 +133,16 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
         insert_semantic_hierarchy(&tx, &semantic_hierarchy)?;
     }
 
-    if let Some((semantics_table, assignment_table)) = semantics {
-        create_semantics_table(&tx, semantics_table.schema(), &last_change)?;
-        insert_semantics_rows(&tx, &semantics_table)?;
-        create_semantic_relations_table(&tx, &last_change)?;
-        insert_semantic_relations(&tx, &assignment_table)?;
+    if let Some(semantics_table) = semantics {
+        create_semantics_table(&tx, &semantics_table, resolved_srs.srs_id, &last_change)?;
+        let extent = insert_semantics_rows(&tx, &semantics_table, resolved_srs.srs_id)?;
+        feature_layers.insert(
+            "semantics".to_string(),
+            FeatureLayerState {
+                insert_sql: String::new(),
+                extent,
+            },
+        );
     }
 
     if let Some(address_table) = addresses {
@@ -674,6 +677,21 @@ fn insert_feature_row(
     Ok(())
 }
 
+fn register_attribute_table(
+    tx: &Transaction<'_>,
+    table_name: &str,
+    description: &str,
+    last_change: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO gpkg_contents (
+            table_name, data_type, identifier, description, last_change
+         ) VALUES (?1, 'attributes', ?2, ?3, ?4)",
+        params![table_name, table_name, description, last_change],
+    )?;
+    Ok(())
+}
+
 fn create_cityobject_hierarchy_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
     tx.execute_batch(
         "CREATE TABLE cityobject_hierarchy (
@@ -732,16 +750,22 @@ fn insert_semantic_hierarchy(
 
 fn create_semantics_table(
     tx: &Transaction<'_>,
-    schema: &crate::TableSchema<'_>,
+    semantics: &SemanticPrimitiveTable<'_>,
+    srs_id: i32,
     last_change: &str,
 ) -> Result<()> {
     let mut columns = vec![
-        "semantic_id INTEGER PRIMARY KEY".to_string(),
+        "id INTEGER PRIMARY KEY".to_string(),
+        "cityobject_id TEXT NOT NULL".to_string(),
+        "geometry_ix INTEGER NOT NULL".to_string(),
+        "semantic_ix INTEGER NOT NULL".to_string(),
+        "primitive_ix INTEGER NOT NULL".to_string(),
+        "geometry_type TEXT NOT NULL".to_string(),
+        "geometry_lod TEXT".to_string(),
         "semantic_type TEXT NOT NULL".to_string(),
-        "parent INTEGER".to_string(),
-        "children TEXT NOT NULL".to_string(),
+        format!("{} GEOMETRY NOT NULL", quote_ident(GPKG_GEOM_COLUMN_NAME)),
     ];
-    columns.extend(schema.columns.iter().map(|column| {
+    columns.extend(semantics.schema().columns.iter().map(|column| {
         format!(
             "{} {}",
             quote_ident(&column.name),
@@ -749,21 +773,57 @@ fn create_semantics_table(
         )
     }));
     tx.execute_batch(&format!("CREATE TABLE semantics ({});", columns.join(", ")))?;
-    register_attribute_table(tx, "semantics", "semantics", last_change)
+    tx.execute(
+        "INSERT INTO gpkg_contents (
+            table_name, data_type, identifier, description, last_change, srs_id
+         ) VALUES ('semantics', 'features', 'semantics', 'semantics', ?1, ?2)",
+        params![last_change, srs_id],
+    )?;
+    tx.execute(
+        "INSERT INTO gpkg_geometry_columns (
+            table_name, column_name, geometry_type_name, srs_id, z, m
+         ) VALUES ('semantics', ?1, 'GEOMETRY', ?2, 1, 0)",
+        params![GPKG_GEOM_COLUMN_NAME, srs_id],
+    )?;
+    Ok(())
 }
 
-fn insert_semantics_rows(tx: &Transaction<'_>, semantics: &SemanticTable<'_>) -> Result<()> {
+fn insert_semantics_rows(
+    tx: &Transaction<'_>,
+    semantics: &SemanticPrimitiveTable<'_>,
+    srs_id: i32,
+) -> Result<Option<[f64; 6]>> {
     let insert_sql = semantic_insert_sql(semantics.schema());
     let mut statement = tx.prepare(&insert_sql)?;
+    let mut extent = None;
     for row in semantics.rows() {
         let fixed = row.fixed();
+        let Some(semantic_ix) = fixed.semantic_ix else {
+            continue;
+        };
+        let semantic_type = fixed
+            .semantic_type_name()
+            .map(|semantic_type| semantic_type.to_string())
+            .unwrap_or_default();
+        let encoded = semantic_primitive_geometry(semantics.model(), fixed)?;
+        extent = union_bbox(extent, encoded.bbox);
         let mut params = vec![
-            SqlValue::Integer(sqlite_integer(fixed.semantic_id, "semantic_id")?),
-            SqlValue::Text(fixed.semantic_type_name().to_string()),
-            fixed.parent.map_or(Ok(SqlValue::Null), |value| {
-                sqlite_integer(value, "parent").map(SqlValue::Integer)
-            })?,
-            SqlValue::Text(serde_json::to_string(&fixed.children)?),
+            SqlValue::Text(fixed.cityobject_id.to_string()),
+            SqlValue::Integer(sqlite_integer(fixed.geometry_ix, "geometry_ix")?),
+            SqlValue::Integer(sqlite_integer(semantic_ix, "semantic_ix")?),
+            SqlValue::Integer(sqlite_integer(fixed.primitive_ix, "primitive_ix")?),
+            SqlValue::Text(fixed.geometry_type.to_string()),
+            fixed
+                .geometry_lod
+                .clone()
+                .map_or(SqlValue::Null, SqlValue::Text),
+            SqlValue::Text(semantic_type),
+            SqlValue::Blob(wrap_geopackage_binary(
+                &encoded.wkb,
+                encoded.bbox,
+                false,
+                srs_id,
+            )),
         ];
         params.extend(
             row.values()
@@ -772,15 +832,19 @@ fn insert_semantics_rows(tx: &Transaction<'_>, semantics: &SemanticTable<'_>) ->
         );
         statement.execute(params_from_iter(params))?;
     }
-    Ok(())
+    Ok(extent)
 }
 
 fn semantic_insert_sql(schema: &crate::TableSchema<'_>) -> String {
     let mut columns = vec![
-        quote_ident("semantic_id"),
+        quote_ident("cityobject_id"),
+        quote_ident("geometry_ix"),
+        quote_ident("semantic_ix"),
+        quote_ident("primitive_ix"),
+        quote_ident("geometry_type"),
+        quote_ident("geometry_lod"),
         quote_ident("semantic_type"),
-        quote_ident("parent"),
-        quote_ident("children"),
+        quote_ident(GPKG_GEOM_COLUMN_NAME),
     ];
     columns.extend(
         schema
@@ -799,92 +863,9 @@ fn semantic_insert_sql(schema: &crate::TableSchema<'_>) -> String {
     )
 }
 
-fn create_semantic_relations_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
-    tx.execute_batch(
-        "CREATE TABLE semantic_relations (
-            semantic_id INTEGER,
-            cityobject_id TEXT NOT NULL,
-            cityobject_ix INTEGER NOT NULL,
-            geometry_ix INTEGER NOT NULL,
-            geometry_type TEXT NOT NULL,
-            geometry_lod TEXT,
-            geometry_is_instance INTEGER NOT NULL,
-            primitive_type TEXT NOT NULL,
-            primitive_ix INTEGER NOT NULL,
-            point_ix INTEGER,
-            linestring_ix INTEGER,
-            solid_ix INTEGER,
-            shell_ix INTEGER,
-            surface_ix INTEGER
-        );",
-    )?;
-    register_attribute_table(tx, "semantic_relations", "semantic_relations", last_change)
-}
-
-fn register_attribute_table(
-    tx: &Transaction<'_>,
-    table_name: &str,
-    description: &str,
-    last_change: &str,
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO gpkg_contents (
-            table_name, data_type, identifier, description, last_change
-         ) VALUES (?1, 'attributes', ?2, ?3, ?4)",
-        params![table_name, table_name, description, last_change],
-    )?;
-    Ok(())
-}
-
-fn insert_semantic_relations(
-    tx: &Transaction<'_>,
-    assignments: &SemanticAssignmentTable<'_>,
-) -> Result<()> {
-    let mut statement = tx.prepare(
-        "INSERT INTO semantic_relations (
-            semantic_id, cityobject_id, cityobject_ix, geometry_ix, geometry_type,
-            geometry_lod, geometry_is_instance, primitive_type, primitive_ix,
-            point_ix, linestring_ix, solid_ix, shell_ix, surface_ix
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-    )?;
-    for row in assignments.rows() {
-        let semantic_id = optional_sqlite_integer(row.semantic_id, "semantic_id")?;
-        let cityobject_ix = sqlite_integer(row.cityobject_ix, "cityobject_ix")?;
-        let geometry_ix = sqlite_integer(row.geometry_ix, "geometry_ix")?;
-        let primitive_ix = sqlite_integer(row.primitive_ix, "primitive_ix")?;
-        let point_ix = optional_sqlite_integer(row.point_ix, "point_ix")?;
-        let linestring_ix = optional_sqlite_integer(row.linestring_ix, "linestring_ix")?;
-        let solid_ix = optional_sqlite_integer(row.solid_ix, "solid_ix")?;
-        let shell_ix = optional_sqlite_integer(row.shell_ix, "shell_ix")?;
-        let surface_ix = optional_sqlite_integer(row.surface_ix, "surface_ix")?;
-
-        statement.execute(params![
-            semantic_id,
-            row.cityobject_id,
-            cityobject_ix,
-            geometry_ix,
-            row.geometry_type.to_string(),
-            row.geometry_lod.clone(),
-            i64::from(row.geometry_is_instance),
-            row.primitive_type.to_string(),
-            primitive_ix,
-            point_ix,
-            linestring_ix,
-            solid_ix,
-            shell_ix,
-            surface_ix,
-        ])?;
-    }
-    Ok(())
-}
-
 fn sqlite_integer(value: u64, column: &str) -> Result<i64> {
     i64::try_from(value)
         .with_context(|| format!("{column} value {value} does not fit in SQLite INTEGER"))
-}
-
-fn optional_sqlite_integer(value: Option<u64>, column: &str) -> Result<Option<i64>> {
-    value.map(|value| sqlite_integer(value, column)).transpose()
 }
 
 fn create_metadata_tables(tx: &Transaction<'_>) -> Result<()> {

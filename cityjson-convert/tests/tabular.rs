@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use cityjson_convert::{
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
-    tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
+    tabulate_semantic_primitives, tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType,
+    TableSchema, Value,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -470,7 +471,7 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
         }]
     );
 
-    let slope = schema_column_index(table.schema(), "attributes__slope");
+    let slope = schema_column_index(table.schema(), "attribute__slope");
     assert_eq!(
         table.schema().columns[slope].origin,
         ColumnOrigin::SemanticAttributes
@@ -482,6 +483,24 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert!(matches!(
         rows[1].value(slope).unwrap().unwrap(),
         Value::Null
+    ));
+
+    let primitives = tabulate_semantic_primitives(&model).unwrap();
+    let primitive_rows = primitives.rows().collect::<Vec<_>>();
+    assert_eq!(primitive_rows.len(), 1);
+    let primitive = primitive_rows[0].fixed();
+    assert_eq!(primitive.cityobject_id, "building");
+    assert_eq!(primitive.geometry_ix, 0);
+    assert_eq!(primitive.semantic_ix, Some(first.semantic_id));
+    assert_eq!(primitive.primitive_ix, 0);
+    assert_eq!(
+        primitive.semantic_type_name().unwrap().to_string(),
+        "RoofSurface"
+    );
+    let slope = schema_column_index(primitives.schema(), "attribute__slope");
+    assert!(matches!(
+        primitive_rows[0].value(slope).unwrap().unwrap(),
+        Value::UInt64(30)
     ));
 }
 

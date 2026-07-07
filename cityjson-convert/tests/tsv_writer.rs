@@ -3,10 +3,9 @@ use std::path::PathBuf;
 
 use cityjson_convert::{
     convert_to_tsv, tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
-    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
-    tabulate_semantics, write_addresses_tsv, write_cityobject_hierarchy_tsv, write_cityobjects_tsv,
-    write_metadata_tsv, write_semantic_assignments_tsv, write_semantic_definitions_tsv,
-    write_semantic_hierarchy_tsv, write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
+    tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
+    write_addresses_tsv, write_cityobject_hierarchy_tsv, write_cityobjects_tsv, write_metadata_tsv,
+    write_semantic_hierarchy_tsv, write_semantics_tsv, TsvExportOptions, TsvWriteOptions,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -327,77 +326,68 @@ fn writes_metadata_tsv_with_fixed_fields_extent_and_extra() {
 }
 
 #[test]
-fn writes_semantic_definition_and_assignment_tsvs() {
+fn writes_semantics_tsv_with_primitive_rows() {
     let model = json::from_slice(semantic_fixture()).unwrap();
-    let semantics = tabulate_semantics(&model).unwrap();
-    let assignments = tabulate_semantic_assignments(&model).unwrap();
+    let semantics = tabulate_semantic_primitives(&model).unwrap();
 
-    let mut definitions = Vec::new();
-    write_semantic_definitions_tsv(
+    let mut bytes = Vec::new();
+    write_semantics_tsv(
         &semantics,
         &TsvWriteOptions {
             include_null_rows: true,
             include_hierarchy: true,
-            include_cityjson_ordinal: false,
+            include_cityjson_ordinal: true,
         },
-        &mut definitions,
+        &mut bytes,
     )
     .unwrap();
-    let rows = parse_tsv(&definitions);
-    assert_eq!(rows.len(), 3);
+    let rows = parse_tsv(&bytes);
+    assert_eq!(rows.len(), 4);
     assert_eq!(
         rows[0],
-        ["semantic_id", "semantic_type", "attributes__slope"]
+        [
+            "cityobject_id",
+            "geometry_ix",
+            "semantic_ix",
+            "primitive_ix",
+            "geometry_type",
+            "geometry_lod",
+            "semantic_type",
+            "attribute__slope",
+        ]
     );
-    assert_eq!(rows[1][1], "RoofSurface");
-    assert_eq!(rows[1][2], "30");
+    assert_eq!(
+        rows[1],
+        [
+            "building",
+            "0",
+            "0",
+            "0",
+            "MultiSurface",
+            "2.0",
+            "RoofSurface",
+            "30"
+        ]
+    );
+    assert_eq!(rows[2][2], "1");
+    assert_eq!(rows[2][6], "WallSurface");
+    assert_eq!(rows[3][2], "");
 
     let hierarchy = tabulate_semantic_hierarchy(&model);
     let mut hierarchy_bytes = Vec::new();
     write_semantic_hierarchy_tsv(&hierarchy, &mut hierarchy_bytes).unwrap();
     let rows = parse_tsv(&hierarchy_bytes);
     assert_eq!(rows, [["parent_id", "child_id"], ["0", "1"]]);
-
-    let mut assignment_bytes = Vec::new();
-    write_semantic_assignments_tsv(
-        &assignments,
-        &TsvWriteOptions {
-            include_null_rows: true,
-            include_hierarchy: false,
-            include_cityjson_ordinal: true,
-        },
-        &mut assignment_bytes,
-    )
-    .unwrap();
-    let rows = parse_tsv(&assignment_bytes);
-    assert_eq!(rows.len(), 4);
-    assert_eq!(
-        rows[0],
-        [
-            "semantic_id",
-            "cityobject_id",
-            "cityobject_ix",
-            "geometry_ix",
-            "geometry_type",
-            "geometry_lod",
-            "primitive_ix",
-        ]
-    );
-    assert_eq!(rows[1][0], "0");
-    assert_eq!(rows[2][0], "1");
-    assert_eq!(rows[3][0], "");
 }
 
 #[test]
-fn writes_split_semantics_as_joined_filtered_tsv() {
+fn writes_semantics_tsv_filtered_to_assigned_primitives() {
     let model = json::from_slice(semantic_fixture()).unwrap();
-    let semantics = tabulate_semantics(&model).unwrap();
-    let assignments = tabulate_semantic_assignments(&model).unwrap();
+    let semantics = tabulate_semantic_primitives(&model).unwrap();
 
     let mut bytes = Vec::new();
-    write_split_semantics_tsv(
+    write_semantics_tsv(
         &semantics,
-        &assignments,
         &TsvWriteOptions {
             include_null_rows: false,
             include_hierarchy: true,
@@ -408,31 +398,17 @@ fn writes_split_semantics_as_joined_filtered_tsv() {
     .unwrap();
     let rows = parse_tsv(&bytes);
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], "semantic_id");
-    assert_eq!(rows[0][2], "cityobject_ix");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], "cityobject_id");
+    assert_eq!(rows[0][2], "semantic_ix");
+    assert_eq!(rows[0][3], "primitive_ix");
     assert!(rows[0].contains(&"semantic_type".to_string()));
-    assert!(!rows[0].contains(&"parent".to_string()));
-    assert!(!rows[0].contains(&"children".to_string()));
-    assert!(rows[0].contains(&"attributes__slope".to_string()));
-    assert_eq!(rows[1][0], "0");
-    assert_eq!(rows[1][1], "building");
-    assert!(rows[1].contains(&"RoofSurface".to_string()));
+    assert!(rows[0].contains(&"attribute__slope".to_string()));
+    assert_eq!(rows[1][0], "building");
+    assert_eq!(rows[1][2], "0");
+    assert_eq!(rows[1][6], "RoofSurface");
     assert_eq!(rows[1].last().unwrap(), "30");
-
-    let mut bytes = Vec::new();
-    write_split_semantics_tsv(
-        &semantics,
-        &assignments,
-        &TsvWriteOptions {
-            include_null_rows: true,
-            include_hierarchy: false,
-            include_cityjson_ordinal: false,
-        },
-        &mut bytes,
-    )
-    .unwrap();
-    assert_eq!(parse_tsv(&bytes).len(), 4);
+    assert_eq!(rows[2][2], "1");
 }
 
 #[test]
@@ -448,7 +424,7 @@ fn converts_model_to_tsv_directory_outputs() {
             include_hierarchy: true,
             include_cityjson_ordinal: true,
             include_metadata: true,
-            split_semantics: true,
+            include_semantics: true,
             split_address: true,
         },
     )

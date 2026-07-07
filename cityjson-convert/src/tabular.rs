@@ -131,9 +131,10 @@ use cityjson_lib::cityjson_types::resources::handles::{
     CityObjectHandle, GeometryHandle, SemanticHandle,
 };
 use cityjson_lib::cityjson_types::resources::storage::OwnedStringStorage;
+use cityjson_lib::cityjson_types::v2_0::boundary::Boundary;
 use cityjson_lib::cityjson_types::v2_0::{
     CityObjectType, GeometryType, Metadata, OwnedAttributeValue, OwnedAttributes, Semantic,
-    SemanticType,
+    SemanticType, VertexIndex,
 };
 use cityjson_lib::CityModel;
 use serde_json::{Map, Value as JsonValue};
@@ -339,7 +340,8 @@ impl ColumnOrigin {
     /// Returns the physical source prefix used in flattened column names.
     fn physical_prefix(self) -> Option<&'static str> {
         match self {
-            Self::Attributes | Self::SemanticAttributes => Some("attributes"),
+            Self::Attributes => Some("attributes"),
+            Self::SemanticAttributes => Some("attribute"),
             Self::Extra => None,
             Self::MetadataExtra => Some("metadata_extra"),
         }
@@ -643,6 +645,107 @@ impl<'table, 'model> SemanticRowRef<'table, 'model> {
     }
 }
 
+/// Borrowed semantic primitive table with one row per geometry primitive.
+///
+/// Rows join primitive semantic assignments to semantic definition attributes.
+/// Geometry bytes are intentionally exposed through [`semantic_primitive_geometry`]
+/// so text writers can avoid computing WKB while GeoPackage writers can serialize
+/// the same projection with a `geom` column.
+#[derive(Debug)]
+pub struct SemanticPrimitiveTable<'model> {
+    model: &'model CityModel,
+    rows: Vec<SemanticPrimitiveRow<'model>>,
+    schema: TableSchema<'model>,
+}
+
+impl<'model> SemanticPrimitiveTable<'model> {
+    /// Returns the source model backing this borrowed table.
+    #[must_use]
+    pub fn model(&self) -> &'model CityModel {
+        self.model
+    }
+
+    /// Returns the flattened schema for semantic attributes.
+    #[must_use]
+    pub fn schema(&self) -> &TableSchema<'model> {
+        &self.schema
+    }
+
+    /// Iterates semantic primitive rows in source `CityObject` and geometry order.
+    pub fn rows(&self) -> impl Iterator<Item = SemanticPrimitiveRowRef<'_, 'model>> {
+        self.rows.iter().map(|row| SemanticPrimitiveRowRef {
+            row,
+            columns: &self.schema.columns,
+        })
+    }
+}
+
+/// Fixed semantic primitive fields plus borrowed semantic attributes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticPrimitiveRow<'model> {
+    pub cityobject_id: &'model str,
+    pub geometry_ix: u64,
+    pub semantic_ix: Option<u64>,
+    pub primitive_ix: u64,
+    pub geometry_type: GeometryType,
+    pub geometry_lod: Option<String>,
+    pub semantic_type: Option<&'model SemanticType<OwnedStringStorage>>,
+    pub primitive_type: PrimitiveType,
+    pub point_ix: Option<u64>,
+    pub linestring_ix: Option<u64>,
+    pub solid_ix: Option<u64>,
+    pub shell_ix: Option<u64>,
+    pub surface_ix: Option<u64>,
+    geometry_handle: GeometryHandle,
+    attributes: Option<&'model OwnedAttributes>,
+}
+
+impl SemanticPrimitiveRow<'_> {
+    /// Returns the semantic type using its `CityJSON` display spelling, when the
+    /// primitive has a semantic assignment.
+    #[must_use]
+    pub fn semantic_type_name(&self) -> Option<impl Display + '_> {
+        self.semantic_type
+    }
+}
+
+/// Borrowed semantic primitive row bound to shared dynamic semantic columns.
+#[derive(Clone, Copy, Debug)]
+pub struct SemanticPrimitiveRowRef<'table, 'model> {
+    row: &'table SemanticPrimitiveRow<'model>,
+    columns: &'table [ColumnSchema<'model>],
+}
+
+impl<'table, 'model> SemanticPrimitiveRowRef<'table, 'model> {
+    /// Returns fixed semantic primitive fields.
+    #[must_use]
+    pub fn fixed(&self) -> &'table SemanticPrimitiveRow<'model> {
+        self.row
+    }
+
+    /// Resolves the semantic attribute value at `index`.
+    #[must_use]
+    pub fn value(&self, index: usize) -> Option<Result<Value<'_, 'model>>> {
+        self.columns
+            .get(index)
+            .map(|column| resolve_dynamic_value(self.row.attributes, column))
+    }
+
+    /// Resolves semantic attribute values lazily in shared schema order.
+    pub fn values(&self) -> impl Iterator<Item = Result<Value<'_, 'model>>> {
+        self.columns
+            .iter()
+            .map(|column| resolve_dynamic_value(self.row.attributes, column))
+    }
+}
+
+/// WKB bytes and source-space extent for one semantic primitive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticPrimitiveGeometry {
+    pub wkb: Vec<u8>,
+    pub bbox: Option<[f64; 6]>,
+}
+
 /// Borrowed semantic hierarchy table with one parent-to-child edge per row.
 ///
 /// Semantic ids are zero-based indices from the source semantic object handles.
@@ -703,6 +806,7 @@ pub struct SemanticAssignmentRow<'model> {
     pub cityobject_id: &'model str,
     pub cityobject_ix: u64,
     pub geometry_ix: u64,
+    pub geometry_handle: GeometryHandle,
     pub geometry_type: GeometryType,
     pub geometry_lod: Option<String>,
     pub geometry_is_instance: bool,
@@ -1287,6 +1391,136 @@ pub fn tabulate_semantic_hierarchy(model: &CityModel) -> SemanticHierarchyTable 
     }
 }
 
+/// Tabulates semantic primitives joined to semantic definition attributes.
+///
+/// # Errors
+///
+/// Returns an error when geometry handles cannot be resolved, semantic assignment
+/// counts do not match primitive counts, or semantic attributes cannot be
+/// represented by the table vocabulary.
+pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimitiveTable<'_>> {
+    let attributes = infer_attribute_schema(
+        model
+            .iter_semantics()
+            .map(|(_, semantic)| semantic.attributes()),
+    )?;
+    let semantics_by_ix = model
+        .iter_semantics()
+        .map(|(handle, semantic)| (semantic_handle_id(handle), semantic))
+        .collect::<BTreeMap<_, _>>();
+    let assignments = tabulate_semantic_assignments(model)?;
+    let rows = assignments
+        .rows
+        .into_iter()
+        .map(|assignment| {
+            let semantic = assignment
+                .semantic_id
+                .and_then(|semantic_ix| semantics_by_ix.get(&semantic_ix).copied());
+            SemanticPrimitiveRow {
+                cityobject_id: assignment.cityobject_id,
+                geometry_ix: assignment.geometry_ix,
+                semantic_ix: assignment.semantic_id,
+                primitive_ix: assignment.primitive_ix,
+                geometry_type: assignment.geometry_type,
+                geometry_lod: assignment.geometry_lod,
+                semantic_type: semantic.map(Semantic::type_semantic),
+                primitive_type: assignment.primitive_type,
+                point_ix: assignment.point_ix,
+                linestring_ix: assignment.linestring_ix,
+                solid_ix: assignment.solid_ix,
+                shell_ix: assignment.shell_ix,
+                surface_ix: assignment.surface_ix,
+                geometry_handle: assignment.geometry_handle,
+                attributes: semantic.and_then(Semantic::attributes),
+            }
+        })
+        .collect();
+
+    Ok(SemanticPrimitiveTable {
+        model,
+        rows,
+        schema: build_dynamic_schema(
+            [(ColumnOrigin::SemanticAttributes, attributes)],
+            &[
+                "cityobject_id",
+                "geometry_ix",
+                "semantic_ix",
+                "primitive_ix",
+                "geometry_type",
+                "geometry_lod",
+                "semantic_type",
+                "geom",
+            ],
+        ),
+    })
+}
+
+/// Encodes one semantic primitive as ISO WKB plus its source-space extent.
+///
+/// Points are encoded as PointZ, linestrings as LineStringZ, and surfaces as
+/// PolygonZ. Surface primitives retain all rings from the source boundary. The
+/// function resolves geometry instances through the model, matching semantic
+/// assignment tabulation.
+///
+/// # Errors
+///
+/// Returns an error when the row references an incompatible boundary shape, a
+/// primitive index is out of range, or a vertex index is dangling.
+pub fn semantic_primitive_geometry(
+    model: &CityModel,
+    row: &SemanticPrimitiveRow<'_>,
+) -> Result<SemanticPrimitiveGeometry> {
+    let geometry = model
+        .resolve_geometry(row.geometry_handle)
+        .with_context(|| {
+            format!(
+                "resolve geometry for semantic primitive on CityObject {}",
+                row.cityobject_id
+            )
+        })?;
+    let Some(boundary) = geometry.boundaries() else {
+        bail!(
+            "semantic primitive {} on geometry {} of CityObject {} has no boundaries",
+            row.primitive_ix,
+            row.geometry_ix,
+            row.cityobject_id
+        );
+    };
+
+    match row.primitive_type {
+        PrimitiveType::Point => {
+            let point_ix = required_index(row.point_ix, "point_ix", row)?;
+            let points = boundary.to_nested_multi_point()?;
+            let vertex = *points.get(point_ix).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "point primitive index {} is out of range for geometry {} of CityObject {}",
+                    point_ix,
+                    row.geometry_ix,
+                    row.cityobject_id
+                )
+            })?;
+            encode_point_primitive(model, vertex)
+        }
+        PrimitiveType::LineString => {
+            let linestring_ix = required_index(row.linestring_ix, "linestring_ix", row)?;
+            let linestrings = boundary.to_nested_multi_linestring()?;
+            let vertices = linestrings.get(linestring_ix).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "linestring primitive index {} is out of range for geometry {} of CityObject {}",
+                    linestring_ix,
+                    row.geometry_ix,
+                    row.cityobject_id
+                )
+            })?;
+            encode_linestring_primitive(model, vertices)
+        }
+        PrimitiveType::Surface => {
+            let surface = semantic_surface(boundary, geometry.type_geometry(), row)?;
+            encode_surface_primitive(model, surface)
+        }
+    }
+}
+
 /// Tabulates geometry primitive to semantic definition assignments.
 ///
 /// # Errors
@@ -1319,6 +1553,7 @@ pub fn tabulate_semantic_assignments(model: &CityModel) -> Result<SemanticAssign
                 cityobject_id: object.id(),
                 cityobject_ix: cityobject_ix as u64,
                 geometry_ix: geometry_ix as u64,
+                geometry_handle,
                 geometry_type: *geometry.type_geometry(),
                 geometry_lod: geometry.lod().map(ToString::to_string),
                 geometry_is_instance: source_geometry.instance().is_some(),
@@ -1505,11 +1740,176 @@ fn semantic_handle_id(handle: SemanticHandle) -> u64 {
     u64::from(handle.raw_parts().0)
 }
 
+fn required_index(value: Option<u64>, name: &str, row: &SemanticPrimitiveRow<'_>) -> Result<usize> {
+    let value = value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "semantic primitive {} on geometry {} of CityObject {} is missing {name}",
+            row.primitive_ix,
+            row.geometry_ix,
+            row.cityobject_id
+        )
+    })?;
+    usize::try_from(value).with_context(|| format!("{name} value {value} does not fit in usize"))
+}
+
+fn semantic_surface(
+    boundary: &Boundary<u32>,
+    geometry_type: &GeometryType,
+    row: &SemanticPrimitiveRow<'_>,
+) -> Result<Vec<Vec<u32>>> {
+    let surface_ix = required_index(row.surface_ix, "surface_ix", row)?;
+    match geometry_type {
+        GeometryType::MultiSurface | GeometryType::CompositeSurface => {
+            let surfaces = boundary.to_nested_multi_or_composite_surface()?;
+            surfaces.get(surface_ix).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "surface primitive index {} is out of range for geometry {} of CityObject {}",
+                    surface_ix,
+                    row.geometry_ix,
+                    row.cityobject_id
+                )
+            })
+        }
+        GeometryType::Solid => {
+            let shell_ix = required_index(row.shell_ix, "shell_ix", row)?;
+            let shells = boundary.to_nested_solid()?;
+            shells
+                .get(shell_ix)
+                .and_then(|shell| shell.get(surface_ix))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "surface primitive shell {} surface {} is out of range for geometry {} of CityObject {}",
+                        shell_ix,
+                        surface_ix,
+                        row.geometry_ix,
+                        row.cityobject_id
+                    )
+                })
+        }
+        GeometryType::MultiSolid | GeometryType::CompositeSolid => {
+            let solid_ix = required_index(row.solid_ix, "solid_ix", row)?;
+            let shell_ix = required_index(row.shell_ix, "shell_ix", row)?;
+            let solids = boundary.to_nested_multi_or_composite_solid()?;
+            solids
+                .get(solid_ix)
+                .and_then(|solid| solid.get(shell_ix))
+                .and_then(|shell| shell.get(surface_ix))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "surface primitive solid {} shell {} surface {} is out of range for geometry {} of CityObject {}",
+                        solid_ix,
+                        shell_ix,
+                        surface_ix,
+                        row.geometry_ix,
+                        row.cityobject_id
+                    )
+                })
+        }
+        other => bail!(
+            "surface semantic primitive on geometry {} of CityObject {} is incompatible with geometry type {other}",
+            row.geometry_ix,
+            row.cityobject_id
+        ),
+    }
+}
+
+fn encode_point_primitive(model: &CityModel, vertex: u32) -> Result<SemanticPrimitiveGeometry> {
+    let coordinate = semantic_vertex_coordinate(model, vertex)?;
+    let mut wkb = Vec::with_capacity(1 + 4 + 24);
+    push_wkb_header(&mut wkb, 1001);
+    push_wkb_coordinate(&mut wkb, coordinate);
+    Ok(SemanticPrimitiveGeometry {
+        wkb,
+        bbox: Some(coordinate_bbox(coordinate)),
+    })
+}
+
+fn encode_linestring_primitive(
+    model: &CityModel,
+    vertices: &[u32],
+) -> Result<SemanticPrimitiveGeometry> {
+    let mut wkb = Vec::with_capacity(1 + 4 + 4 + vertices.len() * 24);
+    push_wkb_header(&mut wkb, 1002);
+    push_wkb_count(&mut wkb, vertices.len(), "linestring vertex count")?;
+    let mut bbox = None;
+    for vertex in vertices {
+        let coordinate = semantic_vertex_coordinate(model, *vertex)?;
+        update_bbox(&mut bbox, coordinate);
+        push_wkb_coordinate(&mut wkb, coordinate);
+    }
+    Ok(SemanticPrimitiveGeometry { wkb, bbox })
+}
+
+fn encode_surface_primitive(
+    model: &CityModel,
+    rings: Vec<Vec<u32>>,
+) -> Result<SemanticPrimitiveGeometry> {
+    let vertex_count = rings.iter().map(Vec::len).sum::<usize>();
+    let mut wkb = Vec::with_capacity(1 + 4 + 4 + rings.len() * 4 + vertex_count * 24);
+    push_wkb_header(&mut wkb, 1003);
+    push_wkb_count(&mut wkb, rings.len(), "surface ring count")?;
+    let mut bbox = None;
+    for ring in rings {
+        push_wkb_count(&mut wkb, ring.len(), "surface ring vertex count")?;
+        for vertex in ring {
+            let coordinate = semantic_vertex_coordinate(model, vertex)?;
+            update_bbox(&mut bbox, coordinate);
+            push_wkb_coordinate(&mut wkb, coordinate);
+        }
+    }
+    Ok(SemanticPrimitiveGeometry { wkb, bbox })
+}
+
+fn semantic_vertex_coordinate(model: &CityModel, vertex: u32) -> Result<[f64; 3]> {
+    let vertex = model
+        .get_vertex(VertexIndex::new(vertex))
+        .with_context(|| format!("missing semantic primitive vertex {vertex}"))?;
+    Ok(vertex.to_array())
+}
+
+fn push_wkb_header(out: &mut Vec<u8>, geometry_type: u32) {
+    out.push(1);
+    out.extend_from_slice(&geometry_type.to_le_bytes());
+}
+
+fn push_wkb_count(out: &mut Vec<u8>, count: usize, label: &str) -> Result<()> {
+    let count = u32::try_from(count).with_context(|| format!("{label} exceeds u32"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    Ok(())
+}
+
+fn push_wkb_coordinate(out: &mut Vec<u8>, coordinate: [f64; 3]) {
+    for value in coordinate {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn coordinate_bbox([x, y, z]: [f64; 3]) -> [f64; 6] {
+    [x, y, z, x, y, z]
+}
+
+fn update_bbox(bbox: &mut Option<[f64; 6]>, coordinate: [f64; 3]) {
+    match bbox {
+        Some(existing) => {
+            existing[0] = existing[0].min(coordinate[0]);
+            existing[1] = existing[1].min(coordinate[1]);
+            existing[2] = existing[2].min(coordinate[2]);
+            existing[3] = existing[3].max(coordinate[0]);
+            existing[4] = existing[4].max(coordinate[1]);
+            existing[5] = existing[5].max(coordinate[2]);
+        }
+        None => *bbox = Some(coordinate_bbox(coordinate)),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SemanticAssignmentContext<'model> {
     cityobject_id: &'model str,
     cityobject_ix: u64,
     geometry_ix: u64,
+    geometry_handle: GeometryHandle,
     geometry_type: GeometryType,
     geometry_lod: Option<String>,
     geometry_is_instance: bool,
@@ -1542,6 +1942,7 @@ fn push_point_assignments<'model>(
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
             geometry_ix: context.geometry_ix,
+            geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
             geometry_is_instance: context.geometry_is_instance,
@@ -1578,6 +1979,7 @@ fn push_linestring_assignments<'model>(
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
             geometry_ix: context.geometry_ix,
+            geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
             geometry_is_instance: context.geometry_is_instance,
@@ -1614,6 +2016,7 @@ fn push_surface_assignments<'model>(
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
             geometry_ix: context.geometry_ix,
+            geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
             geometry_is_instance: context.geometry_is_instance,

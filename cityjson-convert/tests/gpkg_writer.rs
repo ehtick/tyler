@@ -227,7 +227,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
         &output,
         &GpkgExportOptions {
             split_lod: false,
-            split_semantics: false,
+            include_semantics: false,
             split_address: false,
             include_hierarchy: true,
             include_metadata: true,
@@ -296,7 +296,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
         &output,
         &GpkgExportOptions {
             split_lod: true,
-            split_semantics: true,
+            include_semantics: true,
             split_address: false,
             include_hierarchy: true,
             include_metadata: false,
@@ -308,13 +308,19 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
     let conn = Connection::open(&output).expect("open GeoPackage");
     assert!(table_exists(&conn, "building_multisurface_lod2_0"));
     assert!(table_exists(&conn, "semantics"));
-    assert!(table_exists(&conn, "semantic_relations"));
+    assert!(!table_exists(&conn, "semantic_relations"));
     assert!(table_exists(&conn, "semantic_hierarchy"));
     assert_eq!(table_row_count(&conn, "semantics"), 2);
-    assert_eq!(table_row_count(&conn, "semantic_relations"), 3);
     assert_eq!(table_row_count(&conn, "semantic_hierarchy"), 1);
-    assert_attribute_table_registered(&conn, "semantics");
-    assert_attribute_table_registered(&conn, "semantic_relations");
+    assert_eq!(table_column_type(&conn, "semantics", "geom"), "GEOMETRY");
+    let semantics_data_type: String = conn
+        .query_row(
+            "SELECT data_type FROM gpkg_contents WHERE table_name = 'semantics'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read semantics gpkg_contents row");
+    assert_eq!(semantics_data_type, "features");
 
     let inserted_lod: String = conn
         .query_row(
@@ -369,7 +375,7 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
         &output,
         &GpkgExportOptions {
             split_lod: true,
-            split_semantics: false,
+            include_semantics: false,
             split_address: false,
             include_hierarchy: false,
             include_metadata: false,
@@ -565,7 +571,7 @@ fn converts_split_address_to_multipoint_feature_layer() {
         &output,
         &GpkgExportOptions {
             split_lod: false,
-            split_semantics: false,
+            include_semantics: false,
             split_address: true,
             include_hierarchy: false,
             include_metadata: false,

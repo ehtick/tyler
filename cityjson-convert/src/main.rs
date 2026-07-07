@@ -82,8 +82,8 @@ struct TsvFileCliOptions {
     #[arg(long = "tsv-include-metadata", default_value_t = false)]
     tsv_include_metadata: bool,
     /// Write a separate TSV semantics file joined from primitive assignments.
-    #[arg(long = "tsv-split-semantics", default_value_t = false)]
-    tsv_split_semantics: bool,
+    #[arg(long = "tsv-include-semantics", default_value_t = false)]
+    tsv_include_semantics: bool,
     /// Write `CityObject` extra.address values to addresses.tsv.
     #[arg(long = "tsv-split-address", default_value_t = false)]
     tsv_split_address: bool,
@@ -106,7 +106,7 @@ struct GpkgLayerCliOptions {
     #[arg(long = "gpkg-split-lod", default_value_t = false)]
     lod_layers: bool,
     // Write semantic tables alongside feature tables.
-    #[arg(long = "gpkg-split-semantics", default_value_t = false)]
+    #[arg(long = "gpkg-include-semantics", default_value_t = false)]
     semantics_tables: bool,
     // Write standalone CityObject and semantic hierarchy tables.
     #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
@@ -178,7 +178,7 @@ fn main() -> anyhow::Result<()> {
             let model = read_model(&cli.input)?;
             let options = GpkgExportOptions {
                 split_lod: cli.gpkg.layers.lod_layers,
-                split_semantics: cli.gpkg.layers.semantics_tables,
+                include_semantics: cli.gpkg.layers.semantics_tables,
                 split_address: cli.gpkg.layers.address_layer,
                 include_hierarchy: cli.gpkg.layers.hierarchy_tables,
                 include_metadata: cli.gpkg.metadata.include_source,
@@ -195,7 +195,7 @@ fn main() -> anyhow::Result<()> {
                 include_hierarchy: cli.tsv_rows.tsv_include_hierarchy,
                 include_cityjson_ordinal: cli.tsv_rows.tsv_include_cityjson_ordinal,
                 include_metadata: cli.tsv_files.tsv_include_metadata,
-                split_semantics: cli.tsv_files.tsv_split_semantics,
+                include_semantics: cli.tsv_files.tsv_include_semantics,
                 split_address: cli.tsv_files.tsv_split_address,
             };
             info!("Converting to TSV");
