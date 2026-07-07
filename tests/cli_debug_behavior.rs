@@ -226,7 +226,7 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
             "--tsv-include-null-rows",
             "--tsv-include-hierarchy",
             "--tsv-include-cityjson-ordinal",
-            "--tsv-split-semantics",
+            "--tsv-include-semantics",
         ],
     );
     assert_success(&output, "TSV format run");
@@ -246,8 +246,24 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     let cityobjects_header = cityobjects.lines().next().expect("cityobjects header");
     assert!(cityobjects_header.contains("cityobject_id"));
     assert!(cityobjects_header.contains("cityobject_ix"));
-    assert!(cityobjects_header.contains("parents"));
-    assert!(cityobjects_header.contains("children"));
+    assert!(!cityobjects_header.contains("parents"));
+    assert!(!cityobjects_header.contains("children"));
+
+    let mut cityobject_hierarchy_tables = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("t"),
+        "cityobject_hierarchy.tsv",
+        &mut cityobject_hierarchy_tables,
+    );
+    assert!(
+        !cityobject_hierarchy_tables.is_empty(),
+        "expected CityObject hierarchy TSV tables under {}",
+        output_dir.join("t").display()
+    );
+    let cityobject_hierarchy =
+        fs::read_to_string(&cityobject_hierarchy_tables[0]).expect("read cityobject_hierarchy.tsv");
+    let hierarchy_rows = parse_tsv(&cityobject_hierarchy);
+    assert_eq!(hierarchy_rows[0].as_slice(), ["parent_id", "child_id"]);
 
     let mut semantic_tables = Vec::new();
     collect_paths_with_suffix(&output_dir.join("t"), "semantics.tsv", &mut semantic_tables);
@@ -261,7 +277,7 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
     let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
     assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
-    assert!(metadata_header.contains("geographical_extent_wkt"));
+    assert!(metadata_header.contains("geographical_extent_wkb"));
     assert!(aggregate_metadata
         .lines()
         .skip(1)
@@ -272,46 +288,14 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         rows.len() >= 2,
         "metadata.tsv should contain at least one data row"
     );
-    let extent_ix = rows[0]
+    let extent_wkb_ix = rows[0]
         .iter()
-        .position(|column| column == "geographical_extent")
-        .expect("metadata.tsv should contain geographical_extent");
-    let extent_wkt_ix = rows[0]
-        .iter()
-        .position(|column| column == "geographical_extent_wkt")
-        .expect("metadata.tsv should contain geographical_extent_wkt");
-    let tile_extent: Vec<f64> =
-        serde_json::from_str(&rows[1][extent_ix]).expect("parse tile geographical_extent");
-    let expected_tile_extent = [
-        85_530.015_986_816_4,
-        446_894.658_972_168,
-        -0.319_460_330_963_134_53,
-        85_722.015_986_816_4,
-        447_086.658_972_168,
-        9.717_539_669_036_865,
-    ];
-    assert_eq!(tile_extent.len(), expected_tile_extent.len());
-    for (actual, expected) in tile_extent.iter().zip(expected_tile_extent) {
-        assert!(
-            (actual - expected).abs() < 1e-9,
-            "expected tile extent value {expected}, got {actual}"
-        );
-    }
-    assert!((tile_extent[3] - tile_extent[0] - (tile_extent[4] - tile_extent[1])).abs() < 1e-6);
-    let expected_wkt = format!(
-        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
-        tile_extent[0],
-        tile_extent[1],
-        tile_extent[3],
-        tile_extent[1],
-        tile_extent[3],
-        tile_extent[4],
-        tile_extent[0],
-        tile_extent[4],
-        tile_extent[0],
-        tile_extent[1]
+        .position(|column| column == "geographical_extent_wkb")
+        .expect("metadata.tsv should contain geographical_extent_wkb");
+    assert!(
+        rows[1][extent_wkb_ix].starts_with("01030000"),
+        "geographical_extent_wkb should contain hex-encoded polygon WKB"
     );
-    assert_eq!(rows[1][extent_wkt_ix], expected_wkt);
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
     assert!(!output_dir
         .join("metadata/cjindex-metadata.city.json")

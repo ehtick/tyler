@@ -244,8 +244,8 @@ fn build_tsv_export_options(cli: &crate::cli::Cli) -> cityjson_convert::TsvExpor
         include_hierarchy: cli.tsv_include_hierarchy,
         include_cityjson_ordinal: cli.tsv_include_cityjson_ordinal,
         include_metadata: false,
-        split_semantics: cli.tsv_split_semantics,
-        split_address: cli.tsv_split_address,
+        include_semantics: cli.tsv_include_semantics,
+        include_address: cli.tsv_include_address,
     }
 }
 

@@ -183,7 +183,10 @@ fn assert_building_blob_header(conn: &Connection) {
         i32::from_le_bytes(blob[4..8].try_into().expect("srs id bytes")),
         7415
     );
-    assert_eq!(read_gpb_envelope(&blob), [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
+    let envelope = read_gpb_envelope(&blob);
+    for (actual, expected) in envelope.into_iter().zip([0.0, 1.0, 0.0, 1.0, 0.0, 0.0]) {
+        assert!((actual - expected).abs() < f64::EPSILON);
+    }
     assert_eq!(
         u32::from_le_bytes(blob[57..61].try_into().expect("wkb type bytes")),
         1006

@@ -120,12 +120,12 @@ pub struct Cli {
     /// Include the source CityJSON CityObject ordinal when the output format is TSV.
     #[arg(long)]
     pub tsv_include_cityjson_ordinal: bool,
-    /// Split semantic surface assignments into semantics.tsv when the output format is TSV.
+    /// Include semantic primitive assignments in semantics.tsv when the output format is TSV.
     #[arg(long)]
-    pub tsv_split_semantics: bool,
-    /// Split CityObject extra.address values into addresses.tsv when the output format is TSV.
+    pub tsv_include_semantics: bool,
+    /// Include CityObject extra.address values in addresses.tsv when the output format is TSV.
     #[arg(long)]
-    pub tsv_split_address: bool,
+    pub tsv_include_address: bool,
     /// LoD to use in output for Building features
     #[arg(long)]
     pub lod_building: Option<String>,
@@ -339,24 +339,24 @@ const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
         is_present: cli_has_tsv_include_cityjson_ordinal,
     },
     NoEffectInfoRule {
-        flag: "--tsv-split-semantics",
+        flag: "--tsv-include-semantics",
         n_a_formats: &[
             crate::OutputFormatKind::Cesium3dTiles,
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
         ],
-        is_present: cli_has_tsv_split_semantics,
+        is_present: cli_has_tsv_include_semantics,
     },
     NoEffectInfoRule {
-        flag: "--tsv-split-address",
+        flag: "--tsv-include-address",
         n_a_formats: &[
             crate::OutputFormatKind::Cesium3dTiles,
             crate::OutputFormatKind::Obj,
             crate::OutputFormatKind::Cityjson,
             crate::OutputFormatKind::Cityjsonseq,
         ],
-        is_present: cli_has_tsv_split_address,
+        is_present: cli_has_tsv_include_address,
     },
 ];
 
@@ -436,12 +436,12 @@ fn cli_has_tsv_include_cityjson_ordinal(cli: &Cli) -> bool {
     cli.tsv_include_cityjson_ordinal
 }
 
-fn cli_has_tsv_split_semantics(cli: &Cli) -> bool {
-    cli.tsv_split_semantics
+fn cli_has_tsv_include_semantics(cli: &Cli) -> bool {
+    cli.tsv_include_semantics
 }
 
-fn cli_has_tsv_split_address(cli: &Cli) -> bool {
-    cli.tsv_split_address
+fn cli_has_tsv_include_address(cli: &Cli) -> bool {
+    cli.tsv_include_address
 }
 
 fn unique_output_formats(formats: &[crate::OutputFormatKind]) -> Vec<crate::OutputFormatKind> {
@@ -682,8 +682,8 @@ mod tests {
             "--tsv-include-null-rows".to_string(),
             "--tsv-include-hierarchy".to_string(),
             "--tsv-include-cityjson-ordinal".to_string(),
-            "--tsv-split-semantics".to_string(),
-            "--tsv-split-address".to_string(),
+            "--tsv-include-semantics".to_string(),
+            "--tsv-include-address".to_string(),
         ]);
         let cli = Cli::try_parse_from(args).unwrap();
 
@@ -691,8 +691,8 @@ mod tests {
         assert!(cli.tsv_include_null_rows);
         assert!(cli.tsv_include_hierarchy);
         assert!(cli.tsv_include_cityjson_ordinal);
-        assert!(cli.tsv_split_semantics);
-        assert!(cli.tsv_split_address);
+        assert!(cli.tsv_include_semantics);
+        assert!(cli.tsv_include_address);
         assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
     }
 
@@ -801,8 +801,8 @@ mod tests {
         cli.tsv_include_null_rows = true;
         cli.tsv_include_hierarchy = true;
         cli.tsv_include_cityjson_ordinal = true;
-        cli.tsv_split_semantics = true;
-        cli.tsv_split_address = true;
+        cli.tsv_include_semantics = true;
+        cli.tsv_include_address = true;
 
         assert_eq!(
             cli.no_effect_info_messages(&[OutputFormatKind::Cityjson]),
@@ -813,9 +813,9 @@ mod tests {
                     .to_string(),
                 "--tsv-include-cityjson-ordinal has no effect for selected output formats: cityjson"
                     .to_string(),
-                "--tsv-split-semantics has no effect for selected output formats: cityjson"
+                "--tsv-include-semantics has no effect for selected output formats: cityjson"
                     .to_string(),
-                "--tsv-split-address has no effect for selected output formats: cityjson"
+                "--tsv-include-address has no effect for selected output formats: cityjson"
                     .to_string(),
             ]
         );

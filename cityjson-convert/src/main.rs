@@ -94,6 +94,10 @@ struct GpkgCliOptions {
     #[command(flatten)]
     layers: GpkgLayerCliOptions,
     #[command(flatten)]
+    semantics: GpkgSemanticCliOptions,
+    #[command(flatten)]
+    address: GpkgAddressCliOptions,
+    #[command(flatten)]
     metadata: GpkgMetadataCliOptions,
     // Optional target CRS metadata label when the source metadata lacks a parseable EPSG code.
     #[arg(long = "gpkg-output-crs")]
@@ -105,15 +109,23 @@ struct GpkgLayerCliOptions {
     // Split GeoPackage layers by LoD.
     #[arg(long = "gpkg-split-lod", default_value_t = false)]
     lod_layers: bool,
-    // Write semantic tables alongside feature tables.
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgSemanticCliOptions {
+    // Write semantic primitive feature rows.
     #[arg(long = "gpkg-include-semantics", default_value_t = false)]
-    semantics_tables: bool,
+    include_semantics: bool,
     // Write standalone CityObject and semantic hierarchy tables.
     #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
-    hierarchy_tables: bool,
+    include_hierarchy: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgAddressCliOptions {
     // Write CityObject extra.address values to a separate feature layer.
     #[arg(long = "gpkg-include-address", default_value_t = false)]
-    address_layer: bool,
+    include_address: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -178,9 +190,9 @@ fn main() -> anyhow::Result<()> {
             let model = read_model(&cli.input)?;
             let options = GpkgExportOptions {
                 split_lod: cli.gpkg.layers.lod_layers,
-                include_semantics: cli.gpkg.layers.semantics_tables,
-                include_address: cli.gpkg.layers.address_layer,
-                include_hierarchy: cli.gpkg.layers.hierarchy_tables,
+                include_semantics: cli.gpkg.semantics.include_semantics,
+                include_address: cli.gpkg.address.include_address,
+                include_hierarchy: cli.gpkg.semantics.include_hierarchy,
                 include_metadata: cli.gpkg.metadata.include_source,
                 output_crs: cli.gpkg.output_crs.clone(),
             };

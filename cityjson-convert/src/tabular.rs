@@ -179,10 +179,10 @@ impl<'model> CityObjectTable<'model> {
     }
 }
 
-/// Borrowed CityObject hierarchy table with one parent-to-child edge per row.
+/// Borrowed `CityObject` hierarchy table with one parent-to-child edge per row.
 ///
 /// The table is empty when no `CityObject` declares parent or child handles.
-/// Edges are de-duplicated because CityJSON can expose the same relation from
+/// Edges are de-duplicated because `CityJSON` can expose the same relation from
 /// both sides through a parent's `children` and a child's `parents` member.
 #[derive(Debug)]
 pub struct CityObjectHierarchyTable<'model> {
@@ -342,8 +342,7 @@ impl ColumnOrigin {
         match self {
             Self::Attributes => Some("attributes"),
             Self::SemanticAttributes => Some("attribute"),
-            Self::Extra => None,
-            Self::MetadataExtra => None,
+            Self::Extra | Self::MetadataExtra => None,
         }
     }
 }
@@ -648,7 +647,7 @@ impl<'table, 'model> SemanticRowRef<'table, 'model> {
 ///
 /// Rows join primitive semantic assignments to semantic definition attributes.
 /// Geometry bytes are intentionally exposed through [`semantic_primitive_geometry`]
-/// so text writers can avoid computing WKB while GeoPackage writers can serialize
+/// so text writers can avoid computing WKB while `GeoPackage` writers can serialize
 /// the same projection with a `geom` column.
 #[derive(Debug)]
 pub struct SemanticPrimitiveTable<'model> {
@@ -1041,6 +1040,7 @@ fn geometry_ref_to_wkb_hex(model: &CityModel, value: GeometryHandle) -> Result<S
     Ok(bytes_to_hex(&geometry_ref_to_wkb(model, value)?))
 }
 
+#[must_use]
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -1448,8 +1448,8 @@ pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimiti
 
 /// Encodes one semantic primitive as ISO WKB plus its source-space extent.
 ///
-/// Points are encoded as PointZ, linestrings as LineStringZ, and surfaces as
-/// PolygonZ. Surface primitives retain all rings from the source boundary. The
+/// Points are encoded as `PointZ`, linestrings as `LineStringZ`, and surfaces as
+/// `PolygonZ`. Surface primitives retain all rings from the source boundary. The
 /// function resolves geometry instances through the model, matching semantic
 /// assignment tabulation.
 ///
@@ -1506,7 +1506,7 @@ pub fn semantic_primitive_geometry(
             encode_linestring_primitive(model, vertices)
         }
         PrimitiveType::Surface => {
-            let surface = semantic_surface(boundary, geometry.type_geometry(), row)?;
+            let surface = semantic_surface(boundary, *geometry.type_geometry(), row)?;
             encode_surface_primitive(model, surface)
         }
     }
@@ -1755,7 +1755,7 @@ fn required_index(value: Option<u64>, name: &str, row: &SemanticPrimitiveRow<'_>
 
 fn semantic_surface(
     boundary: &Boundary<u32>,
-    geometry_type: &GeometryType,
+    geometry_type: GeometryType,
     row: &SemanticPrimitiveRow<'_>,
 ) -> Result<Vec<Vec<u32>>> {
     let surface_ix = required_index(row.surface_ix, "surface_ix", row)?;

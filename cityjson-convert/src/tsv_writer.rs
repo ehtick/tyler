@@ -138,7 +138,7 @@ pub fn write_cityobjects_tsv<W: Write>(
     Ok(())
 }
 
-/// Writes CityObject hierarchy edges as TSV.
+/// Writes `CityObject` hierarchy edges as TSV.
 ///
 /// # Errors
 ///
@@ -231,7 +231,7 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let mut record = metadata_fixed_cells(row.fixed())?;
+        let mut record = metadata_fixed_cells(row.fixed());
         record.extend(
             dynamic_cells(table.model(), row.values())?
                 .into_iter()
@@ -328,8 +328,8 @@ fn metadata_fixed_header() -> Vec<String> {
     .collect()
 }
 
-fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Result<Vec<String>> {
-    Ok(vec![
+fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Vec<String> {
+    vec![
         option_string_cell(row.identifier.as_deref()),
         option_string_cell(row.reference_date.as_deref()),
         option_string_cell(row.reference_system.as_deref()),
@@ -345,7 +345,7 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Result<Vec<String>> {
         option_string_cell(row.contact_type.as_deref()),
         option_string_cell(row.contact_phone.as_deref()),
         option_string_cell(row.contact_organization.as_deref()),
-    ])
+    ]
 }
 
 fn semantic_primitive_header() -> Vec<String> {
