@@ -10,10 +10,11 @@ use csv::Terminator;
 
 use crate::{
     tabular::{geometry_ref_to_multipoint_wkb_hex, value_to_text_cell, TextCell},
-    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
-    tabulate_semantic_assignments, tabulate_semantics, AddressTable, CityObjectTable, IdList,
-    MetadataRow, MetadataTable, SemanticAssignmentRow, SemanticAssignmentTable, SemanticTable,
-    Value,
+    tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
+    tabulate_semantics, AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow,
+    MetadataTable, SemanticAssignmentRow, SemanticAssignmentTable, SemanticHierarchyTable,
+    SemanticTable, Value,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -58,6 +59,16 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
     let mut file = File::create(output_dir.join("cityobjects.tsv"))?;
     write_cityobjects_tsv(&cityobjects, &write_options, &mut file)?;
 
+    if options.include_hierarchy {
+        let hierarchy = tabulate_cityobject_hierarchy(model)?;
+        let mut file = File::create(output_dir.join("cityobject_hierarchy.tsv"))?;
+        write_cityobject_hierarchy_tsv(&hierarchy, &mut file)?;
+
+        let hierarchy = tabulate_semantic_hierarchy(model);
+        let mut file = File::create(output_dir.join("semantic_hierarchy.tsv"))?;
+        write_semantic_hierarchy_tsv(&hierarchy, &mut file)?;
+    }
+
     if options.include_metadata {
         let metadata = tabulate_model_metadata(model)?;
         let mut file = File::create(output_dir.join("metadata.tsv"))?;
@@ -95,9 +106,6 @@ pub fn write_cityobjects_tsv<W: Write>(
     if options.include_cityjson_ordinal {
         header.push("cityobject_ix".to_string());
     }
-    if options.include_hierarchy {
-        header.extend(["parents".to_string(), "children".to_string()]);
-    }
     header.extend(
         table
             .schema()
@@ -125,14 +133,46 @@ pub fn write_cityobjects_tsv<W: Write>(
         if options.include_cityjson_ordinal {
             record.push(row.cityobject_ix.to_string());
         }
-        if options.include_hierarchy {
-            record.push(id_list_cell(&row.parents()?)?);
-            record.push(id_list_cell(&row.children()?)?);
-        }
         record.extend(dynamic.into_iter().map(|cell| cell.text));
         tsv.write_record(record)?;
     }
 
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes CityObject hierarchy edges as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails.
+pub fn write_cityobject_hierarchy_tsv<W: Write>(
+    table: &CityObjectHierarchyTable<'_>,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    tsv.write_record(["parent_id", "child_id"])?;
+    for row in table.rows() {
+        tsv.write_record([row.parent_id, row.child_id])?;
+    }
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes semantic hierarchy edges as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails.
+pub fn write_semantic_hierarchy_tsv<W: Write>(
+    table: &SemanticHierarchyTable,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    tsv.write_record(["parent_id", "child_id"])?;
+    for row in table.rows() {
+        tsv.write_record([row.parent_id.to_string(), row.child_id.to_string()])?;
+    }
     tsv.flush()?;
     Ok(())
 }
@@ -232,9 +272,6 @@ pub fn write_semantic_definitions_tsv<W: Write>(
 ) -> Result<()> {
     let mut tsv = tsv_writer(writer);
     let mut header = vec!["semantic_id".to_string(), "semantic_type".to_string()];
-    if options.include_hierarchy {
-        header.extend(["parent".to_string(), "children".to_string()]);
-    }
     header.extend(
         table
             .schema()
@@ -255,10 +292,6 @@ pub fn write_semantic_definitions_tsv<W: Write>(
             fixed.semantic_id.to_string(),
             fixed.semantic_type_name().to_string(),
         ];
-        if options.include_hierarchy {
-            record.push(optional_u64_cell(fixed.parent));
-            record.push(serde_json::to_string(&fixed.children)?);
-        }
         record.extend(dynamic.into_iter().map(|cell| cell.text));
         tsv.write_record(record)?;
     }
@@ -315,9 +348,6 @@ pub fn write_split_semantics_tsv<W: Write>(
     let mut tsv = tsv_writer(writer);
     let mut header = semantic_assignment_header(options.include_cityjson_ordinal);
     header.push("semantic_type".to_string());
-    if options.include_hierarchy {
-        header.extend(["parent".to_string(), "children".to_string()]);
-    }
     header.extend(
         semantics
             .schema()
@@ -348,15 +378,8 @@ pub fn write_split_semantics_tsv<W: Write>(
         if let Some(row) = semantic {
             let fixed = row.fixed();
             record.push(fixed.semantic_type_name().to_string());
-            if options.include_hierarchy {
-                record.push(optional_u64_cell(fixed.parent));
-                record.push(serde_json::to_string(&fixed.children)?);
-            }
         } else {
             record.push(String::new());
-            if options.include_hierarchy {
-                record.extend([String::new(), String::new()]);
-            }
         }
         record.extend(dynamic.into_iter().map(|cell| cell.text));
         tsv.write_record(record)?;
@@ -394,10 +417,6 @@ fn null_cells(count: usize) -> Vec<TextCell> {
 
 fn all_null(cells: &[TextCell]) -> bool {
     cells.iter().all(|cell| cell.is_null)
-}
-
-fn id_list_cell(ids: &IdList<'_>) -> Result<String> {
-    Ok(serde_json::to_string(ids.ids())?)
 }
 
 fn metadata_fixed_header() -> Vec<String> {

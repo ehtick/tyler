@@ -2,9 +2,9 @@ use std::env;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
-    tabulate_semantic_assignments, tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType,
-    TableSchema, Value,
+    tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
+    tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -356,6 +356,15 @@ fn exposes_cityobject_hierarchy_as_resolved_id_lists() {
     assert_eq!(rows[0].parents().unwrap().ids(), &[] as &[&str]);
     assert_eq!(rows[1].parents().unwrap().ids(), &["building"]);
     assert_eq!(rows[1].children().unwrap().ids(), &[] as &[&str]);
+
+    let hierarchy = tabulate_cityobject_hierarchy(&model).unwrap();
+    assert_eq!(
+        hierarchy.rows().collect::<Vec<_>>(),
+        [&cityjson_convert::HierarchyRow {
+            parent_id: "building",
+            child_id: "room",
+        }]
+    );
 }
 
 #[test]
@@ -452,6 +461,14 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert_eq!(second.semantic_type_name().to_string(), "WallSurface");
     assert_eq!(first.children, vec![second.semantic_id]);
     assert_eq!(second.parent, Some(first.semantic_id));
+    let hierarchy = tabulate_semantic_hierarchy(&model);
+    assert_eq!(
+        hierarchy.rows().collect::<Vec<_>>(),
+        [&cityjson_convert::SemanticHierarchyRow {
+            parent_id: first.semantic_id,
+            child_id: second.semantic_id,
+        }]
+    );
 
     let slope = schema_column_index(table.schema(), "attributes__slope");
     assert_eq!(

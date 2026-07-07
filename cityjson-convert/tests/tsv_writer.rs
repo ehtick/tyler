@@ -2,10 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    convert_to_tsv, tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
-    tabulate_semantic_assignments, tabulate_semantics, write_addresses_tsv, write_cityobjects_tsv,
+    convert_to_tsv, tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
+    tabulate_semantics, write_addresses_tsv, write_cityobject_hierarchy_tsv, write_cityobjects_tsv,
     write_metadata_tsv, write_semantic_assignments_tsv, write_semantic_definitions_tsv,
-    write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
+    write_semantic_hierarchy_tsv, write_split_semantics_tsv, TsvExportOptions, TsvWriteOptions,
 };
 use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
@@ -261,18 +262,20 @@ fn writes_cityobjects_tsv_with_filtering_ordinal_hierarchy_and_json_cells() {
             "cityobject_id",
             "cityobject_type",
             "cityobject_ix",
-            "parents",
-            "children",
             "attributes__name",
             "attributes__scores",
         ]
     );
     assert_eq!(rows[1][0], "building");
     assert_eq!(rows[1][2], "0");
-    assert_eq!(rows[1][3], "[]");
-    assert_eq!(rows[1][4], "[\"room\"]");
-    assert_eq!(rows[1][5], "Library");
-    assert_eq!(rows[1][6], "[1,2]");
+    assert_eq!(rows[1][3], "Library");
+    assert_eq!(rows[1][4], "[1,2]");
+
+    let hierarchy = tabulate_cityobject_hierarchy(&model).unwrap();
+    let mut bytes = Vec::new();
+    write_cityobject_hierarchy_tsv(&hierarchy, &mut bytes).unwrap();
+    let rows = parse_tsv(&bytes);
+    assert_eq!(rows, [["parent_id", "child_id"], ["building", "room"]]);
 
     let mut bytes = Vec::new();
     write_cityobjects_tsv(
@@ -344,18 +347,16 @@ fn writes_semantic_definition_and_assignment_tsvs() {
     assert_eq!(rows.len(), 3);
     assert_eq!(
         rows[0],
-        [
-            "semantic_id",
-            "semantic_type",
-            "parent",
-            "children",
-            "attributes__slope"
-        ]
+        ["semantic_id", "semantic_type", "attributes__slope"]
     );
     assert_eq!(rows[1][1], "RoofSurface");
-    assert_eq!(rows[1][3], "[1]");
-    assert_eq!(rows[1][4], "30");
-    assert_eq!(rows[2][2], "0");
+    assert_eq!(rows[1][2], "30");
+
+    let hierarchy = tabulate_semantic_hierarchy(&model);
+    let mut hierarchy_bytes = Vec::new();
+    write_semantic_hierarchy_tsv(&hierarchy, &mut hierarchy_bytes).unwrap();
+    let rows = parse_tsv(&hierarchy_bytes);
+    assert_eq!(rows, [["parent_id", "child_id"], ["0", "1"]]);
 
     let mut assignment_bytes = Vec::new();
     write_semantic_assignments_tsv(
@@ -411,8 +412,8 @@ fn writes_split_semantics_as_joined_filtered_tsv() {
     assert_eq!(rows[0][0], "semantic_id");
     assert_eq!(rows[0][2], "cityobject_ix");
     assert!(rows[0].contains(&"semantic_type".to_string()));
-    assert!(rows[0].contains(&"parent".to_string()));
-    assert!(rows[0].contains(&"children".to_string()));
+    assert!(!rows[0].contains(&"parent".to_string()));
+    assert!(!rows[0].contains(&"children".to_string()));
     assert!(rows[0].contains(&"attributes__slope".to_string()));
     assert_eq!(rows[1][0], "0");
     assert_eq!(rows[1][1], "building");
@@ -457,6 +458,8 @@ fn converts_model_to_tsv_directory_outputs() {
     assert!(dir.join("metadata.tsv").is_file());
     assert!(dir.join("semantics.tsv").is_file());
     assert!(dir.join("addresses.tsv").is_file());
+    assert!(dir.join("cityobject_hierarchy.tsv").is_file());
+    assert!(dir.join("semantic_hierarchy.tsv").is_file());
 
     fs::remove_dir_all(dir).unwrap();
 }

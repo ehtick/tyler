@@ -108,6 +108,9 @@ struct GpkgLayerCliOptions {
     // Write semantic tables alongside feature tables.
     #[arg(long = "gpkg-split-semantics", default_value_t = false)]
     semantics_tables: bool,
+    // Write standalone CityObject and semantic hierarchy tables.
+    #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
+    hierarchy_tables: bool,
     // Write CityObject extra.address values to a separate feature layer.
     #[arg(long = "gpkg-split-address", default_value_t = false)]
     address_layer: bool,
@@ -177,6 +180,7 @@ fn main() -> anyhow::Result<()> {
                 split_lod: cli.gpkg.layers.lod_layers,
                 split_semantics: cli.gpkg.layers.semantics_tables,
                 split_address: cli.gpkg.layers.address_layer,
+                include_hierarchy: cli.gpkg.layers.hierarchy_tables,
                 include_metadata: cli.gpkg.metadata.include_source,
                 output_crs: cli.gpkg.output_crs.clone(),
             };

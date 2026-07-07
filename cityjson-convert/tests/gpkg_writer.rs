@@ -110,7 +110,8 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
         "gpkg_metadata",
         "gpkg_metadata_reference",
         "gpkg_spatial_ref_sys",
-        "cityobject_relations",
+        "cityobject_hierarchy",
+        "semantic_hierarchy",
         "building_multisurface",
         "buildingroom_multisurface",
     ] {
@@ -120,7 +121,8 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
         );
     }
 
-    assert_eq!(table_row_count(conn, "cityobject_relations"), 1);
+    assert_eq!(table_row_count(conn, "cityobject_hierarchy"), 1);
+    assert_eq!(table_row_count(conn, "semantic_hierarchy"), 0);
     assert_eq!(table_row_count(conn, "gpkg_metadata"), 1);
     assert_eq!(table_row_count(conn, "gpkg_metadata_reference"), 1);
     assert_eq!(table_row_count(conn, "building_multisurface"), 1);
@@ -201,10 +203,10 @@ fn assert_attribute_table_registered(conn: &Connection, table_name: &str) {
     assert_eq!(data_type, "attributes");
 }
 
-fn assert_single_cityobject_relation(conn: &Connection) {
+fn assert_single_cityobject_hierarchy_edge(conn: &Connection) {
     let relation: (String, String) = conn
         .query_row(
-            "SELECT parent_cityobject_id, child_cityobject_id FROM cityobject_relations",
+            "SELECT parent_id, child_id FROM cityobject_hierarchy",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -227,6 +229,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
             split_lod: false,
             split_semantics: false,
             split_address: false,
+            include_hierarchy: true,
             include_metadata: true,
             output_crs: None,
         },
@@ -238,8 +241,8 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
     assert_building_layer_metadata(&conn);
     assert_building_blob_header(&conn);
     assert_crs_wkt_metadata(&conn);
-    assert_single_cityobject_relation(&conn);
-    assert_attribute_table_registered(&conn, "cityobject_relations");
+    assert_single_cityobject_hierarchy_edge(&conn);
+    assert_attribute_table_registered(&conn, "cityobject_hierarchy");
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");
@@ -295,6 +298,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
             split_lod: true,
             split_semantics: true,
             split_address: false,
+            include_hierarchy: true,
             include_metadata: false,
             output_crs: None,
         },
@@ -305,8 +309,10 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
     assert!(table_exists(&conn, "building_multisurface_lod2_0"));
     assert!(table_exists(&conn, "semantics"));
     assert!(table_exists(&conn, "semantic_relations"));
+    assert!(table_exists(&conn, "semantic_hierarchy"));
     assert_eq!(table_row_count(&conn, "semantics"), 2);
     assert_eq!(table_row_count(&conn, "semantic_relations"), 3);
+    assert_eq!(table_row_count(&conn, "semantic_hierarchy"), 1);
     assert_attribute_table_registered(&conn, "semantics");
     assert_attribute_table_registered(&conn, "semantic_relations");
 
@@ -365,6 +371,7 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
             split_lod: true,
             split_semantics: false,
             split_address: false,
+            include_hierarchy: false,
             include_metadata: false,
             output_crs: None,
         },
@@ -560,6 +567,7 @@ fn converts_split_address_to_multipoint_feature_layer() {
             split_lod: false,
             split_semantics: false,
             split_address: true,
+            include_hierarchy: false,
             include_metadata: false,
             output_crs: None,
         },

@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -12,9 +12,11 @@ use rusqlite::{params, params_from_iter, Connection, Transaction};
 
 use crate::{
     tabular::{geometry_ref_to_wkb, metadata_to_compact_json, value_to_json},
-    tabulate_addresses, tabulate_cityobjects, tabulate_model_metadata,
-    tabulate_semantic_assignments, tabulate_semantics, AddressTable, CityObjectRow,
-    CityObjectTable, LogicalType, MetadataTable, SemanticAssignmentTable, SemanticTable, Value,
+    tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
+    tabulate_semantics, AddressTable, CityObjectHierarchyTable, CityObjectRow, CityObjectTable,
+    LogicalType, MetadataTable, SemanticAssignmentTable, SemanticHierarchyTable, SemanticTable,
+    Value,
 };
 
 const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
@@ -32,6 +34,7 @@ pub struct GpkgExportOptions {
     pub split_lod: bool,
     pub split_semantics: bool,
     pub split_address: bool,
+    pub include_hierarchy: bool,
     pub include_metadata: bool,
     pub output_crs: Option<String>,
 }
@@ -64,6 +67,14 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     let cityobject_rows = cityobjects.rows().collect::<Vec<_>>();
     let metadata = if options.include_metadata {
         Some(tabulate_model_metadata(model)?)
+    } else {
+        None
+    };
+    let hierarchy = if options.include_hierarchy {
+        Some((
+            tabulate_cityobject_hierarchy(model)?,
+            tabulate_semantic_hierarchy(model),
+        ))
     } else {
         None
     };
@@ -101,7 +112,6 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     let mut used_table_names = HashSet::new();
     let mut feature_layer_names = BTreeMap::new();
     let mut feature_layers: BTreeMap<String, FeatureLayerState> = BTreeMap::new();
-    let mut relations = BTreeSet::new();
 
     export_feature_layers(
         &FeatureLayerExport {
@@ -116,11 +126,14 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
         &mut used_table_names,
         &mut feature_layer_names,
         &mut feature_layers,
-        &mut relations,
     )?;
 
-    create_relation_table(&tx, &last_change)?;
-    insert_cityobject_relations(&tx, &relations)?;
+    if let Some((cityobject_hierarchy, semantic_hierarchy)) = hierarchy {
+        create_cityobject_hierarchy_table(&tx, &last_change)?;
+        insert_cityobject_hierarchy(&tx, &cityobject_hierarchy)?;
+        create_semantic_hierarchy_table(&tx, &last_change)?;
+        insert_semantic_hierarchy(&tx, &semantic_hierarchy)?;
+    }
 
     if let Some((semantics_table, assignment_table)) = semantics {
         create_semantics_table(&tx, semantics_table.schema(), &last_change)?;
@@ -167,11 +180,9 @@ fn export_feature_layers(
     used_table_names: &mut HashSet<String>,
     feature_layer_names: &mut BTreeMap<FeatureLayerKey, String>,
     feature_layers: &mut BTreeMap<String, FeatureLayerState>,
-    relations: &mut BTreeSet<(String, String)>,
 ) -> Result<()> {
     for (cityobject_ix, (_, cityobject)) in export.model.cityobjects().iter().enumerate() {
         let row = &export.cityobject_rows[cityobject_ix];
-        collect_cityobject_relations(row, relations)?;
 
         let Some(geometry_handles) = cityobject.geometry() else {
             continue;
@@ -663,31 +674,58 @@ fn insert_feature_row(
     Ok(())
 }
 
-fn create_relation_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
+fn create_cityobject_hierarchy_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
     tx.execute_batch(
-        "CREATE TABLE cityobject_relations (
-            parent_cityobject_id TEXT NOT NULL,
-            child_cityobject_id TEXT NOT NULL,
-            PRIMARY KEY (parent_cityobject_id, child_cityobject_id)
+        "CREATE TABLE cityobject_hierarchy (
+            parent_id TEXT NOT NULL,
+            child_id TEXT NOT NULL,
+            PRIMARY KEY (parent_id, child_id)
         );",
     )?;
     register_attribute_table(
         tx,
-        "cityobject_relations",
-        "cityobject_relations",
+        "cityobject_hierarchy",
+        "cityobject_hierarchy",
         last_change,
     )
 }
 
-fn insert_cityobject_relations(
+fn insert_cityobject_hierarchy(
     tx: &Transaction<'_>,
-    relations: &BTreeSet<(String, String)>,
+    hierarchy: &CityObjectHierarchyTable<'_>,
 ) -> Result<()> {
     let mut statement = tx.prepare(
-        "INSERT OR IGNORE INTO cityobject_relations (parent_cityobject_id, child_cityobject_id) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO cityobject_hierarchy (parent_id, child_id) VALUES (?1, ?2)",
     )?;
-    for (parent, child) in relations {
-        statement.execute(params![parent, child])?;
+    for row in hierarchy.rows() {
+        statement.execute(params![row.parent_id, row.child_id])?;
+    }
+    Ok(())
+}
+
+fn create_semantic_hierarchy_table(tx: &Transaction<'_>, last_change: &str) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE semantic_hierarchy (
+            parent_id INTEGER NOT NULL,
+            child_id INTEGER NOT NULL,
+            PRIMARY KEY (parent_id, child_id)
+        );",
+    )?;
+    register_attribute_table(tx, "semantic_hierarchy", "semantic_hierarchy", last_change)
+}
+
+fn insert_semantic_hierarchy(
+    tx: &Transaction<'_>,
+    hierarchy: &SemanticHierarchyTable,
+) -> Result<()> {
+    let mut statement = tx.prepare(
+        "INSERT OR IGNORE INTO semantic_hierarchy (parent_id, child_id) VALUES (?1, ?2)",
+    )?;
+    for row in hierarchy.rows() {
+        statement.execute(params![
+            sqlite_integer(row.parent_id, "parent_id")?,
+            sqlite_integer(row.child_id, "child_id")?,
+        ])?;
     }
     Ok(())
 }
@@ -939,20 +977,6 @@ fn update_feature_layer_extents(
                 params![min_x, min_y, max_x, max_y, table_name],
             )?;
         }
-    }
-    Ok(())
-}
-
-fn collect_cityobject_relations(
-    row: &CityObjectRow<'_, '_>,
-    relations: &mut BTreeSet<(String, String)>,
-) -> Result<()> {
-    let cityobject_id = row.cityobject_id.to_string();
-    for parent in row.parents()?.iter() {
-        relations.insert((parent.to_string(), cityobject_id.clone()));
-    }
-    for child in row.children()?.iter() {
-        relations.insert((cityobject_id.clone(), child.to_string()));
     }
     Ok(())
 }

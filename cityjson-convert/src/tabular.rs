@@ -178,6 +178,30 @@ impl<'model> CityObjectTable<'model> {
     }
 }
 
+/// Borrowed CityObject hierarchy table with one parent-to-child edge per row.
+///
+/// The table is empty when no `CityObject` declares parent or child handles.
+/// Edges are de-duplicated because CityJSON can expose the same relation from
+/// both sides through a parent's `children` and a child's `parents` member.
+#[derive(Debug)]
+pub struct CityObjectHierarchyTable<'model> {
+    rows: Vec<HierarchyRow<'model>>,
+}
+
+impl<'model> CityObjectHierarchyTable<'model> {
+    /// Iterates hierarchy edges ordered by parent id and then child id.
+    pub fn rows(&self) -> impl Iterator<Item = &HierarchyRow<'model>> {
+        self.rows.iter()
+    }
+}
+
+/// One parent-to-child hierarchy edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HierarchyRow<'model> {
+    pub parent_id: &'model str,
+    pub child_id: &'model str,
+}
+
 /// Borrowed address table with one row per `CityObject.extra.address` object.
 #[derive(Debug)]
 pub struct AddressTable<'model> {
@@ -617,6 +641,29 @@ impl<'table, 'model> SemanticRowRef<'table, 'model> {
             .iter()
             .map(|column| resolve_dynamic_value(self.row.attributes, column))
     }
+}
+
+/// Borrowed semantic hierarchy table with one parent-to-child edge per row.
+///
+/// Semantic ids are zero-based indices from the source semantic object handles.
+/// The table is empty when no semantic objects declare parent or child handles.
+#[derive(Debug)]
+pub struct SemanticHierarchyTable {
+    rows: Vec<SemanticHierarchyRow>,
+}
+
+impl SemanticHierarchyTable {
+    /// Iterates hierarchy edges ordered by parent id and then child id.
+    pub fn rows(&self) -> impl Iterator<Item = &SemanticHierarchyRow> {
+        self.rows.iter()
+    }
+}
+
+/// One parent-to-child semantic hierarchy edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticHierarchyRow {
+    pub parent_id: u64,
+    pub child_id: u64,
 }
 
 /// Borrowed semantic-assignment table with one row per mapped geometry primitive.
@@ -1079,6 +1126,36 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
     })
 }
 
+/// Tabulates `CityObject` parent/child edges into a standalone hierarchy table.
+///
+/// # Errors
+///
+/// Returns an error when a parent or child handle references a missing
+/// `CityObject`.
+pub fn tabulate_cityobject_hierarchy(model: &CityModel) -> Result<CityObjectHierarchyTable<'_>> {
+    let mut edges = BTreeMap::<(&str, &str), HierarchyRow<'_>>::new();
+    for (_, object) in model.cityobjects().iter() {
+        let cityobject_id = object.id();
+        for parent in cityobject_id_list(model, object.parents())?.iter() {
+            edges
+                .entry((parent, cityobject_id))
+                .or_insert(HierarchyRow {
+                    parent_id: parent,
+                    child_id: cityobject_id,
+                });
+        }
+        for child in cityobject_id_list(model, object.children())?.iter() {
+            edges.entry((cityobject_id, child)).or_insert(HierarchyRow {
+                parent_id: cityobject_id,
+                child_id: child,
+            });
+        }
+    }
+    Ok(CityObjectHierarchyTable {
+        rows: edges.into_values().collect(),
+    })
+}
+
 /// Infers the address schema and returns one borrowed row per `extra.address`.
 ///
 /// # Errors
@@ -1180,6 +1257,34 @@ pub fn tabulate_semantics(model: &CityModel) -> Result<SemanticTable<'_>> {
             &["semantic_id", "semantic_type", "parent", "children"],
         ),
     })
+}
+
+/// Tabulates semantic parent/child edges into a standalone hierarchy table.
+pub fn tabulate_semantic_hierarchy(model: &CityModel) -> SemanticHierarchyTable {
+    let mut edges = BTreeMap::<(u64, u64), SemanticHierarchyRow>::new();
+    for (handle, semantic) in model.iter_semantics() {
+        let semantic_id = semantic_handle_id(handle);
+        if let Some(parent) = semantic.parent().map(semantic_handle_id) {
+            edges
+                .entry((parent, semantic_id))
+                .or_insert(SemanticHierarchyRow {
+                    parent_id: parent,
+                    child_id: semantic_id,
+                });
+        }
+        for child in semantic.children().unwrap_or_default().iter().copied() {
+            let child_id = semantic_handle_id(child);
+            edges
+                .entry((semantic_id, child_id))
+                .or_insert(SemanticHierarchyRow {
+                    parent_id: semantic_id,
+                    child_id,
+                });
+        }
+    }
+    SemanticHierarchyTable {
+        rows: edges.into_values().collect(),
+    }
 }
 
 /// Tabulates geometry primitive to semantic definition assignments.
