@@ -107,8 +107,6 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
     for expected in [
         "gpkg_contents",
         "gpkg_geometry_columns",
-        "gpkg_metadata",
-        "gpkg_metadata_reference",
         "gpkg_spatial_ref_sys",
         "cityobject_hierarchy",
         "semantic_hierarchy",
@@ -123,9 +121,31 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
 
     assert_eq!(table_row_count(conn, "cityobject_hierarchy"), 1);
     assert_eq!(table_row_count(conn, "semantic_hierarchy"), 0);
-    assert_eq!(table_row_count(conn, "gpkg_metadata"), 1);
-    assert_eq!(table_row_count(conn, "gpkg_metadata_reference"), 1);
     assert_eq!(table_row_count(conn, "building_multisurface"), 1);
+}
+
+fn metadata_output_path(output: &std::path::Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("metadata");
+    output.with_file_name(format!("{stem}_metadata.gpkg"))
+}
+
+fn assert_metadata_gpkg(output: &std::path::Path) {
+    let metadata_output = metadata_output_path(output);
+    assert!(metadata_output.is_file());
+    let conn = Connection::open(&metadata_output).expect("open metadata GeoPackage");
+    assert!(table_exists(&conn, "metadata"));
+    assert_eq!(table_row_count(&conn, "metadata"), 1);
+    assert_eq!(
+        table_column_type(&conn, "metadata", "geographical_extent_wkb"),
+        "BLOB"
+    );
+    let identifier: String = conn
+        .query_row("SELECT identifier FROM metadata", [], |row| row.get(0))
+        .expect("read metadata identifier");
+    assert_eq!(identifier, "dataset-1");
 }
 
 fn assert_building_layer_metadata(conn: &Connection) {
@@ -218,8 +238,12 @@ fn assert_single_cityobject_hierarchy_edge(conn: &Connection) {
 fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
     let model = layers_relations_metadata_model();
     let output = stable_output_path("convert_to_gpkg_layers_relations_metadata");
+    let metadata_output = metadata_output_path(&output);
     if output.exists() {
         fs::remove_file(&output).expect("remove previous output");
+    }
+    if metadata_output.exists() {
+        fs::remove_file(&metadata_output).expect("remove previous metadata output");
     }
 
     convert_to_gpkg(
@@ -243,9 +267,14 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
     assert_crs_wkt_metadata(&conn);
     assert_single_cityobject_hierarchy_edge(&conn);
     assert_attribute_table_registered(&conn, "cityobject_hierarchy");
+    assert_metadata_gpkg(&output);
 
+    let metadata_output = metadata_output_path(&output);
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");
+    }
+    if metadata_output.exists() {
+        fs::remove_file(&metadata_output).expect("clean up metadata output");
     }
 }
 

@@ -8,7 +8,7 @@ use cityjson_lib::CityModel;
 use csv::Terminator;
 
 use crate::{
-    tabular::{value_to_text_cell, TextCell},
+    tabular::{bytes_to_hex, value_to_text_cell, TextCell},
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow, MetadataTable,
@@ -314,8 +314,7 @@ fn metadata_fixed_header() -> Vec<String> {
         "reference_date",
         "reference_system",
         "title",
-        "geographical_extent",
-        "geographical_extent_wkt",
+        "geographical_extent_wkb",
         "contact_name",
         "contact_email_address",
         "contact_role",
@@ -335,11 +334,10 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Result<Vec<String>> {
         option_string_cell(row.reference_date.as_deref()),
         option_string_cell(row.reference_system.as_deref()),
         option_string_cell(row.title.as_deref()),
-        row.geographical_extent
-            .map(|bbox| serde_json::to_string(&bbox))
-            .transpose()?
+        row.geographical_extent_wkb
+            .as_deref()
+            .map(bytes_to_hex)
             .unwrap_or_default(),
-        option_string_cell(row.geographical_extent_wkt.as_deref()),
         option_string_cell(row.contact_name.as_deref()),
         option_string_cell(row.contact_email_address.as_deref()),
         option_string_cell(row.contact_role.as_deref()),

@@ -302,12 +302,13 @@ fn writes_metadata_tsv_with_fixed_fields_extent_and_extra() {
     let rows = parse_tsv(&bytes);
 
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].contains(&"geographical_extent".to_string()));
-    assert!(rows[0].contains(&"geographical_extent_wkt".to_string()));
-    assert!(rows[0].contains(&"metadata_extra__+quality__score".to_string()));
+    assert!(rows[0].contains(&"geographical_extent_wkb".to_string()));
+    assert!(!rows[0].contains(&"geographical_extent".to_string()));
+    assert!(!rows[0].contains(&"geographical_extent_wkt".to_string()));
+    assert!(rows[0].contains(&"+quality__score".to_string()));
+    assert!(!rows[0].contains(&"metadata_extra__+quality__score".to_string()));
     assert_eq!(rows[1][0], "dataset-1");
-    assert_eq!(rows[1][4], "[1.0,2.0,3.0,4.0,5.0,6.0]");
-    assert_eq!(rows[1][5], "POLYGON((1 2, 4 2, 4 5, 1 5, 1 2))");
+    assert!(rows[1][4].starts_with("01030000000100000005000000"));
     assert_eq!(rows[1].last().unwrap(), "7");
 }
 

@@ -343,7 +343,7 @@ impl ColumnOrigin {
             Self::Attributes => Some("attributes"),
             Self::SemanticAttributes => Some("attribute"),
             Self::Extra => None,
-            Self::MetadataExtra => Some("metadata_extra"),
+            Self::MetadataExtra => None,
         }
     }
 }
@@ -531,8 +531,7 @@ pub struct MetadataRow<'model> {
     pub reference_date: Option<String>,
     pub reference_system: Option<String>,
     pub title: Option<String>,
-    pub geographical_extent: Option<[f64; 6]>,
-    pub geographical_extent_wkt: Option<String>,
+    pub geographical_extent_wkb: Option<Vec<u8>>,
     pub contact_name: Option<String>,
     pub contact_email_address: Option<String>,
     pub contact_role: Option<String>,
@@ -1042,7 +1041,7 @@ fn geometry_ref_to_wkb_hex(model: &CityModel, value: GeometryHandle) -> Result<S
     Ok(bytes_to_hex(&geometry_ref_to_wkb(model, value)?))
 }
 
-fn bytes_to_hex(bytes: &[u8]) -> String {
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1316,8 +1315,7 @@ pub fn tabulate_model_metadata(model: &CityModel) -> Result<MetadataTable<'_>> {
                 "reference_date",
                 "reference_system",
                 "title",
-                "geographical_extent",
-                "geographical_extent_wkt",
+                "geographical_extent_wkb",
                 "contact_name",
                 "contact_email_address",
                 "contact_role",
@@ -1616,8 +1614,7 @@ impl<'model> MetadataRow<'model> {
             reference_date: metadata.reference_date().map(ToString::to_string),
             reference_system: metadata.reference_system().map(ToString::to_string),
             title: metadata.title().map(ToString::to_string),
-            geographical_extent: metadata.geographical_extent().map(|bbox| (*bbox).into()),
-            geographical_extent_wkt: metadata.geographical_extent().map(bbox_wkt_2d),
+            geographical_extent_wkb: metadata.geographical_extent().map(bbox_wkb_2d),
             contact_name: contact.map(|contact| contact.contact_name().to_string()),
             contact_email_address: contact.map(|contact| contact.email_address().to_string()),
             contact_role: contact.and_then(|contact| contact.role().map(|role| role.to_string())),
@@ -2096,20 +2093,25 @@ fn surface_paths_for_multi_solid<Surface>(solids: &[Vec<Vec<Surface>>]) -> Vec<S
     paths
 }
 
-fn bbox_wkt_2d(bbox: &cityjson_lib::cityjson_types::v2_0::BBox) -> String {
-    format!(
-        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
-        bbox.min_x(),
-        bbox.min_y(),
-        bbox.max_x(),
-        bbox.min_y(),
-        bbox.max_x(),
-        bbox.max_y(),
-        bbox.min_x(),
-        bbox.max_y(),
-        bbox.min_x(),
-        bbox.min_y()
-    )
+fn bbox_wkb_2d(bbox: &cityjson_lib::cityjson_types::v2_0::BBox) -> Vec<u8> {
+    let coordinates = [
+        [bbox.min_x(), bbox.min_y()],
+        [bbox.max_x(), bbox.min_y()],
+        [bbox.max_x(), bbox.max_y()],
+        [bbox.min_x(), bbox.max_y()],
+        [bbox.min_x(), bbox.min_y()],
+    ];
+    let mut wkb = Vec::with_capacity(1 + 4 + 4 + 4 + coordinates.len() * 16);
+    push_wkb_header(&mut wkb, 3);
+    push_wkb_count(&mut wkb, 1, "metadata extent ring count")
+        .expect("one metadata extent ring fits in u32");
+    push_wkb_count(&mut wkb, coordinates.len(), "metadata extent vertex count")
+        .expect("metadata extent vertex count fits in u32");
+    for [x, y] in coordinates {
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    wkb
 }
 
 /// Merges one `CityObject` attribute map into an ordered inferred tree.

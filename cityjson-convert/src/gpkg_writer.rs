@@ -1,7 +1,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use cityjson_lib::cityjson_types::v2_0::boundary::Boundary;
@@ -11,9 +11,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, Transaction};
 
 use crate::{
-    tabular::{
-        geometry_ref_to_wkb, metadata_to_compact_json, semantic_primitive_geometry, value_to_json,
-    },
+    tabular::{geometry_ref_to_wkb, semantic_primitive_geometry, value_to_json},
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectRow, CityObjectTable, LogicalType,
@@ -24,9 +22,7 @@ const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
 const GPKG_USER_VERSION: i32 = 10300;
 const GPB_MAGIC: &[u8; 2] = b"GP";
 const GPKG_GEOM_COLUMN_NAME: &str = "geom";
-const GPKG_METADATA_STANDARD_URI: &str = "https://www.geopackage.org/spec/#extension_metadata";
 const GPKG_CRS_WKT_EXTENSION_URI: &str = "https://www.geopackage.org/spec/#extension_crs_wkt";
-const GPKG_METADATA_REFERENCE_SCOPE: &str = "dataset";
 const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 
 #[derive(Clone, Debug, Default)]
@@ -157,14 +153,14 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
         );
     }
 
-    if let Some(metadata_table) = metadata {
-        create_metadata_tables(&tx)?;
-        insert_metadata_rows(&tx, &metadata_table, model, &last_change)?;
-    }
-
     update_feature_layer_extents(&tx, &feature_layers)?;
 
     tx.commit()?;
+
+    if let Some(metadata_table) = metadata {
+        write_metadata_gpkg(output, model, &metadata_table, &resolved_srs, &last_change)?;
+    }
+
     Ok(())
 }
 
@@ -865,83 +861,159 @@ fn sqlite_integer(value: u64, column: &str) -> Result<i64> {
         .with_context(|| format!("{column} value {value} does not fit in SQLite INTEGER"))
 }
 
-fn create_metadata_tables(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "CREATE TABLE gpkg_metadata (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            md_scope TEXT NOT NULL,
-            md_standard_uri TEXT NOT NULL,
-            mime_type TEXT NOT NULL,
-            metadata TEXT NOT NULL
-        );
-        CREATE TABLE gpkg_metadata_reference (
-            reference_scope TEXT NOT NULL,
-            table_name TEXT,
-            column_name TEXT,
-            row_id_value INTEGER,
-            timestamp TEXT NOT NULL,
-            md_file_id INTEGER NOT NULL,
-            md_parent_id INTEGER
-        );",
-    )?;
-    tx.execute(
-        "INSERT INTO gpkg_extensions (
-            table_name, column_name, extension_name, definition, scope
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            Some("gpkg_metadata"),
-            Option::<&str>::None,
-            "gpkg_metadata",
-            GPKG_METADATA_STANDARD_URI,
-            "read-write",
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO gpkg_extensions (
-            table_name, column_name, extension_name, definition, scope
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            Some("gpkg_metadata_reference"),
-            Option::<&str>::None,
-            "gpkg_metadata",
-            GPKG_METADATA_STANDARD_URI,
-            "read-write",
-        ],
-    )?;
+fn write_metadata_gpkg(
+    output: &Path,
+    model: &CityModel,
+    metadata: &MetadataTable<'_>,
+    resolved_srs: &ResolvedSrs,
+    last_change: &str,
+) -> Result<()> {
+    let metadata_output = metadata_output_path(output);
+    if let Some(parent) = metadata_output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if metadata_output.exists() {
+        fs::remove_file(&metadata_output).with_context(|| {
+            format!(
+                "remove existing metadata GeoPackage {}",
+                metadata_output.display()
+            )
+        })?;
+    }
+
+    let mut conn = Connection::open(&metadata_output)
+        .with_context(|| format!("open metadata GeoPackage {}", metadata_output.display()))?;
+    conn.execute_batch(&format!(
+        "PRAGMA application_id = {GPKG_APPLICATION_ID};
+PRAGMA user_version = {GPKG_USER_VERSION};
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = OFF;
+PRAGMA synchronous = OFF;"
+    ))?;
+    let tx = conn.transaction()?;
+    create_core_tables(&tx)?;
+    insert_standard_spatial_ref_systems(&tx, resolved_srs)?;
+    create_metadata_table(&tx, metadata, last_change)?;
+    insert_metadata_rows(&tx, metadata, model)?;
+    tx.commit()?;
     Ok(())
+}
+
+fn metadata_output_path(output: &Path) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("metadata");
+    output.with_file_name(format!("{stem}_metadata.gpkg"))
+}
+
+fn create_metadata_table(
+    tx: &Transaction<'_>,
+    metadata: &MetadataTable<'_>,
+    last_change: &str,
+) -> Result<()> {
+    let mut columns = vec![
+        "id INTEGER PRIMARY KEY".to_string(),
+        "identifier TEXT".to_string(),
+        "reference_date TEXT".to_string(),
+        "reference_system TEXT".to_string(),
+        "title TEXT".to_string(),
+        "geographical_extent_wkb BLOB".to_string(),
+        "contact_name TEXT".to_string(),
+        "contact_email_address TEXT".to_string(),
+        "contact_role TEXT".to_string(),
+        "contact_website TEXT".to_string(),
+        "contact_type TEXT".to_string(),
+        "contact_phone TEXT".to_string(),
+        "contact_organization TEXT".to_string(),
+    ];
+    columns.extend(metadata.schema().columns.iter().map(|column| {
+        format!(
+            "{} {}",
+            quote_ident(&column.name),
+            sqlite_type_decl(&column.logical_type)
+        )
+    }));
+    tx.execute_batch(&format!("CREATE TABLE metadata ({});", columns.join(", ")))?;
+    register_attribute_table(tx, "metadata", "metadata", last_change)
 }
 
 fn insert_metadata_rows(
     tx: &Transaction<'_>,
-    metadata_table: &MetadataTable<'_>,
+    metadata: &MetadataTable<'_>,
     model: &CityModel,
-    last_change: &str,
 ) -> Result<()> {
-    let Some(metadata) = model.metadata() else {
-        return Ok(());
-    };
-    let metadata_json = metadata_to_compact_json(model, metadata)?;
-    tx.execute(
-        "INSERT INTO gpkg_metadata (
-            md_scope, md_standard_uri, mime_type, metadata
-         ) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            GPKG_METADATA_REFERENCE_SCOPE,
-            GPKG_METADATA_STANDARD_URI,
-            "application/json",
-            metadata_json,
-        ],
-    )?;
-    let metadata_id = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO gpkg_metadata_reference (
-            reference_scope, table_name, column_name, row_id_value, timestamp, md_file_id, md_parent_id
-         ) VALUES (?1, NULL, NULL, NULL, ?2, ?3, NULL)",
-        params![GPKG_METADATA_REFERENCE_SCOPE, last_change, metadata_id],
-    )?;
-
-    let _ = metadata_table;
+    let insert_sql = metadata_insert_sql(metadata.schema());
+    let mut statement = tx.prepare(&insert_sql)?;
+    for row in metadata.rows() {
+        let fixed = row.fixed();
+        let mut params = metadata_fixed_sql_values(fixed);
+        params.extend(
+            row.values()
+                .map(|value| sqlite_value_from_tabular_value(model, value?))
+                .collect::<Result<Vec<_>>>()?,
+        );
+        statement.execute(params_from_iter(params))?;
+    }
     Ok(())
+}
+
+fn metadata_insert_sql(schema: &crate::TableSchema<'_>) -> String {
+    let mut columns = [
+        "identifier",
+        "reference_date",
+        "reference_system",
+        "title",
+        "geographical_extent_wkb",
+        "contact_name",
+        "contact_email_address",
+        "contact_role",
+        "contact_website",
+        "contact_type",
+        "contact_phone",
+        "contact_organization",
+    ]
+    .into_iter()
+    .map(quote_ident)
+    .collect::<Vec<_>>();
+    columns.extend(
+        schema
+            .columns
+            .iter()
+            .map(|column| quote_ident(&column.name)),
+    );
+    let placeholders = (0..columns.len())
+        .map(|_| "?".to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO metadata ({}) VALUES ({})",
+        columns.join(", "),
+        placeholders
+    )
+}
+
+fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>) -> Vec<SqlValue> {
+    vec![
+        option_sql_text(row.identifier.as_deref()),
+        option_sql_text(row.reference_date.as_deref()),
+        option_sql_text(row.reference_system.as_deref()),
+        option_sql_text(row.title.as_deref()),
+        row.geographical_extent_wkb
+            .clone()
+            .map_or(SqlValue::Null, SqlValue::Blob),
+        option_sql_text(row.contact_name.as_deref()),
+        option_sql_text(row.contact_email_address.as_deref()),
+        option_sql_text(row.contact_role.as_deref()),
+        option_sql_text(row.contact_website.as_deref()),
+        option_sql_text(row.contact_type.as_deref()),
+        option_sql_text(row.contact_phone.as_deref()),
+        option_sql_text(row.contact_organization.as_deref()),
+    ]
+}
+
+fn option_sql_text(value: Option<&str>) -> SqlValue {
+    value.map_or(SqlValue::Null, |value| SqlValue::Text(value.to_string()))
 }
 
 fn update_feature_layer_extents(
