@@ -28,7 +28,6 @@ const SQLITE_LAST_CHANGE_SQL: &str = "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now
 #[derive(Clone, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct GpkgExportOptions {
-    pub split_lod: bool,
     pub include_semantics: bool,
     pub include_address: bool,
     pub include_hierarchy: bool,
@@ -114,7 +113,6 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             cityobjects: &cityobjects,
             cityobject_rows: &cityobject_rows,
             srs_id: resolved_srs.srs_id,
-            split_lod: options.split_lod,
             last_change: &last_change,
         },
         &mut used_table_names,
@@ -170,7 +168,6 @@ struct FeatureLayerExport<'tx, 'conn, 'model, 'rows> {
     cityobjects: &'rows CityObjectTable<'model>,
     cityobject_rows: &'rows [CityObjectRow<'rows, 'model>],
     srs_id: i32,
-    split_lod: bool,
     last_change: &'tx str,
 }
 
@@ -207,12 +204,8 @@ fn export_feature_layers(
             let layer_table_name = feature_layer_names
                 .entry(layer_key)
                 .or_insert_with(|| {
-                    let base = layer_table_name_base(
-                        &cityobject_type,
-                        &geometry_family,
-                        lod.as_deref(),
-                        export.split_lod,
-                    );
+                    let base =
+                        layer_table_name_base(&cityobject_type, &geometry_family, lod.as_deref());
                     unique_identifier(base, used_table_names)
                 })
                 .clone();
@@ -893,8 +886,8 @@ PRAGMA synchronous = OFF;"
     let tx = conn.transaction()?;
     create_core_tables(&tx)?;
     insert_standard_spatial_ref_systems(&tx, resolved_srs)?;
-    create_metadata_table(&tx, metadata, last_change)?;
-    insert_metadata_rows(&tx, metadata, model)?;
+    create_metadata_table(&tx, metadata, resolved_srs.srs_id, last_change)?;
+    insert_metadata_rows(&tx, metadata, model, resolved_srs.srs_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -910,6 +903,7 @@ fn metadata_output_path(output: &Path) -> PathBuf {
 fn create_metadata_table(
     tx: &Transaction<'_>,
     metadata: &MetadataTable<'_>,
+    srs_id: i32,
     last_change: &str,
 ) -> Result<()> {
     let mut columns = vec![
@@ -918,7 +912,7 @@ fn create_metadata_table(
         "reference_date TEXT".to_string(),
         "reference_system TEXT".to_string(),
         "title TEXT".to_string(),
-        "geographical_extent_wkb BLOB".to_string(),
+        "geographical_extent_wkb POLYGON".to_string(),
         "contact_name TEXT".to_string(),
         "contact_email_address TEXT".to_string(),
         "contact_role TEXT".to_string(),
@@ -935,19 +929,32 @@ fn create_metadata_table(
         )
     }));
     tx.execute_batch(&format!("CREATE TABLE metadata ({});", columns.join(", ")))?;
-    register_attribute_table(tx, "metadata", "metadata", last_change)
+    tx.execute(
+        "INSERT INTO gpkg_contents (
+            table_name, data_type, identifier, description, last_change, srs_id
+         ) VALUES ('metadata', 'features', 'metadata', 'metadata', ?1, ?2)",
+        params![last_change, srs_id],
+    )?;
+    tx.execute(
+        "INSERT INTO gpkg_geometry_columns (
+            table_name, column_name, geometry_type_name, srs_id, z, m
+         ) VALUES ('metadata', 'geographical_extent_wkb', 'POLYGON', ?1, 1, 0)",
+        params![srs_id],
+    )?;
+    Ok(())
 }
 
 fn insert_metadata_rows(
     tx: &Transaction<'_>,
     metadata: &MetadataTable<'_>,
     model: &CityModel,
+    srs_id: i32,
 ) -> Result<()> {
     let insert_sql = metadata_insert_sql(metadata.schema());
     let mut statement = tx.prepare(&insert_sql)?;
     for row in metadata.rows() {
         let fixed = row.fixed();
-        let mut params = metadata_fixed_sql_values(fixed);
+        let mut params = metadata_fixed_sql_values(fixed, srs_id);
         params.extend(
             row.values()
                 .map(|value| sqlite_value_from_tabular_value(model, value?))
@@ -993,7 +1000,7 @@ fn metadata_insert_sql(schema: &crate::TableSchema<'_>) -> String {
     )
 }
 
-fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>) -> Vec<SqlValue> {
+fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>, srs_id: i32) -> Vec<SqlValue> {
     vec![
         option_sql_text(row.identifier.as_deref()),
         option_sql_text(row.reference_date.as_deref()),
@@ -1001,7 +1008,9 @@ fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>) -> Vec<SqlValue> {
         option_sql_text(row.title.as_deref()),
         row.geographical_extent_wkb
             .clone()
-            .map_or(SqlValue::Null, SqlValue::Blob),
+            .map_or(SqlValue::Null, |wkb| {
+                SqlValue::Blob(wrap_geopackage_binary(&wkb, None, false, srs_id))
+            }),
         option_sql_text(row.contact_name.as_deref()),
         option_sql_text(row.contact_email_address.as_deref()),
         option_sql_text(row.contact_role.as_deref()),
@@ -1156,22 +1165,17 @@ fn layer_table_name_base(
     cityobject_type: &str,
     geometry_family: &str,
     lod: Option<impl ToString>,
-    split_lod: bool,
 ) -> String {
-    let mut base = format!(
-        "{}_{}",
-        sanitize_identifier(cityobject_type),
-        sanitize_identifier(geometry_family)
+    let lod = lod.map_or_else(
+        || "none".to_string(),
+        |lod| sanitize_lod_fragment(&lod.to_string()),
     );
-    if split_lod {
-        let lod = lod.map_or_else(
-            || "none".to_string(),
-            |lod| sanitize_lod_fragment(&lod.to_string()),
-        );
-        base.push_str("_lod");
-        base.push_str(&lod);
-    }
-    base
+    format!(
+        "{}_{}_lod{}",
+        sanitize_identifier(cityobject_type),
+        sanitize_identifier(geometry_family),
+        lod
+    )
 }
 
 fn sanitize_lod_fragment(value: &str) -> String {

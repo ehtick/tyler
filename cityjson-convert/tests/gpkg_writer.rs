@@ -110,8 +110,8 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
         "gpkg_spatial_ref_sys",
         "cityobject_hierarchy",
         "semantic_hierarchy",
-        "building_multisurface",
-        "buildingroom_multisurface",
+        "building_multisurface_lod1",
+        "buildingroom_multisurface_lod1",
     ] {
         assert!(
             tables.iter().any(|table| table == expected),
@@ -121,7 +121,7 @@ fn assert_layers_relations_metadata_tables(conn: &Connection) {
 
     assert_eq!(table_row_count(conn, "cityobject_hierarchy"), 1);
     assert_eq!(table_row_count(conn, "semantic_hierarchy"), 0);
-    assert_eq!(table_row_count(conn, "building_multisurface"), 1);
+    assert_eq!(table_row_count(conn, "building_multisurface_lod1"), 1);
 }
 
 fn metadata_output_path(output: &std::path::Path) -> PathBuf {
@@ -140,8 +140,16 @@ fn assert_metadata_gpkg(output: &std::path::Path) {
     assert_eq!(table_row_count(&conn, "metadata"), 1);
     assert_eq!(
         table_column_type(&conn, "metadata", "geographical_extent_wkb"),
-        "BLOB"
+        "POLYGON"
     );
+    let geometry_type_name: String = conn
+        .query_row(
+            "SELECT geometry_type_name FROM gpkg_geometry_columns WHERE table_name = 'metadata' AND column_name = 'geographical_extent_wkb'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read metadata geometry column metadata");
+    assert_eq!(geometry_type_name, "POLYGON");
     let identifier: String = conn
         .query_row("SELECT identifier FROM metadata", [], |row| row.get(0))
         .expect("read metadata identifier");
@@ -151,7 +159,7 @@ fn assert_metadata_gpkg(output: &std::path::Path) {
 fn assert_building_layer_metadata(conn: &Connection) {
     let (geometry_type_name, z, m): (String, i64, i64) = conn
         .query_row(
-            "SELECT geometry_type_name, z, m FROM gpkg_geometry_columns WHERE table_name = 'building_multisurface'",
+            "SELECT geometry_type_name, z, m FROM gpkg_geometry_columns WHERE table_name = 'building_multisurface_lod1'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -159,13 +167,13 @@ fn assert_building_layer_metadata(conn: &Connection) {
     assert_eq!(geometry_type_name, "MULTIPOLYGON");
     assert_eq!((z, m), (1, 0));
     assert_eq!(
-        table_column_type(conn, "building_multisurface", "geom"),
+        table_column_type(conn, "building_multisurface_lod1", "geom"),
         "MULTIPOLYGON"
     );
 
     let (min_x, min_y, max_x, max_y): (f64, f64, f64, f64) = conn
         .query_row(
-            "SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name = 'building_multisurface'",
+            "SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name = 'building_multisurface_lod1'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
@@ -174,7 +182,7 @@ fn assert_building_layer_metadata(conn: &Connection) {
 }
 
 fn assert_building_blob_header(conn: &Connection) {
-    let blob = read_blob_prefix(conn, "building_multisurface");
+    let blob = read_blob_prefix(conn, "building_multisurface_lod1");
     assert_eq!(&blob[0..2], b"GP");
     assert_eq!(blob[2], 0);
     assert_eq!(blob[3] & 0b0000_0001, 0b0000_0001);
@@ -253,7 +261,6 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
         &model,
         &output,
         &GpkgExportOptions {
-            split_lod: false,
             include_semantics: false,
             include_address: false,
             include_hierarchy: true,
@@ -282,7 +289,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
 }
 
 #[test]
-fn converts_model_to_gpkg_with_split_lod_and_semantics() {
+fn converts_model_to_gpkg_with_lod_layers_and_semantics() {
     let model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -318,7 +325,7 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
         }"#,
     )
     .expect("parse inline CityJSON");
-    let output = stable_output_path("convert_to_gpkg_split_lod_semantics");
+    let output = stable_output_path("convert_to_gpkg_lod_layers_semantics");
     if output.exists() {
         fs::remove_file(&output).expect("remove previous output");
     }
@@ -327,7 +334,6 @@ fn converts_model_to_gpkg_with_split_lod_and_semantics() {
         &model,
         &output,
         &GpkgExportOptions {
-            split_lod: true,
             include_semantics: true,
             include_address: false,
             include_hierarchy: true,
@@ -406,7 +412,6 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
         &model,
         &output,
         &GpkgExportOptions {
-            split_lod: true,
             include_semantics: false,
             include_address: false,
             include_hierarchy: false,
@@ -461,7 +466,7 @@ fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
 
     let conn = Connection::open(&output).expect("open GeoPackage");
     let column_names = conn
-        .prepare("SELECT name FROM pragma_table_info('building_multisurface') ORDER BY cid")
+        .prepare("SELECT name FROM pragma_table_info('building_multisurface_lod1') ORDER BY cid")
         .expect("prepare column query")
         .query_map([], |row| row.get::<_, String>(0))
         .expect("query column names")
@@ -472,7 +477,7 @@ fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
 
     let (first, second): (String, String) = conn
         .query_row(
-            r#"SELECT "attributes__eindRegistratie", "attributes__eindregistratie__2" FROM building_multisurface LIMIT 1"#,
+            r#"SELECT "attributes__eindRegistratie", "attributes__eindregistratie__2" FROM building_multisurface_lod1 LIMIT 1"#,
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -534,7 +539,7 @@ fn omits_geometry_ref_attributes_from_feature_layers() {
     let conn = Connection::open(&output).expect("open GeoPackage");
     let has_column: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('building_multisurface') WHERE name = 'attributes__location'",
+            "SELECT COUNT(*) FROM pragma_table_info('building_multisurface_lod1') WHERE name = 'attributes__location'",
             [],
             |row| row.get(0),
         )
@@ -604,7 +609,6 @@ fn converts_include_address_to_multipoint_feature_layer() {
         &model,
         &output,
         &GpkgExportOptions {
-            split_lod: false,
             include_semantics: false,
             include_address: true,
             include_hierarchy: false,

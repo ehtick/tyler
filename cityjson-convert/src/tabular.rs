@@ -1433,6 +1433,7 @@ pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimiti
     let rows = assignments
         .rows
         .into_iter()
+        .filter(|assignment| assignment.semantic_id.is_some())
         .map(|assignment| {
             let semantic = assignment
                 .semantic_id

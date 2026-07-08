@@ -92,8 +92,6 @@ struct TsvFileCliOptions {
 #[derive(Args, Debug, Default)]
 struct GpkgCliOptions {
     #[command(flatten)]
-    layers: GpkgLayerCliOptions,
-    #[command(flatten)]
     semantics: GpkgSemanticCliOptions,
     #[command(flatten)]
     address: GpkgAddressCliOptions,
@@ -102,13 +100,6 @@ struct GpkgCliOptions {
     // Optional target CRS metadata label when the source metadata lacks a parseable EPSG code.
     #[arg(long = "gpkg-output-crs")]
     output_crs: Option<String>,
-}
-
-#[derive(Args, Debug, Default)]
-struct GpkgLayerCliOptions {
-    // Split GeoPackage layers by LoD.
-    #[arg(long = "gpkg-split-lod", default_value_t = false)]
-    lod_layers: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -189,7 +180,6 @@ fn main() -> anyhow::Result<()> {
         OutputFormat::Gpkg => {
             let model = read_model(&cli.input)?;
             let options = GpkgExportOptions {
-                split_lod: cli.gpkg.layers.lod_layers,
                 include_semantics: cli.gpkg.semantics.include_semantics,
                 include_address: cli.gpkg.address.include_address,
                 include_hierarchy: cli.gpkg.semantics.include_hierarchy,

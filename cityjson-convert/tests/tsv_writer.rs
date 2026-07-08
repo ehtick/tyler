@@ -344,7 +344,7 @@ fn writes_semantics_tsv_with_primitive_rows() {
     )
     .unwrap();
     let rows = parse_tsv(&bytes);
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 3);
     assert_eq!(
         rows[0],
         [
@@ -373,7 +373,6 @@ fn writes_semantics_tsv_with_primitive_rows() {
     );
     assert_eq!(rows[2][2], "1");
     assert_eq!(rows[2][6], "WallSurface");
-    assert_eq!(rows[3][2], "");
 
     let hierarchy = tabulate_semantic_hierarchy(&model);
     let mut hierarchy_bytes = Vec::new();
@@ -414,13 +413,14 @@ fn writes_semantics_tsv_filtered_to_assigned_primitives() {
 }
 
 #[test]
-fn converts_model_to_tsv_directory_outputs() {
+fn converts_model_to_tsv_file_outputs() {
     let model = json::from_slice(semantic_fixture()).unwrap();
     let dir = temp_output_dir("tsv_convert");
+    let output = dir.join("nested").join("model.tsv");
 
     convert_to_tsv(
         &model,
-        &dir,
+        &output,
         &TsvExportOptions {
             include_null_rows: true,
             include_hierarchy: true,
@@ -432,12 +432,18 @@ fn converts_model_to_tsv_directory_outputs() {
     )
     .unwrap();
 
-    assert!(dir.join("cityobjects.tsv").is_file());
-    assert!(dir.join("metadata.tsv").is_file());
-    assert!(dir.join("semantics.tsv").is_file());
-    assert!(dir.join("addresses.tsv").is_file());
-    assert!(dir.join("cityobject_hierarchy.tsv").is_file());
-    assert!(dir.join("semantic_hierarchy.tsv").is_file());
+    assert!(output.is_file());
+    assert!(dir.join("nested").join("model_metadata.tsv").is_file());
+    assert!(dir.join("nested").join("model_semantics.tsv").is_file());
+    assert!(dir.join("nested").join("model_addresses.tsv").is_file());
+    assert!(dir
+        .join("nested")
+        .join("model_cityobject_hierarchy.tsv")
+        .is_file());
+    assert!(dir
+        .join("nested")
+        .join("model_semantic_hierarchy.tsv")
+        .is_file());
 
     fs::remove_dir_all(dir).unwrap();
 }

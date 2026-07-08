@@ -33,7 +33,10 @@ pub struct TsvWriteOptions {
     pub include_cityjson_ordinal: bool,
 }
 
-/// Converts a `CityJSON` model to TSV files in an output directory.
+/// Converts a `CityJSON` model to TSV files.
+///
+/// The requested output file receives the `CityObject` table. Optional tables
+/// are written beside it using the output stem, for example `model_metadata.tsv`.
 ///
 /// # Errors
 ///
@@ -41,11 +44,13 @@ pub struct TsvWriteOptions {
 /// cannot be resolved or serialized.
 pub fn convert_to_tsv<P: AsRef<Path>>(
     model: &CityModel,
-    output_dir: P,
+    output: P,
     options: &TsvExportOptions,
 ) -> Result<()> {
-    let output_dir = output_dir.as_ref();
-    fs::create_dir_all(output_dir)?;
+    let output = output.as_ref();
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     let write_options = TsvWriteOptions {
         include_null_rows: options.include_null_rows,
@@ -54,38 +59,46 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
     };
 
     let cityobjects = tabulate_cityobjects(model)?;
-    let mut file = File::create(output_dir.join("cityobjects.tsv"))?;
+    let mut file = File::create(output)?;
     write_cityobjects_tsv(&cityobjects, &write_options, &mut file)?;
 
     if options.include_hierarchy {
         let hierarchy = tabulate_cityobject_hierarchy(model)?;
-        let mut file = File::create(output_dir.join("cityobject_hierarchy.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "cityobject_hierarchy"))?;
         write_cityobject_hierarchy_tsv(&hierarchy, &mut file)?;
 
         let hierarchy = tabulate_semantic_hierarchy(model);
-        let mut file = File::create(output_dir.join("semantic_hierarchy.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "semantic_hierarchy"))?;
         write_semantic_hierarchy_tsv(&hierarchy, &mut file)?;
     }
 
     if options.include_metadata {
         let metadata = tabulate_model_metadata(model)?;
-        let mut file = File::create(output_dir.join("metadata.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "metadata"))?;
         write_metadata_tsv(&metadata, &mut file)?;
     }
 
     if options.include_address {
         let addresses = tabulate_addresses(model)?;
-        let mut file = File::create(output_dir.join("addresses.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "addresses"))?;
         write_addresses_tsv(&addresses, &write_options, &mut file)?;
     }
 
     if options.include_semantics {
         let semantics = tabulate_semantic_primitives(model)?;
-        let mut file = File::create(output_dir.join("semantics.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "semantics"))?;
         write_semantics_tsv(&semantics, &write_options, &mut file)?;
     }
 
     Ok(())
+}
+
+fn sidecar_path(output: &Path, suffix: &str) -> std::path::PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("cityobjects");
+    output.with_file_name(format!("{stem}_{suffix}.tsv"))
 }
 
 /// Writes `CityObject` rows as TSV.
@@ -252,7 +265,7 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
 /// resolved.
 pub fn write_semantics_tsv<W: Write>(
     table: &SemanticPrimitiveTable<'_>,
-    options: &TsvWriteOptions,
+    _options: &TsvWriteOptions,
     writer: W,
 ) -> Result<()> {
     let mut tsv = tsv_writer(writer);
@@ -268,9 +281,6 @@ pub fn write_semantics_tsv<W: Write>(
 
     for row in table.rows() {
         let fixed = row.fixed();
-        if !options.include_null_rows && fixed.semantic_id.is_none() {
-            continue;
-        }
         let dynamic = dynamic_cells(table.model(), row.values()).with_context(|| {
             format!(
                 "resolve dynamic values for semantic primitive {} on CityObject {}",

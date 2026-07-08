@@ -2017,7 +2017,7 @@ impl OutputFormatBackend for TsvBackend {
             .join(job.content_tile_coord.to_string());
         let mut options = context.tsv_export_options.clone();
         options.include_metadata = false;
-        cityjson_convert::convert_to_tsv(model, &output_dir, &options)?;
+        cityjson_convert::convert_to_tsv(model, output_dir.join("cityobjects.tsv"), &options)?;
 
         write_tsv_metadata_fragment(job, model, context)?;
 
