@@ -882,6 +882,13 @@ fn tabulates_address_location_separately_from_dynamic_address_columns() {
         ]),
     );
 
+    let cityobjects = tabulate_cityobjects(&model).expect("tabulate CityObjects");
+    assert!(cityobjects
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.path.first().copied() != Some("address")));
+
     let expected_wkb =
         cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(&model, geometry_handle)
             .expect("encode address location as WKB");

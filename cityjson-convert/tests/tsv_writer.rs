@@ -179,6 +179,21 @@ fn writes_include_address_tsv_with_dynamic_columns() {
         )]),
     );
 
+    let cityobjects = tabulate_cityobjects(&model).expect("tabulate CityObjects");
+    let mut cityobjects_bytes = Vec::new();
+    write_cityobjects_tsv(
+        &cityobjects,
+        &TsvWriteOptions {
+            include_null_rows: true,
+            include_hierarchy: false,
+            include_cityjson_ordinal: false,
+        },
+        &mut cityobjects_bytes,
+    )
+    .unwrap();
+    let cityobjects_rows = parse_tsv(&cityobjects_bytes);
+    assert_eq!(cityobjects_rows[0], ["cityobject_id", "cityobject_type"]);
+
     let table = tabulate_addresses(&model).expect("tabulate addresses");
     let mut bytes = Vec::new();
     write_addresses_tsv(

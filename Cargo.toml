@@ -53,7 +53,7 @@ resolver = "2"
 
 [patch.crates-io]
 cityjson-convert = { path = "cityjson-convert" }
-cityjson-lib = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af2ddb6" }
-cityjson-index = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af2ddb6" }
-cityjson-types = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af2ddb6" }
-cityjson-json = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af2ddb6" }
+cityjson-lib = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af1b4795b5e589ac8017fab54fbe6b9068ee2ef3" }
+cityjson-index = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af1b4795b5e589ac8017fab54fbe6b9068ee2ef3" }
+cityjson-types = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af1b4795b5e589ac8017fab54fbe6b9068ee2ef3" }
+cityjson-json = { git = "https://github.com/3DGI/cityjson-rs.git", rev = "af1b4795b5e589ac8017fab54fbe6b9068ee2ef3" }

@@ -1208,8 +1208,7 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
             .iter()
             .map(|(_, object)| object.attributes()),
     )?;
-    let extra =
-        infer_attribute_schema(model.cityobjects().iter().map(|(_, object)| object.extra()))?;
+    let extra = infer_extra_schema_without_addresses(model)?;
     Ok(CityObjectTable {
         model,
         schema: build_dynamic_schema(
@@ -1227,6 +1226,37 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
             ],
         ),
     })
+}
+
+fn infer_extra_schema_without_addresses(model: &CityModel) -> Result<StructSchema<'_>> {
+    let mut schema = StructSchema::default();
+    for (row_ix, (_, object)) in model.cityobjects().iter().enumerate() {
+        let Some(extra) = object.extra() else {
+            mark_all_nullable(&mut schema);
+            continue;
+        };
+        merge_extra_map_without_addresses(&mut schema, extra, row_ix)?;
+    }
+    Ok(schema)
+}
+
+fn merge_extra_map_without_addresses<'model>(
+    schema: &mut StructSchema<'model>,
+    values: &'model OwnedAttributes,
+    seen_rows: usize,
+) -> Result<()> {
+    for field in schema.fields.values_mut() {
+        if !values.contains_key(field.name) || field.name == "address" {
+            field.nullable = true;
+        }
+    }
+    for (name, value) in values.iter() {
+        if name == "address" {
+            continue;
+        }
+        merge_field(schema, name, value, seen_rows)?;
+    }
+    Ok(())
 }
 
 /// Tabulates `CityObject` parent/child edges into a standalone hierarchy table.
