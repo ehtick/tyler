@@ -441,6 +441,17 @@ impl<'model> CityObjectRow<'_, 'model> {
             .map(|column| self.value_for_column(column))
     }
 
+    /// Resolves one dynamic column from a separately inferred compatible schema.
+    ///
+    /// `GeoPackage` feature layers can infer dynamic schemas per `CityObject` type,
+    /// while rows still borrow their fixed identity from the model-wide table.
+    pub(crate) fn value_for_schema_column<'row>(
+        &'row self,
+        column: &'row ColumnSchema<'model>,
+    ) -> Result<Value<'row, 'model>> {
+        self.value_for_column(column)
+    }
+
     /// Resolves parent `CityObject` handles into borrowed `CityObject` ids.
     ///
     /// # Errors
@@ -1228,14 +1239,55 @@ pub fn tabulate_cityobjects(model: &CityModel) -> Result<CityObjectTable<'_>> {
     })
 }
 
+pub(crate) fn tabulate_cityobject_type_schema<'model>(
+    model: &'model CityModel,
+    cityobject_type: &str,
+) -> Result<TableSchema<'model>> {
+    let matching_cityobjects = model
+        .cityobjects()
+        .iter()
+        .map(|(_, object)| object)
+        .filter(|object| object.type_cityobject().to_string() == cityobject_type)
+        .collect::<Vec<_>>();
+    let attributes = infer_attribute_schema(
+        matching_cityobjects
+            .iter()
+            .map(|object| object.attributes()),
+    )?;
+    let extra = infer_extra_schema_without_addresses_for_objects(
+        matching_cityobjects.iter().map(|object| object.extra()),
+    )?;
+    Ok(build_dynamic_schema(
+        [
+            (ColumnOrigin::Attributes, attributes),
+            (ColumnOrigin::Extra, extra),
+        ],
+        &[
+            "cityobject_id",
+            "cityobject_ix",
+            "cityobject_type",
+            "bbox",
+            "parents",
+            "children",
+        ],
+    ))
+}
+
 fn infer_extra_schema_without_addresses(model: &CityModel) -> Result<StructSchema<'_>> {
+    infer_extra_schema_without_addresses_for_objects(
+        model.cityobjects().iter().map(|(_, object)| object.extra()),
+    )
+}
+
+fn infer_extra_schema_without_addresses_for_objects<'model>(
+    sources: impl IntoIterator<Item = Option<&'model OwnedAttributes>>,
+) -> Result<StructSchema<'model>> {
     let mut schema = StructSchema::default();
-    for (row_ix, (_, object)) in model.cityobjects().iter().enumerate() {
-        let Some(extra) = object.extra() else {
-            mark_all_nullable(&mut schema);
-            continue;
-        };
-        merge_extra_map_without_addresses(&mut schema, extra, row_ix)?;
+    for (row_ix, source) in sources.into_iter().enumerate() {
+        match source {
+            Some(extra) => merge_extra_map_without_addresses(&mut schema, extra, row_ix)?,
+            None => mark_all_nullable(&mut schema),
+        }
     }
     Ok(schema)
 }

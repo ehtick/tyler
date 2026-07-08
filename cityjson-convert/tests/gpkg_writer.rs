@@ -49,6 +49,15 @@ fn table_column_type(conn: &Connection, table: &str, column: &str) -> String {
     .expect("read column type")
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.query_row(
+        &format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok()
+}
+
 fn read_gpb_envelope(blob: &[u8]) -> [f64; 6] {
     let mut values = [0.0; 6];
     for (ix, chunk) in blob[8..56].chunks_exact(8).enumerate() {
@@ -425,6 +434,189 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
     assert!(table_exists(&conn, "building_multisurface_lod1"));
     assert!(!table_exists(&conn, "building_multisurface_lod1_2"));
     assert_eq!(table_row_count(&conn, "building_multisurface_lod1"), 2);
+
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
+fn infers_feature_layer_attributes_per_cityobject_type() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "children":["part"],
+                    "attributes":{"name":"Library","measuredHeight":12.5},
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                },
+                "part":{
+                    "type":"BuildingPart",
+                    "parents":["building"],
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,2,3,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0],[1,1,0]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let output = stable_output_path("convert_to_gpkg_per_type_attributes");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(&model, &output, &GpkgExportOptions::default())
+        .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    assert!(table_has_column(
+        &conn,
+        "building_multisurface_lod1",
+        "attributes__name"
+    ));
+    assert!(table_has_column(
+        &conn,
+        "building_multisurface_lod1",
+        "attributes__measuredHeight"
+    ));
+    assert!(!table_has_column(
+        &conn,
+        "buildingpart_multisurface_lod1",
+        "attributes__name"
+    ));
+    assert!(!table_has_column(
+        &conn,
+        "buildingpart_multisurface_lod1",
+        "attributes__measuredHeight"
+    ));
+
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
+fn infers_feature_layer_attribute_types_per_cityobject_type() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{"shared":"A"},
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                },
+                "part":{
+                    "type":"BuildingPart",
+                    "attributes":{"shared":7},
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,2,3,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0],[1,1,0]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let output = stable_output_path("convert_to_gpkg_per_type_attribute_types");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(&model, &output, &GpkgExportOptions::default())
+        .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    assert_eq!(
+        table_column_type(&conn, "building_multisurface_lod1", "attributes__shared"),
+        "TEXT"
+    );
+    assert_eq!(
+        table_column_type(
+            &conn,
+            "buildingpart_multisurface_lod1",
+            "attributes__shared"
+        ),
+        "INTEGER"
+    );
+
+    if output.exists() {
+        fs::remove_file(&output).expect("clean up output");
+    }
+}
+
+#[test]
+fn keeps_nullable_attributes_within_same_cityobject_type() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "part-1":{
+                    "type":"BuildingPart",
+                    "attributes":{"roofType":"flat"},
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                },
+                "part-2":{
+                    "type":"BuildingPart",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,2,3,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0],[1,1,0]],
+            "metadata":{"referenceSystem":"EPSG:7415"}
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let output = stable_output_path("convert_to_gpkg_same_type_nullable_attributes");
+    if output.exists() {
+        fs::remove_file(&output).expect("remove previous output");
+    }
+
+    convert_to_gpkg(&model, &output, &GpkgExportOptions::default())
+        .expect("GeoPackage conversion should succeed");
+
+    let conn = Connection::open(&output).expect("open GeoPackage");
+    assert!(table_has_column(
+        &conn,
+        "buildingpart_multisurface_lod1",
+        "attributes__roofType"
+    ));
+    let null_count: i64 = conn
+        .query_row(
+            r#"SELECT COUNT(*) FROM buildingpart_multisurface_lod1 WHERE "attributes__roofType" IS NULL"#,
+            [],
+            |row| row.get(0),
+        )
+        .expect("read null attribute count");
+    assert_eq!(null_count, 1);
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");

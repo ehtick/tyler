@@ -11,11 +11,14 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection, Transaction};
 
 use crate::{
-    tabular::{geometry_ref_to_wkb, semantic_primitive_geometry, value_to_json},
+    tabular::{
+        geometry_ref_to_wkb, semantic_primitive_geometry, tabulate_cityobject_type_schema,
+        value_to_json,
+    },
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
-    AddressTable, CityObjectHierarchyTable, CityObjectRow, CityObjectTable, LogicalType,
-    MetadataTable, SemanticHierarchyTable, SemanticPrimitiveTable, Value,
+    AddressTable, CityObjectHierarchyTable, CityObjectRow, LogicalType, MetadataTable,
+    SemanticHierarchyTable, SemanticPrimitiveTable, TableSchema, Value,
 };
 
 const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
@@ -36,8 +39,9 @@ pub struct GpkgExportOptions {
 }
 
 #[derive(Debug)]
-struct FeatureLayerState {
+struct FeatureLayerState<'model> {
     insert_sql: String,
+    schema: TableSchema<'model>,
     extent: Option<[f64; 6]>,
 }
 
@@ -61,6 +65,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
 
     let cityobjects = tabulate_cityobjects(model)?;
     let cityobject_rows = cityobjects.rows().collect::<Vec<_>>();
+    let cityobject_type_schemas = cityobject_type_schemas(model, &cityobject_rows)?;
     let metadata = if options.include_metadata {
         Some(tabulate_model_metadata(model)?)
     } else {
@@ -104,14 +109,14 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
 
     let mut used_table_names = HashSet::new();
     let mut feature_layer_names = BTreeMap::new();
-    let mut feature_layers: BTreeMap<String, FeatureLayerState> = BTreeMap::new();
+    let mut feature_layers: BTreeMap<String, FeatureLayerState<'_>> = BTreeMap::new();
 
     export_feature_layers(
         &FeatureLayerExport {
             tx: &tx,
             model,
-            cityobjects: &cityobjects,
             cityobject_rows: &cityobject_rows,
+            cityobject_type_schemas: &cityobject_type_schemas,
             srs_id: resolved_srs.srs_id,
             last_change: &last_change,
         },
@@ -134,6 +139,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             "semantics".to_string(),
             FeatureLayerState {
                 insert_sql: String::new(),
+                schema: TableSchema::default(),
                 extent,
             },
         );
@@ -146,6 +152,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             "addresses".to_string(),
             FeatureLayerState {
                 insert_sql: String::new(),
+                schema: TableSchema::default(),
                 extent,
             },
         );
@@ -165,17 +172,35 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
 struct FeatureLayerExport<'tx, 'conn, 'model, 'rows> {
     tx: &'tx Transaction<'conn>,
     model: &'model CityModel,
-    cityobjects: &'rows CityObjectTable<'model>,
     cityobject_rows: &'rows [CityObjectRow<'rows, 'model>],
+    cityobject_type_schemas: &'rows BTreeMap<String, TableSchema<'model>>,
     srs_id: i32,
     last_change: &'tx str,
 }
 
-fn export_feature_layers(
-    export: &FeatureLayerExport<'_, '_, '_, '_>,
+fn cityobject_type_schemas<'model>(
+    model: &'model CityModel,
+    rows: &[CityObjectRow<'_, 'model>],
+) -> Result<BTreeMap<String, TableSchema<'model>>> {
+    let mut schemas = BTreeMap::new();
+    for row in rows {
+        let cityobject_type = row.cityobject_type_name().to_string();
+        match schemas.entry(cityobject_type) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                let schema = tabulate_cityobject_type_schema(model, entry.key())?;
+                entry.insert(schema);
+            }
+        }
+    }
+    Ok(schemas)
+}
+
+fn export_feature_layers<'model>(
+    export: &FeatureLayerExport<'_, '_, 'model, '_>,
     used_table_names: &mut HashSet<String>,
     feature_layer_names: &mut BTreeMap<FeatureLayerKey, String>,
-    feature_layers: &mut BTreeMap<String, FeatureLayerState>,
+    feature_layers: &mut BTreeMap<String, FeatureLayerState<'model>>,
 ) -> Result<()> {
     for (cityobject_ix, (_, cityobject)) in export.model.cityobjects().iter().enumerate() {
         let row = &export.cityobject_rows[cityobject_ix];
@@ -213,16 +238,22 @@ fn export_feature_layers(
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
                     let table_name = entry.key().clone();
+                    let schema = export
+                        .cityobject_type_schemas
+                        .get(&cityobject_type)
+                        .cloned()
+                        .unwrap_or_default();
                     create_feature_table(
                         export.tx,
                         &table_name,
-                        export.cityobjects,
+                        &schema,
                         export.srs_id,
                         geometry_type,
                         export.last_change,
                     )?;
                     entry.insert(FeatureLayerState {
-                        insert_sql: feature_insert_sql(&table_name, export.cityobjects.schema()),
+                        insert_sql: feature_insert_sql(&table_name, &schema),
+                        schema,
                         extent: None,
                     })
                 }
@@ -231,11 +262,14 @@ fn export_feature_layers(
             insert_feature_row(
                 export.tx,
                 &state.insert_sql,
-                export.model,
-                row,
-                geometry_type,
-                geometry.lod().map(ToString::to_string),
-                encoded.blob,
+                FeatureRowInsert {
+                    model: export.model,
+                    row,
+                    geometry_type,
+                    lod: geometry.lod().map(ToString::to_string),
+                    geom_blob: encoded.blob,
+                    schema: &state.schema,
+                },
             )?;
         }
     }
@@ -469,7 +503,7 @@ fn insert_standard_spatial_ref_systems(tx: &Transaction<'_>, custom: &ResolvedSr
 fn create_feature_table(
     tx: &Transaction<'_>,
     table_name: &str,
-    cityobjects: &CityObjectTable<'_>,
+    schema: &TableSchema<'_>,
     srs_id: i32,
     geometry_type: GeometryType,
     last_change: &str,
@@ -487,7 +521,7 @@ fn create_feature_table(
             geometry_type_name
         ),
     ];
-    columns.extend(cityobjects.schema().columns.iter().map(|column| {
+    columns.extend(schema.columns.iter().map(|column| {
         format!(
             "{} {}",
             quote_ident(&column.name),
@@ -637,25 +671,38 @@ fn feature_insert_sql(table_name: &str, schema: &crate::TableSchema<'_>) -> Stri
     )
 }
 
-fn insert_feature_row(
-    tx: &Transaction<'_>,
-    insert_sql: &str,
-    model: &CityModel,
-    row: &CityObjectRow<'_, '_>,
+struct FeatureRowInsert<'row, 'model> {
+    model: &'model CityModel,
+    row: &'row CityObjectRow<'row, 'model>,
     geometry_type: GeometryType,
     lod: Option<String>,
     geom_blob: Vec<u8>,
+    schema: &'row TableSchema<'model>,
+}
+
+fn insert_feature_row(
+    tx: &Transaction<'_>,
+    insert_sql: &str,
+    feature: FeatureRowInsert<'_, '_>,
 ) -> Result<()> {
     let mut params = vec![
-        SqlValue::Text(row.cityobject_id.to_string()),
-        SqlValue::Text(row.cityobject_type_name().to_string()),
-        SqlValue::Text(geometry_type.to_string()),
-        lod.map_or(SqlValue::Null, SqlValue::Text),
-        SqlValue::Blob(geom_blob),
+        SqlValue::Text(feature.row.cityobject_id.to_string()),
+        SqlValue::Text(feature.row.cityobject_type_name().to_string()),
+        SqlValue::Text(feature.geometry_type.to_string()),
+        feature.lod.map_or(SqlValue::Null, SqlValue::Text),
+        SqlValue::Blob(feature.geom_blob),
     ];
     params.extend(
-        row.values()
-            .map(|value| sqlite_value_from_tabular_value(model, value?))
+        feature
+            .schema
+            .columns
+            .iter()
+            .map(|column| {
+                sqlite_value_from_tabular_value(
+                    feature.model,
+                    feature.row.value_for_schema_column(column)?,
+                )
+            })
             .collect::<Result<Vec<_>>>()?,
     );
     let mut statement = tx.prepare_cached(insert_sql)?;
@@ -1027,7 +1074,7 @@ fn option_sql_text(value: Option<&str>) -> SqlValue {
 
 fn update_feature_layer_extents(
     tx: &Transaction<'_>,
-    feature_layers: &BTreeMap<String, FeatureLayerState>,
+    feature_layers: &BTreeMap<String, FeatureLayerState<'_>>,
 ) -> Result<()> {
     for (table_name, layer) in feature_layers {
         if let Some([min_x, min_y, _, max_x, max_y, _]) = layer.extent {
