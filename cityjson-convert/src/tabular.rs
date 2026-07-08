@@ -682,8 +682,8 @@ impl<'model> SemanticPrimitiveTable<'model> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SemanticPrimitiveRow<'model> {
     pub cityobject_id: &'model str,
-    pub geometry_ix: u64,
-    pub semantic_ix: Option<u64>,
+    pub geometry_id: u64,
+    pub semantic_id: Option<u64>,
     pub primitive_ix: u64,
     pub geometry_type: GeometryType,
     pub geometry_lod: Option<String>,
@@ -803,7 +803,7 @@ impl Display for PrimitiveType {
 pub struct SemanticAssignmentRow<'model> {
     pub cityobject_id: &'model str,
     pub cityobject_ix: u64,
-    pub geometry_ix: u64,
+    pub geometry_id: u64,
     pub geometry_handle: GeometryHandle,
     pub geometry_type: GeometryType,
     pub geometry_lod: Option<String>,
@@ -1395,7 +1395,7 @@ pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimiti
             .iter_semantics()
             .map(|(_, semantic)| semantic.attributes()),
     )?;
-    let semantics_by_ix = model
+    let semantics_by_id = model
         .iter_semantics()
         .map(|(handle, semantic)| (semantic_handle_id(handle), semantic))
         .collect::<BTreeMap<_, _>>();
@@ -1406,11 +1406,11 @@ pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimiti
         .map(|assignment| {
             let semantic = assignment
                 .semantic_id
-                .and_then(|semantic_ix| semantics_by_ix.get(&semantic_ix).copied());
+                .and_then(|semantic_id| semantics_by_id.get(&semantic_id).copied());
             SemanticPrimitiveRow {
                 cityobject_id: assignment.cityobject_id,
-                geometry_ix: assignment.geometry_ix,
-                semantic_ix: assignment.semantic_id,
+                geometry_id: assignment.geometry_id,
+                semantic_id: assignment.semantic_id,
                 primitive_ix: assignment.primitive_ix,
                 geometry_type: assignment.geometry_type,
                 geometry_lod: assignment.geometry_lod,
@@ -1434,8 +1434,8 @@ pub fn tabulate_semantic_primitives(model: &CityModel) -> Result<SemanticPrimiti
             [(ColumnOrigin::SemanticAttributes, attributes)],
             &[
                 "cityobject_id",
-                "geometry_ix",
-                "semantic_ix",
+                "geometry_id",
+                "semantic_id",
                 "primitive_ix",
                 "geometry_type",
                 "geometry_lod",
@@ -1473,7 +1473,7 @@ pub fn semantic_primitive_geometry(
         bail!(
             "semantic primitive {} on geometry {} of CityObject {} has no boundaries",
             row.primitive_ix,
-            row.geometry_ix,
+            row.geometry_id,
             row.cityobject_id
         );
     };
@@ -1486,7 +1486,7 @@ pub fn semantic_primitive_geometry(
                 anyhow::anyhow!(
                     "point primitive index {} is out of range for geometry {} of CityObject {}",
                     point_ix,
-                    row.geometry_ix,
+                    row.geometry_id,
                     row.cityobject_id
                 )
             })?;
@@ -1499,7 +1499,7 @@ pub fn semantic_primitive_geometry(
                 anyhow::anyhow!(
                     "linestring primitive index {} is out of range for geometry {} of CityObject {}",
                     linestring_ix,
-                    row.geometry_ix,
+                    row.geometry_id,
                     row.cityobject_id
                 )
             })?;
@@ -1525,7 +1525,7 @@ pub fn tabulate_semantic_assignments(model: &CityModel) -> Result<SemanticAssign
         let Some(geometry_handles) = object.geometry() else {
             continue;
         };
-        for (geometry_ix, geometry_handle) in geometry_handles.iter().copied().enumerate() {
+        for (source_geometry_ix, geometry_handle) in geometry_handles.iter().copied().enumerate() {
             let source_geometry = model
                 .get_geometry(geometry_handle)
                 .ok_or_else(|| anyhow::anyhow!("dangling geometry handle {geometry_handle:?}"))?;
@@ -1535,7 +1535,7 @@ pub fn tabulate_semantic_assignments(model: &CityModel) -> Result<SemanticAssign
             };
             let Some(boundary) = geometry.boundaries() else {
                 bail!(
-                    "semantic assignments on geometry {geometry_ix} of CityObject {} have no boundaries",
+                    "semantic assignments on source geometry index {source_geometry_ix} of CityObject {} have no boundaries",
                     object.id()
                 );
             };
@@ -1543,7 +1543,7 @@ pub fn tabulate_semantic_assignments(model: &CityModel) -> Result<SemanticAssign
             let context = SemanticAssignmentContext {
                 cityobject_id: object.id(),
                 cityobject_ix: cityobject_ix as u64,
-                geometry_ix: geometry_ix as u64,
+                geometry_id: geometry_handle_id(geometry_handle),
                 geometry_handle,
                 geometry_type: *geometry.type_geometry(),
                 geometry_lod: geometry.lod().map(ToString::to_string),
@@ -1741,12 +1741,16 @@ fn semantic_handle_id(handle: SemanticHandle) -> u64 {
     u64::from(handle.raw_parts().0)
 }
 
+fn geometry_handle_id(handle: GeometryHandle) -> u64 {
+    u64::from(handle.raw_parts().0)
+}
+
 fn required_index(value: Option<u64>, name: &str, row: &SemanticPrimitiveRow<'_>) -> Result<usize> {
     let value = value.ok_or_else(|| {
         anyhow::anyhow!(
             "semantic primitive {} on geometry {} of CityObject {} is missing {name}",
             row.primitive_ix,
-            row.geometry_ix,
+            row.geometry_id,
             row.cityobject_id
         )
     })?;
@@ -1766,7 +1770,7 @@ fn semantic_surface(
                 anyhow::anyhow!(
                     "surface primitive index {} is out of range for geometry {} of CityObject {}",
                     surface_ix,
-                    row.geometry_ix,
+                    row.geometry_id,
                     row.cityobject_id
                 )
             })
@@ -1783,7 +1787,7 @@ fn semantic_surface(
                         "surface primitive shell {} surface {} is out of range for geometry {} of CityObject {}",
                         shell_ix,
                         surface_ix,
-                        row.geometry_ix,
+                        row.geometry_id,
                         row.cityobject_id
                     )
                 })
@@ -1803,14 +1807,14 @@ fn semantic_surface(
                         solid_ix,
                         shell_ix,
                         surface_ix,
-                        row.geometry_ix,
+                        row.geometry_id,
                         row.cityobject_id
                     )
                 })
         }
         other => bail!(
             "surface semantic primitive on geometry {} of CityObject {} is incompatible with geometry type {other}",
-            row.geometry_ix,
+            row.geometry_id,
             row.cityobject_id
         ),
     }
@@ -1909,7 +1913,7 @@ fn update_bbox(bbox: &mut Option<[f64; 6]>, coordinate: [f64; 3]) {
 struct SemanticAssignmentContext<'model> {
     cityobject_id: &'model str,
     cityobject_ix: u64,
-    geometry_ix: u64,
+    geometry_id: u64,
     geometry_handle: GeometryHandle,
     geometry_type: GeometryType,
     geometry_lod: Option<String>,
@@ -1942,7 +1946,7 @@ fn push_point_assignments<'model>(
         rows.push(SemanticAssignmentRow {
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
-            geometry_ix: context.geometry_ix,
+            geometry_id: context.geometry_id,
             geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
@@ -1979,7 +1983,7 @@ fn push_linestring_assignments<'model>(
         rows.push(SemanticAssignmentRow {
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
-            geometry_ix: context.geometry_ix,
+            geometry_id: context.geometry_id,
             geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
@@ -2016,7 +2020,7 @@ fn push_surface_assignments<'model>(
         rows.push(SemanticAssignmentRow {
             cityobject_id: context.cityobject_id,
             cityobject_ix: context.cityobject_ix,
-            geometry_ix: context.geometry_ix,
+            geometry_id: context.geometry_id,
             geometry_handle: context.geometry_handle,
             geometry_type: context.geometry_type,
             geometry_lod: context.geometry_lod.clone(),
@@ -2046,7 +2050,7 @@ fn validate_assignment_count(
             primitive_type,
             assignment_count,
             primitive_count,
-            context.geometry_ix,
+            context.geometry_id,
             context.cityobject_id
         );
     }

@@ -750,8 +750,8 @@ fn create_semantics_table(
     let mut columns = vec![
         "id INTEGER PRIMARY KEY".to_string(),
         "cityobject_id TEXT NOT NULL".to_string(),
-        "geometry_ix INTEGER NOT NULL".to_string(),
-        "semantic_ix INTEGER NOT NULL".to_string(),
+        "geometry_id INTEGER NOT NULL".to_string(),
+        "semantic_id INTEGER NOT NULL".to_string(),
         "primitive_ix INTEGER NOT NULL".to_string(),
         "geometry_type TEXT NOT NULL".to_string(),
         "geometry_lod TEXT".to_string(),
@@ -791,7 +791,7 @@ fn insert_semantics_rows(
     let mut extent = None;
     for row in semantics.rows() {
         let fixed = row.fixed();
-        let Some(semantic_ix) = fixed.semantic_ix else {
+        let Some(semantic_id) = fixed.semantic_id else {
             continue;
         };
         let semantic_type = fixed
@@ -802,8 +802,8 @@ fn insert_semantics_rows(
         extent = union_bbox(extent, encoded.bbox);
         let mut params = vec![
             SqlValue::Text(fixed.cityobject_id.to_string()),
-            SqlValue::Integer(sqlite_integer(fixed.geometry_ix, "geometry_ix")?),
-            SqlValue::Integer(sqlite_integer(semantic_ix, "semantic_ix")?),
+            SqlValue::Integer(sqlite_integer(fixed.geometry_id, "geometry_id")?),
+            SqlValue::Integer(sqlite_integer(semantic_id, "semantic_id")?),
             SqlValue::Integer(sqlite_integer(fixed.primitive_ix, "primitive_ix")?),
             SqlValue::Text(fixed.geometry_type.to_string()),
             fixed
@@ -831,8 +831,8 @@ fn insert_semantics_rows(
 fn semantic_insert_sql(schema: &crate::TableSchema<'_>) -> String {
     let mut columns = vec![
         quote_ident("cityobject_id"),
-        quote_ident("geometry_ix"),
-        quote_ident("semantic_ix"),
+        quote_ident("geometry_id"),
+        quote_ident("semantic_id"),
         quote_ident("primitive_ix"),
         quote_ident("geometry_type"),
         quote_ident("geometry_lod"),

@@ -268,7 +268,7 @@ pub fn write_semantics_tsv<W: Write>(
 
     for row in table.rows() {
         let fixed = row.fixed();
-        if !options.include_null_rows && fixed.semantic_ix.is_none() {
+        if !options.include_null_rows && fixed.semantic_id.is_none() {
             continue;
         }
         let dynamic = dynamic_cells(table.model(), row.values()).with_context(|| {
@@ -351,8 +351,8 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Vec<String> {
 fn semantic_primitive_header() -> Vec<String> {
     [
         "cityobject_id",
-        "geometry_ix",
-        "semantic_ix",
+        "geometry_id",
+        "semantic_id",
         "primitive_ix",
         "geometry_type",
         "geometry_lod",
@@ -366,8 +366,8 @@ fn semantic_primitive_header() -> Vec<String> {
 fn semantic_primitive_cells(row: &SemanticPrimitiveRow<'_>) -> Vec<String> {
     vec![
         row.cityobject_id.to_string(),
-        row.geometry_ix.to_string(),
-        optional_u64_cell(row.semantic_ix),
+        row.geometry_id.to_string(),
+        optional_u64_cell(row.semantic_id),
         row.primitive_ix.to_string(),
         row.geometry_type.to_string(),
         option_string_cell(row.geometry_lod.as_deref()),

@@ -224,7 +224,8 @@ Semantic feature layers include:
 | Column          | Type                    | Description                           |
 |-----------------|-------------------------|---------------------------------------|
 | `id`            | `INTEGER PRIMARY KEY`   | GeoPackage row id                     |
-| `semantic_id`   | `TEXT NOT NULL`         | Stable generated semantic id          |
+| `semantic_id`   | `INTEGER NOT NULL`      | Stable semantic resource id within the projected model/export |
+| `geometry_id`   | `INTEGER NOT NULL`      | Owning geometry resource id within the projected model/export |
 | `semantic_type` | `TEXT NOT NULL`         | CityJSON semantic object type         |
 | `cityobject_id` | `TEXT NOT NULL`         | Source CityObject id                  |
 | `geom`          | layer-specific geometry | Registered GeoPackage geometry column |

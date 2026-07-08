@@ -59,7 +59,7 @@ feature layers and extends `cityobjects` with geometry identity.
 | `cityobject_id`   | `Utf8`          | yes      | owning CityObject id                                    |
 | `cityobject_ix`   | `UInt64`        | yes      | owning CityObject ordinal                               |
 | `cityobject_type` | `Utf8`          | yes      | owning CityObject type                                  |
-| `geometry_ix`     | `UInt64`        | yes      | geometry index within the CityObject                    |
+| `geometry_id`     | `UInt64`        | yes      | stable geometry resource id within the projected model/export |
 | `geometry_type`   | `Utf8`          | yes      | CityJSON geometry type                                  |
 | `lod`             | `Utf8`          | no       | CityJSON LoD value                                      |
 | `geom`            | format geometry | yes      | physical geometry column, if the format stores geometry |
@@ -75,12 +75,16 @@ GeoPackage uses this row schema with the physical columns required by
 
 One row per exported semantic primitive when Tyler splits semantics.
 
+`geometry_id` and `semantic_id` are resource ids that are stable within one
+projected model/export. They are not guaranteed to be stable across unrelated
+conversions unless the input and resource allocation order are unchanged.
+
 | Logical field   | Type            | Required | Source                                     |
 |-----------------|-----------------|----------|--------------------------------------------|
-| `semantic_id`   | `UInt64`        | yes      | stable semantic row ordinal                |
+| `semantic_id`   | `UInt64`        | yes      | stable semantic resource id within the projected model/export |
 | `cityobject_id` | `Utf8`          | yes      | owning CityObject id                       |
 | `cityobject_ix` | `UInt64`        | yes      | owning CityObject ordinal                  |
-| `geometry_ix`   | `UInt64`        | yes      | owning geometry index                      |
+| `geometry_id`   | `UInt64`        | yes      | owning geometry resource id within the projected model/export |
 | `geometry_type` | `Utf8`          | yes      | resolved CityJSON geometry type            |
 | `geometry_lod`  | `Utf8`          | no       | CityJSON LoD value                         |
 | `primitive_ix`  | `UInt64`        | yes      | semantic primitive index within geometry   |

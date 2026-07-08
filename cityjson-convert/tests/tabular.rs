@@ -487,8 +487,8 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert_eq!(primitive_rows.len(), 1);
     let primitive = primitive_rows[0].fixed();
     assert_eq!(primitive.cityobject_id, "building");
-    assert_eq!(primitive.geometry_ix, 0);
-    assert_eq!(primitive.semantic_ix, Some(first.semantic_id));
+    assert_eq!(primitive.geometry_id, 0);
+    assert_eq!(primitive.semantic_id, Some(first.semantic_id));
     assert_eq!(primitive.primitive_ix, 0);
     assert_eq!(
         primitive.semantic_type_name().unwrap().to_string(),

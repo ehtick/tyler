@@ -334,8 +334,8 @@ fn writes_semantics_tsv_with_primitive_rows() {
         rows[0],
         [
             "cityobject_id",
-            "geometry_ix",
-            "semantic_ix",
+            "geometry_id",
+            "semantic_id",
             "primitive_ix",
             "geometry_type",
             "geometry_lod",
@@ -387,7 +387,7 @@ fn writes_semantics_tsv_filtered_to_assigned_primitives() {
 
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0][0], "cityobject_id");
-    assert_eq!(rows[0][2], "semantic_ix");
+    assert_eq!(rows[0][2], "semantic_id");
     assert_eq!(rows[0][3], "primitive_ix");
     assert!(rows[0].contains(&"semantic_type".to_string()));
     assert!(rows[0].contains(&"attribute__slope".to_string()));
