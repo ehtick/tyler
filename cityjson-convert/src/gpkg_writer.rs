@@ -36,6 +36,7 @@ pub struct GpkgExportOptions {
     pub include_hierarchy: bool,
     pub include_metadata: bool,
     pub output_crs: Option<String>,
+    pub split_lod: bool,
 }
 
 #[derive(Debug)]
@@ -119,6 +120,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
             cityobject_type_schemas: &cityobject_type_schemas,
             srs_id: resolved_srs.srs_id,
             last_change: &last_change,
+            split_lod: options.split_lod,
         },
         &mut used_table_names,
         &mut feature_layer_names,
@@ -176,6 +178,7 @@ struct FeatureLayerExport<'tx, 'conn, 'model, 'rows> {
     cityobject_type_schemas: &'rows BTreeMap<String, TableSchema<'model>>,
     srs_id: i32,
     last_change: &'tx str,
+    split_lod: bool,
 }
 
 fn cityobject_type_schemas<'model>(
@@ -205,7 +208,17 @@ fn export_feature_layers<'model>(
     for (cityobject_ix, (_, cityobject)) in export.model.cityobjects().iter().enumerate() {
         let row = &export.cityobject_rows[cityobject_ix];
 
-        let Some(geometry_handles) = cityobject.geometry() else {
+        let cityobject_type = row.cityobject_type_name().to_string();
+        let Some(geometry_handles) = cityobject.geometry().filter(|handles| !handles.is_empty())
+        else {
+            export_geometryless_cityobject(
+                export,
+                used_table_names,
+                feature_layer_names,
+                feature_layers,
+                row,
+                &cityobject_type,
+            )?;
             continue;
         };
 
@@ -218,9 +231,16 @@ fn export_feature_layers<'model>(
             let geometry_type = *geometry.type_geometry();
             let encoded =
                 encode_geometry_blob(export.model, geometry_type, boundary, export.srs_id)?;
-            let cityobject_type = row.cityobject_type_name().to_string();
             let geometry_family = geometry_type.to_string();
-            let lod = geometry.lod().map(ToString::to_string);
+            let lod = if export.split_lod {
+                Some(
+                    geometry
+                        .lod()
+                        .map_or_else(|| "none".to_string(), ToString::to_string),
+                )
+            } else {
+                None
+            };
             let layer_key = (
                 cityobject_type.clone(),
                 geometry_family.clone(),
@@ -274,6 +294,52 @@ fn export_feature_layers<'model>(
         }
     }
     Ok(())
+}
+
+fn export_geometryless_cityobject<'model>(
+    export: &FeatureLayerExport<'_, '_, 'model, '_>,
+    used_table_names: &mut HashSet<String>,
+    feature_layer_names: &mut BTreeMap<FeatureLayerKey, String>,
+    feature_layers: &mut BTreeMap<String, FeatureLayerState<'model>>,
+    row: &CityObjectRow<'_, 'model>,
+    cityobject_type: &str,
+) -> Result<()> {
+    let layer_key = (cityobject_type.to_string(), String::new(), None);
+    let table_name = feature_layer_names
+        .entry(layer_key)
+        .or_insert_with(|| {
+            unique_identifier(sanitize_identifier(cityobject_type), used_table_names)
+        })
+        .clone();
+    let state = match feature_layers.entry(table_name) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let table_name = entry.key().clone();
+            let schema = export
+                .cityobject_type_schemas
+                .get(cityobject_type)
+                .cloned()
+                .unwrap_or_default();
+            create_geometryless_cityobject_table(
+                export.tx,
+                &table_name,
+                &schema,
+                export.last_change,
+            )?;
+            entry.insert(FeatureLayerState {
+                insert_sql: geometryless_cityobject_insert_sql(&table_name, &schema),
+                schema,
+                extent: None,
+            })
+        }
+    };
+    insert_geometryless_cityobject_row(
+        export.tx,
+        &state.insert_sql,
+        export.model,
+        row,
+        &state.schema,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -554,6 +620,33 @@ fn create_feature_table(
     Ok(())
 }
 
+fn create_geometryless_cityobject_table(
+    tx: &Transaction<'_>,
+    table_name: &str,
+    schema: &TableSchema<'_>,
+    last_change: &str,
+) -> Result<()> {
+    let mut columns = vec![
+        "id INTEGER PRIMARY KEY".to_string(),
+        "cityobject_id TEXT NOT NULL".to_string(),
+        "cityobject_type TEXT NOT NULL".to_string(),
+    ];
+    columns.extend(schema.columns.iter().map(|column| {
+        format!(
+            "{} {}",
+            quote_ident(&column.name),
+            sqlite_type_decl(&column.logical_type)
+        )
+    }));
+
+    tx.execute_batch(&format!(
+        "CREATE TABLE {} ({});",
+        quote_ident(table_name),
+        columns.join(", ")
+    ))?;
+    register_attribute_table(tx, table_name, table_name, last_change)
+}
+
 fn create_address_table(
     tx: &Transaction<'_>,
     addresses: &AddressTable<'_>,
@@ -620,10 +713,7 @@ fn insert_address_rows(
     let mut extent = None;
     for row in addresses.rows() {
         let fixed = row.fixed();
-        let encoded = fixed
-            .location()?
-            .map(|handle| encode_address_geometry_blob(addresses.model(), handle, srs_id))
-            .transpose()?;
+        let encoded = encode_address_location_blob(addresses.model(), fixed.location()?, srs_id)?;
         extent = union_bbox(
             extent,
             encoded.as_ref().and_then(|encoded| encoded.envelope),
@@ -651,6 +741,28 @@ fn feature_insert_sql(table_name: &str, schema: &crate::TableSchema<'_>) -> Stri
         quote_ident("lod"),
         quote_ident(GPKG_GEOM_COLUMN_NAME),
     ];
+    columns.extend(
+        schema
+            .columns
+            .iter()
+            .map(|column| quote_ident(&column.name)),
+    );
+
+    let placeholders = (0..columns.len())
+        .map(|_| "?".to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        quote_ident(table_name),
+        columns.join(", "),
+        placeholders
+    )
+}
+
+fn geometryless_cityobject_insert_sql(table_name: &str, schema: &crate::TableSchema<'_>) -> String {
+    let mut columns = vec![quote_ident("cityobject_id"), quote_ident("cityobject_type")];
     columns.extend(
         schema
             .columns
@@ -702,6 +814,31 @@ fn insert_feature_row(
                     feature.model,
                     feature.row.value_for_schema_column(column)?,
                 )
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let mut statement = tx.prepare_cached(insert_sql)?;
+    statement.execute(params_from_iter(params))?;
+    Ok(())
+}
+
+fn insert_geometryless_cityobject_row(
+    tx: &Transaction<'_>,
+    insert_sql: &str,
+    model: &CityModel,
+    row: &CityObjectRow<'_, '_>,
+    schema: &TableSchema<'_>,
+) -> Result<()> {
+    let mut params = vec![
+        SqlValue::Text(row.cityobject_id.to_string()),
+        SqlValue::Text(row.cityobject_type_name().to_string()),
+    ];
+    params.extend(
+        schema
+            .columns
+            .iter()
+            .map(|column| {
+                sqlite_value_from_tabular_value(model, row.value_for_schema_column(column)?)
             })
             .collect::<Result<Vec<_>>>()?,
     );
@@ -1107,6 +1244,20 @@ fn encode_address_geometry_blob(
     encode_geometry_blob(model, *geometry.type_geometry(), boundary, srs_id)
 }
 
+fn encode_address_location_blob(
+    model: &CityModel,
+    value: Value<'_, '_>,
+    srs_id: i32,
+) -> Result<Option<EncodedGeometry>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::GeometryRef(handle) => {
+            Ok(Some(encode_address_geometry_blob(model, handle, srs_id)?))
+        }
+        other => bail!("address.location must be a geometry reference, found {other:?}"),
+    }
+}
+
 fn encode_geometry_blob(
     model: &CityModel,
     geometry_type: GeometryType,
@@ -1213,16 +1364,14 @@ fn layer_table_name_base(
     geometry_family: &str,
     lod: Option<impl ToString>,
 ) -> String {
-    let lod = lod.map_or_else(
-        || "none".to_string(),
-        |lod| sanitize_lod_fragment(&lod.to_string()),
-    );
-    format!(
-        "{}_{}_lod{}",
+    let base = format!(
+        "{}_{}",
         sanitize_identifier(cityobject_type),
-        sanitize_identifier(geometry_family),
-        lod
-    )
+        sanitize_identifier(geometry_family)
+    );
+    lod.map_or(base.clone(), |lod| {
+        format!("{base}_lod{}", sanitize_lod_fragment(&lod.to_string()))
+    })
 }
 
 fn sanitize_lod_fragment(value: &str) -> String {

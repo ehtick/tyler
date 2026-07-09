@@ -275,6 +275,7 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
             include_hierarchy: true,
             include_metadata: true,
             output_crs: None,
+            split_lod: true,
         },
     )
     .expect("GeoPackage conversion should succeed");
@@ -348,6 +349,7 @@ fn converts_model_to_gpkg_with_lod_layers_and_semantics() {
             include_hierarchy: true,
             include_metadata: false,
             output_crs: None,
+            split_lod: true,
         },
     )
     .expect("GeoPackage conversion should succeed");
@@ -426,14 +428,15 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
             include_hierarchy: false,
             include_metadata: false,
             output_crs: None,
+            split_lod: false,
         },
     )
     .expect("GeoPackage conversion should succeed");
 
     let conn = Connection::open(&output).expect("open GeoPackage");
-    assert!(table_exists(&conn, "building_multisurface_lod1"));
-    assert!(!table_exists(&conn, "building_multisurface_lod1_2"));
-    assert_eq!(table_row_count(&conn, "building_multisurface_lod1"), 2);
+    assert!(table_exists(&conn, "building_multisurface"));
+    assert!(!table_exists(&conn, "building_multisurface_lod1"));
+    assert_eq!(table_row_count(&conn, "building_multisurface"), 2);
 
     if output.exists() {
         fs::remove_file(&output).expect("clean up output");
@@ -483,22 +486,22 @@ fn infers_feature_layer_attributes_per_cityobject_type() {
     let conn = Connection::open(&output).expect("open GeoPackage");
     assert!(table_has_column(
         &conn,
-        "building_multisurface_lod1",
+        "building_multisurface",
         "attributes__name"
     ));
     assert!(table_has_column(
         &conn,
-        "building_multisurface_lod1",
+        "building_multisurface",
         "attributes__measuredHeight"
     ));
     assert!(!table_has_column(
         &conn,
-        "buildingpart_multisurface_lod1",
+        "buildingpart_multisurface",
         "attributes__name"
     ));
     assert!(!table_has_column(
         &conn,
-        "buildingpart_multisurface_lod1",
+        "buildingpart_multisurface",
         "attributes__measuredHeight"
     ));
 
@@ -548,15 +551,11 @@ fn infers_feature_layer_attribute_types_per_cityobject_type() {
 
     let conn = Connection::open(&output).expect("open GeoPackage");
     assert_eq!(
-        table_column_type(&conn, "building_multisurface_lod1", "attributes__shared"),
+        table_column_type(&conn, "building_multisurface", "attributes__shared"),
         "TEXT"
     );
     assert_eq!(
-        table_column_type(
-            &conn,
-            "buildingpart_multisurface_lod1",
-            "attributes__shared"
-        ),
+        table_column_type(&conn, "buildingpart_multisurface", "attributes__shared"),
         "INTEGER"
     );
 
@@ -606,12 +605,12 @@ fn keeps_nullable_attributes_within_same_cityobject_type() {
     let conn = Connection::open(&output).expect("open GeoPackage");
     assert!(table_has_column(
         &conn,
-        "buildingpart_multisurface_lod1",
+        "buildingpart_multisurface",
         "attributes__roofType"
     ));
     let null_count: i64 = conn
         .query_row(
-            r#"SELECT COUNT(*) FROM buildingpart_multisurface_lod1 WHERE "attributes__roofType" IS NULL"#,
+            r#"SELECT COUNT(*) FROM buildingpart_multisurface WHERE "attributes__roofType" IS NULL"#,
             [],
             |row| row.get(0),
         )
@@ -658,7 +657,7 @@ fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
 
     let conn = Connection::open(&output).expect("open GeoPackage");
     let column_names = conn
-        .prepare("SELECT name FROM pragma_table_info('building_multisurface_lod1') ORDER BY cid")
+        .prepare("SELECT name FROM pragma_table_info('building_multisurface') ORDER BY cid")
         .expect("prepare column query")
         .query_map([], |row| row.get::<_, String>(0))
         .expect("query column names")
@@ -669,7 +668,7 @@ fn converts_model_to_gpkg_with_case_insensitive_attribute_collisions() {
 
     let (first, second): (String, String) = conn
         .query_row(
-            r#"SELECT "attributes__eindRegistratie", "attributes__eindregistratie__2" FROM building_multisurface_lod1 LIMIT 1"#,
+            r#"SELECT "attributes__eindRegistratie", "attributes__eindregistratie__2" FROM building_multisurface LIMIT 1"#,
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -731,7 +730,7 @@ fn omits_geometry_ref_attributes_from_feature_layers() {
     let conn = Connection::open(&output).expect("open GeoPackage");
     let has_column: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('building_multisurface_lod1') WHERE name = 'attributes__location'",
+            "SELECT COUNT(*) FROM pragma_table_info('building_multisurface') WHERE name = 'attributes__location'",
             [],
             |row| row.get(0),
         )
@@ -806,6 +805,7 @@ fn converts_include_address_to_multipoint_feature_layer() {
             include_hierarchy: false,
             include_metadata: false,
             output_crs: None,
+            split_lod: false,
         },
     )
     .expect("GeoPackage conversion should succeed");

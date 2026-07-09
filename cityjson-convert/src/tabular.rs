@@ -249,20 +249,19 @@ impl AddressRow<'_> {
         self.cityobject_type
     }
 
-    /// Returns the optional `address.location` geometry handle.
+    /// Returns the optional `address.location` geometry value.
     ///
     /// # Errors
     ///
-    /// Returns an error when `location` exists but is not a geometry value.
-    pub fn location(&self) -> Result<Option<GeometryHandle>> {
-        match self.address.get("location") {
-            None | Some(OwnedAttributeValue::Null) => Ok(None),
-            Some(OwnedAttributeValue::Geometry(handle)) => Ok(Some(*handle)),
-            Some(other) => bail!(
-                "address.location for CityObject {} must be a geometry value, found {other}",
-                self.cityobject_id
-            ),
-        }
+    /// Returns an error when the deserialized value cannot be represented as a
+    /// geometry reference.
+    pub fn location(&self) -> Result<Value<'_, '_>> {
+        build_value(
+            self.address.get("location"),
+            &LogicalType::GeometryRef,
+            true,
+            "address.location",
+        )
     }
 }
 
@@ -2559,11 +2558,8 @@ fn build_value<'schema, 'model>(
         }
         bail!("{path}: missing non-nullable value");
     };
-    if matches!(
-        value,
-        OwnedAttributeValue::Null | OwnedAttributeValue::Geometry(_)
-    ) {
-        if nullable || matches!(value, OwnedAttributeValue::Geometry(_)) {
+    if matches!(value, OwnedAttributeValue::Null) {
+        if nullable {
             return Ok(Value::Null);
         }
         bail!("{path}: null in non-nullable value");
@@ -2589,6 +2585,9 @@ fn build_value<'schema, 'model>(
             })?,
         )),
         (LogicalType::Utf8, OwnedAttributeValue::String(value)) => Ok(Value::Utf8(value)),
+        (LogicalType::GeometryRef, OwnedAttributeValue::Geometry(value)) => {
+            Ok(Value::GeometryRef(*value))
+        }
         (LogicalType::Json, value) => Ok(Value::Json(value)),
         (
             LogicalType::List {

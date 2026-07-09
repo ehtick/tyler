@@ -100,6 +100,9 @@ struct GpkgCliOptions {
     // Optional target CRS metadata label when the source metadata lacks a parseable EPSG code.
     #[arg(long = "gpkg-output-crs")]
     output_crs: Option<String>,
+    // Split GeoPackage feature layers by CityJSON LoD.
+    #[arg(long = "gpkg-split-lod", default_value_t = false)]
+    split_lod: bool,
 }
 
 #[derive(Args, Debug, Default)]
@@ -185,6 +188,7 @@ fn main() -> anyhow::Result<()> {
                 include_hierarchy: cli.gpkg.semantics.include_hierarchy,
                 include_metadata: cli.gpkg.metadata.include_source,
                 output_crs: cli.gpkg.output_crs.clone(),
+                split_lod: cli.gpkg.split_lod,
             };
             info!("Converting to GeoPackage");
             cityjson_convert::convert_to_gpkg(&model, &cli.output, &options)?;

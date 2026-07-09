@@ -897,8 +897,11 @@ fn tabulates_address_location_separately_from_dynamic_address_columns() {
     let street_column = schema_column_index(table.schema(), "street");
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].fixed().location().unwrap(), Some(geometry_handle));
-    assert_eq!(rows[1].fixed().location().unwrap(), None);
+    assert!(matches!(
+        rows[0].fixed().location().unwrap(),
+        Value::GeometryRef(handle) if handle == geometry_handle
+    ));
+    assert!(matches!(rows[1].fixed().location().unwrap(), Value::Null));
     assert_eq!(
         cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(table.model(), geometry_handle)
             .unwrap(),
