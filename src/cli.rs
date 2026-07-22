@@ -470,7 +470,7 @@ fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
         if c.exists() {
             Ok(c)
         } else {
-            Err(format!("path {:?} does not exist", &c))
+            Err(format!("path {:?} does not exist", c))
         }
     } else {
         Err(format!("could not resolve the path {:?}", s))

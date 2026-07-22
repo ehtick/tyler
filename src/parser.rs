@@ -260,11 +260,11 @@ impl World {
 
         info!(
             "Found {} features of type {:?}",
-            nr_features, &cityobject_types
+            nr_features, cityobject_types
         );
         info!(
             "Ignored {} features of type {:?}",
-            nr_features_ignored, &cityobject_types_ignored
+            nr_features_ignored, cityobject_types_ignored
         );
         info!(
             "Available CityObject types after scan: {:?}",
@@ -282,7 +282,7 @@ impl World {
             "Retained LoDs by CityObject type after filtering: {:?}",
             filter_summary.retained_lods
         );
-        debug!("extent: {:?}", &extent);
+        debug!("extent: {:?}", extent);
         info!(
             "Computed extent from features: {}",
             crate::spatial_structs::bbox_to_wkt(&extent)

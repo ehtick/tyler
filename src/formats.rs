@@ -248,7 +248,7 @@ pub mod cesium3dtiles {
                 let tile_id = TileId::from(&quadtree.id);
 
                 if quadtree.children.len() != 4 {
-                    warn!("Quadtree does not have 4 children {:?}", &quadtree);
+                    warn!("Quadtree does not have 4 children {:?}", quadtree);
                 }
                 // Tile bounding volume
                 // Set the bounding volume height from the grid height, which can be set with
@@ -259,7 +259,7 @@ pub mod cesium3dtiles {
                 if tile_bbox[5] < tile_bbox[2] {
                     debug!(
                         "Internal tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
-                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                        tile_bbox, tile_bbox[5], tile_bbox[2]
                     );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
@@ -304,7 +304,7 @@ pub mod cesium3dtiles {
                     // See explanation above
                     debug!(
                         "Leaf tile {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
-                        &tile_bbox, tile_bbox[5], tile_bbox[2]
+                        tile_bbox, tile_bbox[5], tile_bbox[2]
                     );
                     tile_bbox[5] = tile_bbox[2] + tile_bbox[2] * 0.01;
                 }
@@ -342,7 +342,7 @@ pub mod cesium3dtiles {
                         // See explanation above
                         debug!(
                             "Leaf tile content {tile_id} {:?} (in input CRS) bbox maxz {} is less than minz {}. Replacing maxz with minz + minz * 0.01.",
-                            &tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]
+                            tile_content_bbox_rw, tile_content_bbox_rw[5], tile_content_bbox_rw[2]
                         );
                         tile_content_bbox_rw[5] =
                             tile_content_bbox_rw[2] + tile_content_bbox_rw[2] * 0.01;
@@ -426,7 +426,7 @@ pub mod cesium3dtiles {
                 available_levels: self.available_levels(),
                 subtrees,
             };
-            debug!("{:?}", &implicittiling);
+            debug!("{:?}", implicittiling);
             self.root.implicit_tiling = Some(implicittiling);
 
             // We want to have a sparse implicit tileset, which stores the availability
@@ -557,13 +557,13 @@ pub mod cesium3dtiles {
                         let outdir = output_dir_debug.unwrap_or(Path::new(""));
                         let filename = outdir.join(format!(
                             "implicit-level-{}-{}-{}.tsv",
-                            &level_quadtree, &tile.id.x, &tile.id.y
+                            level_quadtree, tile.id.x, tile.id.y
                         ));
                         debug!(
                             "Exporting the subtree {}/{}/{} to TSV file to {}",
-                            &level_quadtree,
-                            &tile.id.x,
-                            &tile.id.y,
+                            level_quadtree,
+                            tile.id.x,
+                            tile.id.y,
                             filename.display()
                         );
                         let mut file_implicit_tileset_at_level = File::create(&filename).unwrap();
@@ -617,8 +617,8 @@ pub mod cesium3dtiles {
                     tile_availability_bitstream.len(),
                     nr_tiles_total_subtree,
                     "tileAvailability bitstream must have {} elements, but it has {}",
-                    &nr_tiles_total_subtree,
-                    &tile_availability_bitstream.len()
+                    nr_tiles_total_subtree,
+                    tile_availability_bitstream.len()
                 );
                 let grid_coordinate_map = Self::grid_coordinate_map(
                     level_child_subtree,
@@ -694,7 +694,7 @@ pub mod cesium3dtiles {
                 // pad our buffer_vec to have a length that is a multiple of 8 bytes
                 Self::add_padding(&mut buffer_vec, 8);
 
-                debug!("Writing subtree {}", &subtree_id);
+                debug!("Writing subtree {}", subtree_id);
                 let buffer = Buffer {
                     name: None,
                     byte_length: buffer_vec.len(),
@@ -732,7 +732,7 @@ pub mod cesium3dtiles {
                 if header.len() != 24 {
                     warn!(
                         "Subtree {} binary header must be 24 bytes long, it is {}",
-                        &subtree_id,
+                        subtree_id,
                         header.len()
                     );
                 }
@@ -1036,18 +1036,18 @@ pub mod cesium3dtiles {
                 let outdir = output_dir_debug.unwrap_or(Path::new(""));
                 let mut file_grid = File::create(outdir.join(format!(
                     "grid_for_level-{}-{}.tsv",
-                    &grid_for_level.length, &first_cell.0
+                    grid_for_level.length, first_cell.0
                 )))
                 .unwrap();
                 writeln!(file_grid, "cell_id\twkt").unwrap();
                 for (cellid, _) in &grid_for_level {
                     let wkt = grid_for_level.cell_to_wkt(&cellid);
-                    writeln!(file_grid, "{}\t{}", &cellid, wkt).unwrap();
+                    writeln!(file_grid, "{}\t{}", cellid, wkt).unwrap();
                 }
 
                 let mut file_grid_morton = File::create(outdir.join(format!(
                     "grid_for_level_morton-{}-{}.tsv",
-                    &grid_for_level.length, &first_cell.0
+                    grid_for_level.length, first_cell.0
                 )))
                 .unwrap();
                 writeln!(file_grid_morton, "idx\tcell_id\twkt").unwrap();
@@ -1056,7 +1056,7 @@ pub mod cesium3dtiles {
                     writeln!(
                         file_grid_morton,
                         "{}\t{}\tPOINT({} {})",
-                        i, &cellid, minx, miny
+                        i, cellid, minx, miny
                     )
                     .unwrap();
                 }

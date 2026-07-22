@@ -2086,7 +2086,7 @@ fn write_subtrees(
             .join(&subtree_id.to_string())
             .with_extension("subtree");
         let mut subtree_file = File::create(&out_path)
-            .unwrap_or_else(|_| panic!("could not create {:?} for writing", &out_path));
+            .unwrap_or_else(|_| panic!("could not create {:?} for writing", out_path));
         if let Err(_e) = subtree_file.write_all(subtree_bytes) {
             warn!("Failed to write subtree {} content", subtree_id);
         }
@@ -2147,11 +2147,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Begin argument parsing
     let cli = crate::cli::Cli::parse();
     cli.validate_parameter_combinations(&[cli.format])?;
-    debug!("{:?}", &cli);
+    debug!("{:?}", cli);
     info!("tyler version: {}", clap::crate_version!());
     if !cli.output.is_dir() {
         fs::create_dir_all(&cli.output)?;
-        info!("Created output directory {:#?}", &cli.output);
+        info!("Created output directory {:#?}", cli.output);
     }
     // Since we have a default value, we can safely unwrap.
     let grid_cellsize = cli.grid_cellsize.unwrap();
@@ -2258,13 +2258,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if cli.debug_dump_grid {
-        info!("Exporting the grid to TSV to {:?}", &debug_data_output_path);
+        info!("Exporting the grid to TSV to {:?}", debug_data_output_path);
         world.export_grid(cli.debug_dump_grid_features, Some(&debug_data_output_path))?;
     }
     if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the world instance to bincode to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         world.export_bincode(Some("world"), Some(&debug_data_output_path))?;
     }
@@ -2285,14 +2285,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.debug_dump_grid {
         info!(
             "Exporting the quadtree to TSV to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         quadtree.export(&world, Some(&debug_data_output_path))?;
     }
     if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the quadtree instance to bincode to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         quadtree.export_bincode(Some("quadtree"), Some(&debug_data_output_path))?;
     }
@@ -2317,10 +2317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if output_format != OutputFormatKind::Cesium3dTiles || !cli.debug_cesium3dtiles_tileset_only {
         fs::create_dir_all(&path_output_tiles)?;
-        info!("Created output directory {:#?}", &path_output_tiles);
+        info!("Created output directory {:#?}", path_output_tiles);
         if should_dump_debug_data(&cli) {
             fs::create_dir_all(&path_features_input_dir)?;
-            info!("Created output directory {:#?}", &path_features_input_dir);
+            info!("Created output directory {:#?}", path_features_input_dir);
         }
 
         let geometry_placement = if let Some(root_enu_frame) = prepared_output.root_enu_frame() {
@@ -2430,7 +2430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if should_dump_debug_data(&cli) {
                 debug!(
                     "Exporting the tiles_results instance to bincode to {:?}",
-                    &debug_data_output_path
+                    debug_data_output_path
                 );
                 let outpath = debug_data_output_path.join("tiles_results.bincode");
                 let tiles_results_file = File::create(outpath)?;
