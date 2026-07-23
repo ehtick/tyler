@@ -35,7 +35,6 @@ pub struct GpkgExportOptions {
     pub include_address: bool,
     pub include_hierarchy: bool,
     pub include_metadata: bool,
-    pub output_crs: Option<String>,
     pub split_lod: bool,
 }
 
@@ -60,6 +59,7 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     options: &GpkgExportOptions,
 ) -> Result<()> {
     let output = output.as_ref();
+    let resolved_srs = resolve_srs(model)?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -90,7 +90,6 @@ pub fn convert_to_gpkg<P: AsRef<Path>>(
     } else {
         None
     };
-    let resolved_srs = resolve_srs(model, options)?;
 
     if output.exists() {
         fs::remove_file(output)
@@ -349,7 +348,7 @@ struct ResolvedSrs {
     definition: String,
 }
 
-fn resolve_srs(model: &CityModel, options: &GpkgExportOptions) -> Result<ResolvedSrs> {
+fn resolve_srs(model: &CityModel) -> Result<ResolvedSrs> {
     if let Some(metadata) = model.metadata() {
         if let Some(reference_system) = metadata.reference_system() {
             let reference_system = reference_system.to_string();
@@ -359,16 +358,9 @@ fn resolve_srs(model: &CityModel, options: &GpkgExportOptions) -> Result<Resolve
         }
     }
 
-    let Some(output_crs) = options.output_crs.as_ref() else {
-        bail!(
-            "CityJSON metadata referenceSystem is missing or ambiguous; provide --gpkg-output-crs"
-        );
-    };
-    let Some(srs_id) = parse_epsg_srs_id(output_crs) else {
-        bail!("could not parse EPSG code from --gpkg-output-crs value {output_crs:?}");
-    };
-
-    resolved_epsg_srs(srs_id, output_crs.clone())
+    bail!(
+        "CityJSON metadata referenceSystem must contain a parseable EPSG identifier; assign CRS upstream"
+    )
 }
 
 fn resolved_epsg_srs(srs_id: i32, label: String) -> Result<ResolvedSrs> {

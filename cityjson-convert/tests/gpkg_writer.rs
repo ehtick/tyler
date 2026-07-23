@@ -274,7 +274,6 @@ fn converts_model_to_gpkg_with_feature_layers_relations_and_metadata() {
             include_address: false,
             include_hierarchy: true,
             include_metadata: true,
-            output_crs: None,
             split_lod: true,
         },
     )
@@ -348,7 +347,6 @@ fn converts_model_to_gpkg_with_lod_layers_and_semantics() {
             include_address: false,
             include_hierarchy: true,
             include_metadata: false,
-            output_crs: None,
             split_lod: true,
         },
     )
@@ -427,7 +425,6 @@ fn reuses_feature_layer_for_multiple_cityobjects_with_same_type_and_lod() {
             include_address: false,
             include_hierarchy: false,
             include_metadata: false,
-            output_crs: None,
             split_lod: false,
         },
     )
@@ -804,7 +801,6 @@ fn converts_include_address_to_multipoint_feature_layer() {
             include_address: true,
             include_hierarchy: false,
             include_metadata: false,
-            output_crs: None,
             split_lod: false,
         },
     )
@@ -867,7 +863,7 @@ fn convert_to_gpkg_requires_a_parseable_crs() {
 
     let error = convert_to_gpkg(&model, &output, &GpkgExportOptions::default())
         .expect_err("conversion should fail without CRS metadata");
-    assert!(error.to_string().contains("gpkg-output-crs"));
+    assert!(error.to_string().contains("assign CRS upstream"));
     assert!(
         !output.exists(),
         "writer should fail before creating the file"
