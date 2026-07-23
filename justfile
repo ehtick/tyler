@@ -31,7 +31,7 @@ fmt-check:
 test *args:
     cargo test --workspace --all-targets --no-fail-fast --no-default-features --features proj-system {{args}}
 
-# Run Docker-based GeoPackage validation with GDAL, GEOS, and PostGIS.
+# Run Docker-based GeoPackage validation with GDAL only.
 gpkg-gis-test:
     docker compose -f cityjson-convert/tools/gis-integration/compose.yaml up --build --abort-on-container-exit --exit-code-from tests
 

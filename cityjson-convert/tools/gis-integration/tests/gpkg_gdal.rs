@@ -1,58 +1,59 @@
+//! GDAL acceptance tests for complete GeoPackage files produced by Tyler.
+
 mod common;
 
 use std::process::Command;
 
+/// Purpose: validate GeoPackage files through GDAL's public reader.
+/// Input: complete temporary GeoPackages for the supported multi-geometry families.
+/// Assertions: GDAL loads each file, exposes its XYZ layer and feature, and reports EPSG:7415.
 #[test]
-fn ogrinfo_opens_generated_geopackages() -> anyhow::Result<()> {
+fn ogrinfo_opens_complete_generated_geopackages() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     for case in common::cases() {
         let path = case.write_gpkg(dir.path())?;
-        assert_eq!(
-            common::geometry_type_name(&path, case.table_name)?,
-            case.expected_gpkg_type,
-            "{}",
-            case.name
-        );
-
         let output = Command::new("ogrinfo")
-            .arg("-ro")
-            .arg("-so")
+            .args(["-ro", "-al"])
             .arg(&path)
-            .arg(case.table_name)
             .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
             "ogrinfo failed for {}\nstdout:\n{}\nstderr:\n{}",
             case.name,
-            String::from_utf8_lossy(&output.stdout),
+            stdout,
             String::from_utf8_lossy(&output.stderr)
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains(case.table_name),
-            "{} missing layer",
-            case.name
-        );
-        assert!(
-            stdout.contains(expected_gdal_geometry_name(case.expected_gpkg_type)),
-            "{} missing geometry type in ogrinfo output:\n{}",
+            stdout.contains(&format!("Layer name: {}", case.table_name)),
+            "{} missing layer:\n{}",
             case.name,
             stdout
         );
         assert!(
-            stdout.contains("EPSG"),
-            "{} missing CRS metadata",
-            case.name
+            stdout.contains(case.expected_ogr_geometry),
+            "{} missing XYZ geometry type:\n{}",
+            case.name,
+            stdout
+        );
+        assert!(
+            stdout.contains("Feature Count: 1"),
+            "{} missing feature count:\n{}",
+            case.name,
+            stdout
+        );
+        assert!(
+            stdout.contains(case.decoded_geometry),
+            "{} missing decoded feature geometry:\n{}",
+            case.name,
+            stdout
+        );
+        assert!(
+            stdout.contains("7415"),
+            "{} missing EPSG:7415:\n{}",
+            case.name,
+            stdout
         );
     }
     Ok(())
-}
-
-fn expected_gdal_geometry_name(gpkg_type: &str) -> &str {
-    match gpkg_type {
-        "MULTIPOINT" => "3D Multi Point",
-        "MULTILINESTRING" => "3D Multi Line String",
-        "MULTIPOLYGON" => "3D Multi Polygon",
-        value => value,
-    }
 }
