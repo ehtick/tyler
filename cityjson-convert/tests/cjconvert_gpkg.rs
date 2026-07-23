@@ -17,11 +17,6 @@ fn corpus_file(relative: &str) -> PathBuf {
 fn fake_complete() -> PathBuf {
     corpus_file("cases/conformance/v2_0/cityjson_fake_complete/cityjson_fake_complete.city.json")
 }
-fn address_fixture() -> PathBuf {
-    corpus_file(
-        "cases/conformance/v2_0/cityobject_building_address/cityobject_building_address.city.json",
-    )
-}
 fn convert(input: &Path, option: Option<&str>) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("create temporary output directory");
     let output = dir.path().join("output.gpkg");
@@ -97,11 +92,11 @@ fn include_hierarchy_writes_hierarchy_table() {
     assert!(has_table(&output, "cityobject_hierarchy"));
 }
 /// Purpose: verify address export is opt-in.
-/// Input: the canonical address `CityJSON` fixture with only --gpkg-include-address added.
+/// Input: the canonical complete `CityJSON` fixture with only --gpkg-include-address added.
 /// Assertions: the address feature layer exists.
 #[test]
 fn include_address_writes_address_layer() {
-    let (_dir, output) = convert(&address_fixture(), Some("--gpkg-include-address"));
+    let (_dir, output) = convert(&fake_complete(), Some("--gpkg-include-address"));
     assert!(has_table(&output, "addresses"));
 }
 /// Purpose: verify source metadata export is opt-in.
