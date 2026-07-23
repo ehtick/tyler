@@ -64,6 +64,21 @@ fn export(model: &CityModel) -> anyhow::Result<()> {
 OBJ output is geometry-only Wavefront OBJ grouped by CityObject ID. Coordinates
 are written in the source CityJSON coordinate space.
 
+### GeoPackage
+
+```rust
+use cityjson_convert::{convert_to_gpkg, GpkgExportOptions};
+use cityjson_lib::CityModel;
+
+fn export(model: &CityModel) -> anyhow::Result<()> {
+    convert_to_gpkg(model, "output/model.gpkg", &GpkgExportOptions::default())
+}
+```
+
+GeoPackage output requires `metadata.referenceSystem` to contain a parseable EPSG
+identifier. The converter rejects missing or non-EPSG CRS metadata before it
+changes the output path; it intentionally has no output-CRS override.
+
 ### CityJSONSeq
 
 ```rust

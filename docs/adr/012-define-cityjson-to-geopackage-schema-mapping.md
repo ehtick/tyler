@@ -41,9 +41,11 @@ The CityJSON `transform` object is not written because it has already been appli
 deserializing a CityJSON document into a `CityModel`.
 
 The GeoPackage uses one CRS for all feature layers. The CRS is stored in
-`gpkg_spatial_ref_sys` and referenced by `gpkg_geometry_columns`. If the input
-CRS is missing or ambiguous, the converter must require an explicit output CRS.
-Use the GeoPackage WKT CRS extension when needed for an accurate CRS definition.
+`gpkg_spatial_ref_sys` and referenced by `gpkg_geometry_columns`. The source `metadata.referenceSystem` must contain a parseable EPSG identifier.
+Missing or non-EPSG source CRS metadata is rejected before the converter creates,
+removes, or modifies the requested output path. The converter does not provide an
+output CRS override because relabelling coordinates would produce misleading GIS
+data. Use the GeoPackage WKT CRS extension for the declared source EPSG CRS.
 
 ### Layer Model
 

@@ -1494,10 +1494,14 @@ fn union_bbox(existing: Option<[f64; 6]>, new_bbox: Option<[f64; 6]>) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_epsg_srs_id, sanitize_identifier, wrap_geopackage_binary};
+    use super::{
+        parse_epsg_srs_id, sanitize_identifier, sqlite_type_decl, union_bbox,
+        wrap_geopackage_binary,
+    };
+    use crate::tabular::{LogicalType, StructSchema};
 
     #[test]
-    fn parses_epsg_codes_from_common_crs_strings() {
+    fn parses_epsg_codes_from_source_metadata() {
         assert_eq!(parse_epsg_srs_id("EPSG:7415"), Some(7415));
         assert_eq!(
             parse_epsg_srs_id("https://www.opengis.net/def/crs/EPSG/0/7415"),
@@ -1511,21 +1515,75 @@ mod tests {
         assert_eq!(sanitize_identifier("Building Part"), "building_part");
         assert_eq!(sanitize_identifier("+NoiseBuilding"), "noisebuilding");
         assert_eq!(sanitize_identifier("123abc"), "layer_123abc");
+        assert_eq!(sanitize_identifier("---"), "layer");
     }
 
     #[test]
-    fn wraps_geopackage_binary_with_header_and_optional_envelope() {
-        let blob = wrap_geopackage_binary(
+    fn maps_every_logical_type_to_a_sqlite_declaration() {
+        let list = LogicalType::List {
+            item_nullable: false,
+            item: Box::new(LogicalType::Utf8),
+        };
+        let structure = LogicalType::Struct(StructSchema::default());
+        for (logical_type, expected) in [
+            (LogicalType::Null, "TEXT"),
+            (LogicalType::Boolean, "INTEGER"),
+            (LogicalType::UInt64, "INTEGER"),
+            (LogicalType::Int64, "INTEGER"),
+            (LogicalType::Float64, "REAL"),
+            (LogicalType::Utf8, "TEXT"),
+            (LogicalType::Json, "TEXT"),
+            (LogicalType::GeometryRef, "BLOB"),
+            (list, "TEXT"),
+            (structure, "TEXT"),
+        ] {
+            assert_eq!(sqlite_type_decl(&logical_type), expected);
+        }
+    }
+
+    #[test]
+    fn wraps_geopackage_binary_with_and_without_envelope() {
+        let with_envelope = wrap_geopackage_binary(
             &[1, 2, 3],
             Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             false,
             7415,
         );
-        assert_eq!(&blob[0..2], b"GP");
-        assert_eq!(blob[2], 0);
-        assert_eq!(blob[3] & 0b0000_0001, 1);
-        assert_eq!(i32::from_le_bytes(blob[4..8].try_into().unwrap()), 7415);
-        assert_eq!(blob[3] & 0b0000_0100, 0b0000_0100);
-        assert_eq!(blob.len(), 2 + 1 + 1 + 4 + 48 + 3);
+        assert_eq!(&with_envelope[0..2], b"GP");
+        assert_eq!(with_envelope[2], 0);
+        assert_eq!(with_envelope[3], 0b0000_0101);
+        assert_eq!(
+            i32::from_le_bytes(with_envelope[4..8].try_into().unwrap()),
+            7415
+        );
+        assert_eq!(
+            f64::from_le_bytes(with_envelope[8..16].try_into().unwrap()).to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert_eq!(
+            f64::from_le_bytes(with_envelope[48..56].try_into().unwrap()).to_bits(),
+            6.0_f64.to_bits()
+        );
+        assert_eq!(&with_envelope[56..], &[1, 2, 3]);
+
+        let without_envelope = wrap_geopackage_binary(&[4, 5], None, true, 4326);
+        assert_eq!(without_envelope[3], 0b0001_0001);
+        assert_eq!(
+            i32::from_le_bytes(without_envelope[4..8].try_into().unwrap()),
+            4326
+        );
+        assert_eq!(&without_envelope[8..], &[4, 5]);
+    }
+
+    #[test]
+    fn unions_feature_layer_extents() {
+        assert_eq!(union_bbox(None, None), None);
+        assert_eq!(
+            union_bbox(
+                Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                Some([-1.0, 3.0, 2.0, 8.0, 4.0, 9.0])
+            ),
+            Some([-1.0, 2.0, 2.0, 8.0, 5.0, 9.0])
+        );
     }
 }

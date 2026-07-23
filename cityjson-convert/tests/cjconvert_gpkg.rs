@@ -1,4 +1,4 @@
-//! CLI acceptance tests for cjconvert GeoPackage options.
+//! CLI acceptance tests for `cjconvert` `GeoPackage` options.
 
 use rusqlite::Connection;
 use std::env;
@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn corpus_file(relative: &str) -> PathBuf {
-    let root = env::var_os("CITYJSON_CORPUS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cityjson-corpus"));
+    let root = env::var_os("CITYJSON_CORPUS_DIR").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cityjson-corpus"),
+        PathBuf::from,
+    );
     let path = root.join(relative);
     assert!(path.is_file(), "CityJSON corpus fixture is missing: {}. Set CITYJSON_CORPUS_DIR to a cityjson-corpus checkout.", path.display());
     path
@@ -50,8 +51,8 @@ fn has_table(output: &Path, table: &str) -> bool {
         .is_ok()
 }
 
-/// Purpose: verify default CLI output omits every optional GeoPackage product.
-/// Input: the canonical complete CityJSON fixture.
+/// Purpose: verify default CLI output omits every optional `GeoPackage` product.
+/// Input: the canonical complete `CityJSON` fixture.
 /// Assertions: optional tables and metadata sidecar are absent.
 #[test]
 fn defaults_omit_optional_outputs() {
@@ -60,9 +61,9 @@ fn defaults_omit_optional_outputs() {
     assert!(!has_table(&output, "cityobject_hierarchy"));
     assert!(!output.with_file_name("output_metadata.gpkg").exists());
 }
-/// Purpose: verify the LoD split option controls layer naming.
-/// Input: the canonical complete CityJSON fixture with only --gpkg-split-lod added.
-/// Assertions: a GeoPackage layer includes a LoD fragment.
+/// Purpose: verify the `LoD` split option controls layer naming.
+/// Input: the canonical complete `CityJSON` fixture with only --gpkg-split-lod added.
+/// Assertions: a `GeoPackage` layer includes a `LoD` fragment.
 #[test]
 fn split_lod_creates_lod_layers() {
     let (_dir, output) = convert(&fake_complete(), Some("--gpkg-split-lod"));
@@ -80,7 +81,7 @@ fn split_lod_creates_lod_layers() {
     );
 }
 /// Purpose: verify semantic export is opt-in.
-/// Input: the canonical complete CityJSON fixture with only --gpkg-include-semantics added.
+/// Input: the canonical complete `CityJSON` fixture with only --gpkg-include-semantics added.
 /// Assertions: the semantics feature table exists.
 #[test]
 fn include_semantics_writes_semantics_table() {
@@ -88,15 +89,15 @@ fn include_semantics_writes_semantics_table() {
     assert!(has_table(&output, "semantics"));
 }
 /// Purpose: verify hierarchy export is opt-in.
-/// Input: the canonical complete CityJSON fixture with only --gpkg-include-hierarchy added.
-/// Assertions: the CityObject hierarchy table exists.
+/// Input: the canonical complete `CityJSON` fixture with only --gpkg-include-hierarchy added.
+/// Assertions: the `CityObject` hierarchy table exists.
 #[test]
 fn include_hierarchy_writes_hierarchy_table() {
     let (_dir, output) = convert(&fake_complete(), Some("--gpkg-include-hierarchy"));
     assert!(has_table(&output, "cityobject_hierarchy"));
 }
 /// Purpose: verify address export is opt-in.
-/// Input: the canonical address CityJSON fixture with only --gpkg-include-address added.
+/// Input: the canonical address `CityJSON` fixture with only --gpkg-include-address added.
 /// Assertions: the address feature layer exists.
 #[test]
 fn include_address_writes_address_layer() {
@@ -104,8 +105,8 @@ fn include_address_writes_address_layer() {
     assert!(has_table(&output, "addresses"));
 }
 /// Purpose: verify source metadata export is opt-in.
-/// Input: the canonical complete CityJSON fixture with only --gpkg-include-metadata added.
-/// Assertions: the metadata sidecar GeoPackage exists.
+/// Input: the canonical complete `CityJSON` fixture with only --gpkg-include-metadata added.
+/// Assertions: the metadata sidecar `GeoPackage` exists.
 #[test]
 fn include_metadata_writes_metadata_sidecar() {
     let (_dir, output) = convert(&fake_complete(), Some("--gpkg-include-metadata"));
