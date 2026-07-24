@@ -97,7 +97,7 @@ struct GpkgCliOptions {
     address: GpkgAddressCliOptions,
     #[command(flatten)]
     metadata: GpkgMetadataCliOptions,
-    /// Split feature layers by CityObject type, geometry family, and CityJSON LoD.
+    /// Split feature layers by `CityObject` type, geometry family, and `CityJSON` `LoD`.
     #[arg(long = "gpkg-split-lod", default_value_t = false)]
     split_lod: bool,
 }
@@ -121,7 +121,7 @@ struct GpkgAddressCliOptions {
 
 #[derive(Args, Debug, Default)]
 struct GpkgMetadataCliOptions {
-    /// Export source CityJSON metadata through the GeoPackage metadata extension.
+    /// Export source `CityJSON` metadata through the `GeoPackage` metadata extension.
     #[arg(long = "gpkg-include-metadata", default_value_t = false)]
     include_source: bool,
 }
