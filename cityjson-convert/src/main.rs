@@ -97,31 +97,31 @@ struct GpkgCliOptions {
     address: GpkgAddressCliOptions,
     #[command(flatten)]
     metadata: GpkgMetadataCliOptions,
-    // Split GeoPackage feature layers by CityJSON LoD.
+    /// Split feature layers by CityObject type, geometry family, and CityJSON LoD.
     #[arg(long = "gpkg-split-lod", default_value_t = false)]
     split_lod: bool,
 }
 
 #[derive(Args, Debug, Default)]
 struct GpkgSemanticCliOptions {
-    // Write semantic primitive feature rows.
+    /// Add a `semantics` feature layer containing semantic primitive rows.
     #[arg(long = "gpkg-include-semantics", default_value_t = false)]
     include_semantics: bool,
-    // Write standalone CityObject and semantic hierarchy tables.
+    /// Add the non-spatial `cityobject_hierarchy` and `semantic_hierarchy` tables.
     #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
     include_hierarchy: bool,
 }
 
 #[derive(Args, Debug, Default)]
 struct GpkgAddressCliOptions {
-    // Write CityObject extra.address values to a separate feature layer.
+    /// Add an `addresses` feature layer from `CityObject.extra.address` values.
     #[arg(long = "gpkg-include-address", default_value_t = false)]
     include_address: bool,
 }
 
 #[derive(Args, Debug, Default)]
 struct GpkgMetadataCliOptions {
-    // Include source CityJSON metadata through the GeoPackage metadata extension.
+    /// Export source CityJSON metadata through the GeoPackage metadata extension.
     #[arg(long = "gpkg-include-metadata", default_value_t = false)]
     include_source: bool,
 }

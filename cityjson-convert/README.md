@@ -164,3 +164,35 @@ cjconvert input.city.json \
   --3dtiles-metadata-class cityobject \
   --smooth-normals
 ```
+
+### GeoPackage options
+
+Write GeoPackage output with `--format gpkg`:
+
+```shell
+cjconvert input.city.json --output output/model.gpkg --format gpkg
+```
+
+The source `CityJSON` must provide a parseable EPSG identifier in
+`metadata.referenceSystem`. All GeoPackage-specific options are disabled by
+default.
+
+| Option | Effect |
+|--------|--------|
+| `--gpkg-split-lod` | Writes separate feature layers for each CityObject type, geometry family, and LoD. Without this option, LoDs share a layer and are stored in its `lod` column. |
+| `--gpkg-include-semantics` | Adds a `semantics` feature layer containing semantic primitive rows. |
+| `--gpkg-include-hierarchy` | Adds the non-spatial `cityobject_hierarchy` and `semantic_hierarchy` tables. |
+| `--gpkg-include-address` | Adds an `addresses` feature layer from `CityObject.extra.address` values. |
+| `--gpkg-include-metadata` | Exports source CityJSON metadata through the GeoPackage metadata extension. |
+
+For example, to export every optional GeoPackage product and split the main
+feature layers by LoD:
+
+```shell
+cjconvert input.city.json --output output/model.gpkg --format gpkg \
+  --gpkg-split-lod \
+  --gpkg-include-semantics \
+  --gpkg-include-hierarchy \
+  --gpkg-include-address \
+  --gpkg-include-metadata
+```
