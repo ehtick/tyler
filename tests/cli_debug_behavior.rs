@@ -304,6 +304,81 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
 }
 
 #[test]
+fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-gpkg", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-gpkg-output");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &[
+            "--format",
+            "gpkg",
+            "--gpkg-split-lod",
+            "--gpkg-include-semantics",
+            "--gpkg-include-hierarchy",
+            "--gpkg-include-address",
+        ],
+    );
+    assert_success(&output, "GeoPackage format run");
+
+    let mut tile_databases = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".gpkg", &mut tile_databases);
+    assert!(
+        !tile_databases.is_empty(),
+        "expected GeoPackage tiles under {}",
+        output_dir.join("t").display()
+    );
+    let tile = rusqlite::Connection::open(&tile_databases[0]).expect("open tile GeoPackage");
+    let tables = tile
+        .prepare("SELECT table_name FROM gpkg_contents ORDER BY table_name")
+        .expect("prepare tile table query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tile tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read tile tables");
+    assert!(tables.iter().any(|table| table == "semantics"));
+    assert!(tables.iter().any(|table| table == "addresses"));
+    assert!(tables.iter().any(|table| table == "cityobject_hierarchy"));
+    assert!(tables.iter().any(|table| table == "semantic_hierarchy"));
+
+    let aggregate_path = output_dir.join("metadata.gpkg");
+    let aggregate =
+        rusqlite::Connection::open(&aggregate_path).expect("open aggregate metadata GeoPackage");
+    let rows = aggregate
+        .prepare("SELECT tile_id, gpkg_path, geographical_extent_wkb FROM metadata ORDER BY id")
+        .expect("prepare aggregate query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .expect("query aggregate metadata")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read aggregate metadata");
+    assert!(!rows.is_empty());
+    for (tile_id, gpkg_path, extent) in rows {
+        assert_eq!(gpkg_path, format!("t/{tile_id}.gpkg"));
+        assert!(output_dir.join(&gpkg_path).is_file());
+        assert!(extent.starts_with(b"GP"));
+    }
+    let geometry_registration: (String, i32) = aggregate
+        .query_row(
+            "SELECT column_name, srs_id FROM gpkg_geometry_columns WHERE table_name = 'metadata'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read aggregate geometry registration");
+    assert_eq!(geometry_registration.0, "geographical_extent_wkb");
+    assert!(!output_dir.join(".tyler-gpkg-metadata").exists());
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
 fn format_cityjson_writes_cityjson_tiles() {
     let metadata = read_fixture("resources/data/3dbag_x00.city.json");
     let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");

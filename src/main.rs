@@ -93,6 +93,7 @@ pub enum OutputFormatKind {
     Cityjson,
     Cityjsonseq,
     Tsv,
+    Gpkg,
 }
 
 #[derive(Default, Debug)]
@@ -246,6 +247,16 @@ fn build_tsv_export_options(cli: &crate::cli::Cli) -> cityjson_convert::TsvExpor
         include_metadata: false,
         include_semantics: cli.tsv_include_semantics,
         include_address: cli.tsv_include_address,
+    }
+}
+
+fn build_gpkg_export_options(cli: &crate::cli::Cli) -> cityjson_convert::GpkgExportOptions {
+    cityjson_convert::GpkgExportOptions {
+        include_semantics: cli.gpkg_include_semantics,
+        include_address: cli.gpkg_include_address,
+        include_hierarchy: cli.gpkg_include_hierarchy,
+        include_metadata: false,
+        split_lod: cli.gpkg_split_lod,
     }
 }
 
@@ -1328,23 +1339,23 @@ fn cleanup_and_update_extents(
     Ok(model)
 }
 
-fn write_tsv_metadata_fragment(
+fn tile_metadata_model(
+    format_name: &str,
     job: &TileExportJob,
     model: &cityjson_lib::CityModel,
     context: &TileWriteContext<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(&context.tsv_metadata_dir)?;
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
     let mut metadata_model = model.clone();
     let source_node_id = job.source_node_id.as_ref().ok_or_else(|| {
         format!(
-            "TSV tile {} is missing its source quadtree node",
+            "{format_name} tile {} is missing its source quadtree node",
             job.content_tile_coord
         )
     })?;
     let qtree_node_id = spatial_structs::QuadTreeNodeId::from(source_node_id);
     let qtree_node = context.quadtree.node(&qtree_node_id).ok_or_else(|| {
         format!(
-            "TSV tile {} references missing source quadtree node {}",
+            "{format_name} tile {} references missing source quadtree node {}",
             job.content_tile_coord, qtree_node_id
         )
     })?;
@@ -1354,6 +1365,16 @@ fn write_tsv_metadata_fragment(
         .set_geographical_extent(BBox::new(
             extent[0], extent[1], extent[2], extent[3], extent[4], extent[5],
         ));
+    Ok(metadata_model)
+}
+
+fn write_tsv_metadata_fragment(
+    job: &TileExportJob,
+    model: &cityjson_lib::CityModel,
+    context: &TileWriteContext<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(&context.tsv_metadata_dir)?;
+    let metadata_model = tile_metadata_model("TSV", job, model, context)?;
     let metadata = cityjson_convert::tabulate_model_metadata(&metadata_model)?;
     let output = File::create(tsv_metadata_fragment_path(
         &context.tsv_metadata_dir,
@@ -1427,6 +1448,41 @@ fn tsv_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> Pa
     ))
 }
 
+fn gpkg_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> PathBuf {
+    metadata_dir.join(format!(
+        "{}-{}-{}.gpkg",
+        tile_coord.level, tile_coord.x, tile_coord.y
+    ))
+}
+
+fn gpkg_tile_relative_path(tile_coord: &TileCoord) -> String {
+    format!("t/{tile_coord}.gpkg")
+}
+
+fn aggregate_gpkg_metadata(
+    output_dir: &Path,
+    successful_jobs: &[TileExportJob],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata_dir = output_dir.join(".tyler-gpkg-metadata");
+    let template = metadata_dir.join("template.gpkg");
+    let fragments = successful_jobs
+        .iter()
+        .map(|job| cityjson_convert::GpkgMetadataFragment {
+            tile_id: job.content_tile_coord.to_string(),
+            gpkg_path: gpkg_tile_relative_path(&job.content_tile_coord),
+            metadata_path: gpkg_metadata_fragment_path(&metadata_dir, &job.content_tile_coord),
+        })
+        .collect::<Vec<_>>();
+    let output_file = output_dir.join("metadata.gpkg");
+    cityjson_convert::aggregate_metadata_gpkg(&output_file, &template, &fragments)?;
+    fs::remove_dir_all(&metadata_dir)?;
+    info!(
+        "Wrote aggregate GeoPackage metadata to {}",
+        output_file.display()
+    );
+    Ok(())
+}
+
 fn write_debug_tile_input(
     path_features_input_dir: &Path,
     file_name: &str,
@@ -1454,6 +1510,8 @@ struct TileWriteContext<'a> {
     cityjson_colors: BTreeMap<String, RGB>,
     tsv_export_options: cityjson_convert::TsvExportOptions,
     tsv_metadata_dir: PathBuf,
+    gpkg_export_options: cityjson_convert::GpkgExportOptions,
+    gpkg_metadata_dir: PathBuf,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1476,6 +1534,7 @@ enum PreparedOutput {
     Cityjson(TileFilesPreparedOutput),
     Cityjsonseq(TileFilesPreparedOutput),
     Tsv(TileFilesPreparedOutput),
+    Gpkg(TileFilesPreparedOutput),
 }
 
 impl PreparedOutput {
@@ -1485,7 +1544,8 @@ impl PreparedOutput {
             PreparedOutput::Obj(prepared)
             | PreparedOutput::Cityjson(prepared)
             | PreparedOutput::Cityjsonseq(prepared)
-            | PreparedOutput::Tsv(prepared) => &prepared.source_crs,
+            | PreparedOutput::Tsv(prepared)
+            | PreparedOutput::Gpkg(prepared) => &prepared.source_crs,
         }
     }
 
@@ -1495,7 +1555,8 @@ impl PreparedOutput {
             PreparedOutput::Obj(_)
             | PreparedOutput::Cityjson(_)
             | PreparedOutput::Cityjsonseq(_)
-            | PreparedOutput::Tsv(_) => None,
+            | PreparedOutput::Tsv(_)
+            | PreparedOutput::Gpkg(_) => None,
         }
     }
 }
@@ -2046,6 +2107,83 @@ impl OutputFormatBackend for TsvBackend {
     }
 }
 
+struct GpkgBackend;
+
+impl OutputFormatBackend for GpkgBackend {
+    fn prepare(
+        &self,
+        cli: &crate::cli::Cli,
+        world: &parser::World,
+        quadtree: &spatial_structs::QuadTree,
+        _grid_cellsize: u32,
+        _geometric_error_factor: f64,
+        _debug_data_output_path: &Path,
+    ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
+        let metadata_dir = cli.output.join(".tyler-gpkg-metadata");
+        fs::create_dir_all(&metadata_dir)?;
+        let base_model = cityjson_lib::json::from_slice(&world.feature_base_document)?;
+        cityjson_convert::write_metadata_gpkg(&base_model, metadata_dir.join("template.gpkg"))?;
+        Ok(PreparedOutput::Gpkg(TileFilesPreparedOutput {
+            export_jobs: quadtree_leaf_tile_export_jobs(world, quadtree),
+            source_crs: format!("EPSG:{}", world.crs.to_epsg()?),
+        }))
+    }
+
+    fn jobs(&self, prepared: &PreparedOutput) -> Vec<TileExportJob> {
+        let PreparedOutput::Gpkg(prepared) = prepared else {
+            return Vec::new();
+        };
+        prepared.export_jobs.clone()
+    }
+
+    fn write_tile(
+        &self,
+        job: &TileExportJob,
+        model: &cityjson_lib::CityModel,
+        context: &TileWriteContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let output_file = context
+            .output_tiles_dir
+            .join(job.content_tile_coord.to_string())
+            .with_extension("gpkg");
+        let mut options = context.gpkg_export_options.clone();
+        options.include_metadata = false;
+        cityjson_convert::convert_to_gpkg(model, &output_file, &options)?;
+
+        fs::create_dir_all(&context.gpkg_metadata_dir)?;
+        let metadata_model = tile_metadata_model("GeoPackage", job, model, context)?;
+        cityjson_convert::write_metadata_gpkg(
+            &metadata_model,
+            gpkg_metadata_fragment_path(&context.gpkg_metadata_dir, &job.content_tile_coord),
+        )?;
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        cli: &crate::cli::Cli,
+        _quadtree: &spatial_structs::QuadTree,
+        successful_jobs: &[TileExportJob],
+        failed_jobs: &[TileExportJob],
+        _prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!(
+            "Skipped {} failed GeoPackage tile outputs",
+            failed_jobs.len()
+        );
+        aggregate_gpkg_metadata(&cli.output, successful_jobs)?;
+        Ok(())
+    }
+
+    fn write_manifest_only(
+        &self,
+        _cli: &crate::cli::Cli,
+        _prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+}
+
 fn output_format_backend(kind: OutputFormatKind) -> Box<dyn OutputFormatBackend> {
     match kind {
         OutputFormatKind::Cesium3dTiles => Box::new(Cesium3dTilesBackend),
@@ -2053,6 +2191,7 @@ fn output_format_backend(kind: OutputFormatKind) -> Box<dyn OutputFormatBackend>
         OutputFormatKind::Cityjson => Box::new(CityjsonBackend),
         OutputFormatKind::Cityjsonseq => Box::new(CityjsonseqBackend),
         OutputFormatKind::Tsv => Box::new(TsvBackend),
+        OutputFormatKind::Gpkg => Box::new(GpkgBackend),
     }
 }
 
@@ -2346,6 +2485,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cityjson_colors: build_cityjson_object_colors(&cli),
             tsv_export_options: build_tsv_export_options(&cli),
             tsv_metadata_dir: cli.output.join(".tyler-tsv-metadata"),
+            gpkg_export_options: build_gpkg_export_options(&cli),
+            gpkg_metadata_dir: cli.output.join(".tyler-gpkg-metadata"),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
