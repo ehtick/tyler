@@ -8,7 +8,7 @@ use cityjson_lib::CityModel;
 use csv::Terminator;
 
 use crate::{
-    tabular::{bytes_to_hex, value_to_text_cell, TextCell},
+    tabular::{value_to_text_cell, TextCell},
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow, MetadataTable,
@@ -324,7 +324,7 @@ fn metadata_fixed_header() -> Vec<String> {
         "reference_date",
         "reference_system",
         "title",
-        "geographical_extent_wkb",
+        "geographical_extent_wkt",
         "contact_name",
         "contact_email_address",
         "contact_role",
@@ -344,10 +344,7 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Vec<String> {
         option_string_cell(row.reference_date.as_deref()),
         option_string_cell(row.reference_system.as_deref()),
         option_string_cell(row.title.as_deref()),
-        row.geographical_extent_wkb
-            .as_deref()
-            .map(bytes_to_hex)
-            .unwrap_or_default(),
+        row.geographical_extent.map(bbox_wkt_2d).unwrap_or_default(),
         option_string_cell(row.contact_name.as_deref()),
         option_string_cell(row.contact_email_address.as_deref()),
         option_string_cell(row.contact_role.as_deref()),
@@ -356,6 +353,12 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Vec<String> {
         option_string_cell(row.contact_phone.as_deref()),
         option_string_cell(row.contact_organization.as_deref()),
     ]
+}
+
+fn bbox_wkt_2d([min_x, min_y, _, max_x, max_y, _]: [f64; 6]) -> String {
+    format!(
+        "POLYGON(({min_x} {min_y}, {max_x} {min_y}, {max_x} {max_y}, {min_x} {max_y}, {min_x} {min_y}))"
+    )
 }
 
 fn semantic_primitive_header() -> Vec<String> {

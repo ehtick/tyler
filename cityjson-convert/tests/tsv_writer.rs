@@ -317,14 +317,35 @@ fn writes_metadata_tsv_with_fixed_fields_extent_and_extra() {
     let rows = parse_tsv(&bytes);
 
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].contains(&"geographical_extent_wkb".to_string()));
+    assert!(rows[0].contains(&"geographical_extent_wkt".to_string()));
     assert!(!rows[0].contains(&"geographical_extent".to_string()));
-    assert!(!rows[0].contains(&"geographical_extent_wkt".to_string()));
+    assert!(!rows[0].contains(&"geographical_extent_wkb".to_string()));
     assert!(rows[0].contains(&"+quality__score".to_string()));
     assert!(!rows[0].contains(&"metadata_extra__+quality__score".to_string()));
     assert_eq!(rows[1][0], "dataset-1");
-    assert!(rows[1][4].starts_with("01030000000100000005000000"));
+    assert_eq!(rows[1][4], "POLYGON((1 2, 4 2, 4 5, 1 5, 1 2))");
     assert_eq!(rows[1].last().unwrap(), "7");
+}
+
+#[test]
+fn writes_empty_metadata_extent_cell_when_extent_is_absent() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{},
+            "vertices":[],
+            "metadata":{"identifier":"dataset-1"}
+        }"#,
+    )
+    .unwrap();
+    let table = tabulate_model_metadata(&model).unwrap();
+
+    let mut bytes = Vec::new();
+    write_metadata_tsv(&table, &mut bytes).unwrap();
+    let rows = parse_tsv(&bytes);
+
+    assert_eq!(rows[1][4], "");
 }
 
 #[test]

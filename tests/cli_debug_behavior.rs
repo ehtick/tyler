@@ -277,7 +277,7 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
     let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
     assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
-    assert!(metadata_header.contains("geographical_extent_wkb"));
+    assert!(metadata_header.contains("geographical_extent_wkt"));
     assert!(aggregate_metadata
         .lines()
         .skip(1)
@@ -288,13 +288,13 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         rows.len() >= 2,
         "metadata.tsv should contain at least one data row"
     );
-    let extent_wkb_ix = rows[0]
+    let extent_wkt_ix = rows[0]
         .iter()
-        .position(|column| column == "geographical_extent_wkb")
-        .expect("metadata.tsv should contain geographical_extent_wkb");
+        .position(|column| column == "geographical_extent_wkt")
+        .expect("metadata.tsv should contain geographical_extent_wkt");
     assert!(
-        rows[1][extent_wkb_ix].starts_with("01030000"),
-        "geographical_extent_wkb should contain hex-encoded polygon WKB"
+        rows[1][extent_wkt_ix].starts_with("POLYGON(("),
+        "geographical_extent_wkt should contain polygon WKT"
     );
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
     assert!(!output_dir

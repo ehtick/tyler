@@ -1339,11 +1339,10 @@ fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>, srs_id: i32) -> Vec<S
         option_sql_text(row.reference_date.as_deref()),
         option_sql_text(row.reference_system.as_deref()),
         option_sql_text(row.title.as_deref()),
-        row.geographical_extent_wkb
-            .clone()
-            .map_or(SqlValue::Null, |wkb| {
-                SqlValue::Blob(wrap_geopackage_binary(&wkb, None, false, srs_id))
-            }),
+        row.geographical_extent.map_or(SqlValue::Null, |bbox| {
+            let wkb = bbox_wkb_2d(bbox);
+            SqlValue::Blob(wrap_geopackage_binary(&wkb, None, false, srs_id))
+        }),
         option_sql_text(row.contact_name.as_deref()),
         option_sql_text(row.contact_email_address.as_deref()),
         option_sql_text(row.contact_role.as_deref()),
@@ -1352,6 +1351,26 @@ fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>, srs_id: i32) -> Vec<S
         option_sql_text(row.contact_phone.as_deref()),
         option_sql_text(row.contact_organization.as_deref()),
     ]
+}
+
+fn bbox_wkb_2d([min_x, min_y, _, max_x, max_y, _]: [f64; 6]) -> Vec<u8> {
+    let coordinates = [
+        [min_x, min_y],
+        [max_x, min_y],
+        [max_x, max_y],
+        [min_x, max_y],
+        [min_x, min_y],
+    ];
+    let mut wkb = Vec::with_capacity(1 + 4 + 4 + 4 + coordinates.len() * 16);
+    wkb.push(1);
+    wkb.extend_from_slice(&3_u32.to_le_bytes());
+    wkb.extend_from_slice(&1_u32.to_le_bytes());
+    wkb.extend_from_slice(&5_u32.to_le_bytes());
+    for [x, y] in coordinates {
+        wkb.extend_from_slice(&x.to_le_bytes());
+        wkb.extend_from_slice(&y.to_le_bytes());
+    }
+    wkb
 }
 
 fn option_sql_text(value: Option<&str>) -> SqlValue {

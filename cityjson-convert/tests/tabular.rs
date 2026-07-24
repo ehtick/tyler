@@ -369,7 +369,7 @@ fn exposes_cityobject_hierarchy_as_resolved_id_lists() {
 }
 
 #[test]
-fn tabulates_model_metadata_with_extent_wkt_and_extra_schema() {
+fn tabulates_model_metadata_with_extent_and_extra_schema() {
     let model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -404,11 +404,10 @@ fn tabulates_model_metadata_with_extent_wkt_and_extra_schema() {
     assert_eq!(fixed.identifier.as_deref(), Some("dataset-1"));
     assert_eq!(fixed.reference_date.as_deref(), Some("2026-01-02"));
     assert_eq!(fixed.title.as_deref(), Some("Demo dataset"));
-    let extent_wkb = fixed
-        .geographical_extent_wkb
-        .as_ref()
-        .expect("metadata extent WKB");
-    assert!(bytes_to_hex(extent_wkb).starts_with("01030000000100000005000000"));
+    assert_eq!(
+        fixed.geographical_extent,
+        Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    );
     assert_eq!(fixed.contact_name.as_deref(), Some("Ada"));
 
     let score = schema_column_index(table.schema(), "+quality__score");
