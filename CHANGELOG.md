@@ -28,6 +28,7 @@
 
 ### Added
 
+- Tiled GeoPackage output in Tyler with `--format gpkg`, optional `--gpkg-*` tables, and an always-generated aggregate `metadata.gpkg`.
 - `cjconvert` can now read dataset directories, including the legacy
   `metadata.json` plus per-feature `*.city.jsonl` layout, through
   `cityjson-index`.

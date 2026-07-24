@@ -154,8 +154,10 @@ Tyler writes 3D Tiles by default. Select another output format with `--format`:
 - `cityjson`: writes one merged `CityJSON` document per non-empty tile.
 - `cityjsonseq`: writes one `CityJSONSeq` stream per non-empty tile, with a
   `CityJSON` header and one `CityJSONFeature` item per selected source feature.
+- `tsv`: writes tabular files per non-empty tile and one root `metadata.tsv`.
+- `gpkg`: writes one GeoPackage per non-empty tile and one root `metadata.gpkg`.
 
-The tiled `OBJ`, `CityJSON` and `CityJSONSeq` outputs use the same grid, quadtree,
+The tiled `OBJ`, `CityJSON`, `CityJSONSeq`, `TSV` and `GeoPackage` outputs use the same grid, quadtree,
 feature filtering, LoD selection, attribute filtering and parent-attribute
 inheritance path as the 3D Tiles output. They do not write `tileset.json`,
 `subtrees/`, or 3D Tiles metadata.
@@ -235,6 +237,38 @@ Each tile stream starts with a `CityJSON` header, followed by one
 `CityJSONFeature` item per selected source feature. This is the same stream
 shape used by `--debug-dump-data`.
 
+### Exporting TSV
+
+Use `--format tsv` to write tabular files under
+`t/<level>/<x>/<y>/`. Tyler always writes `metadata.tsv` at the output root,
+with one row per successful tile and `tile_id` and `cityobjects_path` columns.
+Use the `--tsv-*` options to include null rows, hierarchy, source ordinals,
+semantics, or addresses.
+
+### Exporting GeoPackage
+
+Use `--format gpkg` to write each non-empty tile to
+`t/<level>/<x>/<y>.gpkg`. Tyler always writes a separate `metadata.gpkg` at the
+output root. Its spatial `metadata` layer contains one row per successful tile,
+including `tile_id`, the relative `gpkg_path`, projected CityJSON metadata, and
+the quadtree leaf extent.
+
+```shell
+tyler \
+    /data \
+    --output /gpkg-tiles \
+    --format gpkg \
+    --gpkg-split-lod \
+    --gpkg-include-semantics \
+    --gpkg-include-hierarchy \
+    --gpkg-include-address
+```
+
+The GeoPackage-specific options split feature layers by LoD or add semantics,
+hierarchy, and address tables. Metadata aggregation is always enabled, so
+Tyler intentionally does not expose `--gpkg-include-metadata`.
+
+
 #### Input data
 
 `tyler` accepts a single `input` dataset directory with regular CityJSON files, CityJSONSeq files, or the legacy `feature-files` layout.
@@ -271,6 +305,8 @@ In case of implicit tiling, also a `subtrees/` directory is written with the sub
 For `--format obj`, it will contain a `t/` directory with `.obj` tile files.
 For `--format cityjson`, it will contain a `t/` directory with `.city.json` tile files.
 For `--format cityjsonseq`, it will contain a `t/` directory with `.city.jsonl` tile files.
+For `--format tsv`, it will contain per-tile TSV directories and a root `metadata.tsv`.
+For `--format gpkg`, it will contain a `t/` directory with `.gpkg` tile files and a root `metadata.gpkg`.
 
 For `cjindex` datasets, Tyler writes a derived metadata file under `metadata/`. Per-tile CityJSONFeature streams are kept in memory by default. To inspect them, pass `--debug-dump-data`; Tyler then
 writes `debug/inputs/<tile>.city.jsonl`.
