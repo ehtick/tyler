@@ -127,8 +127,8 @@ fn rejects_missing_or_non_epsg_source_crs_before_writing() {
     }
 }
 
-/// Purpose: preserve deterministic tile identity and GeoPackage paths while aggregating metadata.
-/// Input: two compatible per-tile metadata GeoPackages.
+/// Purpose: preserve deterministic tile identity and `GeoPackage` paths while aggregating metadata.
+/// Input: two compatible per-tile metadata `GeoPackages`.
 /// Assertions: rows follow fragment order and the spatial metadata registration remains valid.
 #[test]
 fn aggregates_tile_metadata_geopackages() {
@@ -193,4 +193,26 @@ fn aggregates_tile_metadata_geopackages() {
             7415
         )
     );
+}
+
+/// Purpose: retain a valid metadata schema when there are no successful tiles.
+/// Input: a metadata template and no fragments.
+/// Assertions: the aggregate metadata layer exists and contains no rows.
+#[test]
+fn writes_empty_metadata_aggregate_from_template() {
+    let model = model("", Some("EPSG:7415"));
+    let directory = TempDir::new().expect("create temporary directory");
+    let template = directory.path().join("template.gpkg");
+    write_metadata_gpkg(&model, &template).expect("write metadata template");
+    let output = directory.path().join("metadata.gpkg");
+
+    aggregate_metadata_gpkg(&output, &template, &[]).expect("write empty aggregate");
+
+    let conn = Connection::open(output).expect("open empty aggregate");
+    let row_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
+        .expect("count aggregate rows");
+    assert_eq!(row_count, 0);
+    assert!(column_names(&conn, "metadata").contains(&"tile_id".to_string()));
+    assert!(column_names(&conn, "metadata").contains(&"gpkg_path".to_string()));
 }

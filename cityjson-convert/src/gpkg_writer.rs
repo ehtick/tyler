@@ -1037,12 +1037,12 @@ fn sqlite_integer(value: u64, column: &str) -> Result<i64> {
         .with_context(|| format!("{column} value {value} does not fit in SQLite INTEGER"))
 }
 
-/// Writes the projected metadata for one CityJSON model to a GeoPackage.
+/// Writes the projected metadata for one `CityJSON` model to a `GeoPackage`.
 ///
 /// # Errors
 ///
 /// Returns an error when metadata or the spatial reference system cannot be
-/// resolved, or when the output GeoPackage cannot be written.
+/// resolved, or when the output `GeoPackage` cannot be written.
 pub fn write_metadata_gpkg<P: AsRef<Path>>(model: &CityModel, output: P) -> Result<()> {
     let output = output.as_ref();
     let metadata = tabulate_model_metadata(model)?;
@@ -1073,7 +1073,7 @@ fn write_metadata_gpkg_impl(
         fs::create_dir_all(parent)?;
     }
     if metadata_output.exists() {
-        fs::remove_file(&metadata_output).with_context(|| {
+        fs::remove_file(metadata_output).with_context(|| {
             format!(
                 "remove existing metadata GeoPackage {}",
                 metadata_output.display()
@@ -1081,7 +1081,7 @@ fn write_metadata_gpkg_impl(
         })?;
     }
 
-    let mut conn = Connection::open(&metadata_output)
+    let mut conn = Connection::open(metadata_output)
         .with_context(|| format!("open metadata GeoPackage {}", metadata_output.display()))?;
     conn.execute_batch(&format!(
         "PRAGMA application_id = {GPKG_APPLICATION_ID};
@@ -1104,7 +1104,7 @@ fn current_timestamp() -> Result<String> {
     Ok(conn.query_row(SQLITE_LAST_CHANGE_SQL, [], |row| row.get(0))?)
 }
 
-/// Aggregates per-tile metadata GeoPackages into one metadata GeoPackage.
+/// Aggregates per-tile metadata `GeoPackages` into one metadata `GeoPackage`.
 ///
 /// The aggregate contains one row per metadata row in fragment order, with
 /// `tile_id` and `gpkg_path` columns identifying the corresponding tile.
@@ -1112,7 +1112,7 @@ fn current_timestamp() -> Result<String> {
 /// # Errors
 ///
 /// Returns an error when no fragments are supplied, fragment schemas or
-/// spatial reference systems differ, or a GeoPackage cannot be read or
+/// spatial reference systems differ, or a `GeoPackage` cannot be read or
 /// written.
 pub fn aggregate_metadata_gpkg<P: AsRef<Path>>(
     output: P,
@@ -1159,7 +1159,7 @@ pub fn aggregate_metadata_gpkg<P: AsRef<Path>>(
         .map(|column| quote_ident(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let placeholders = (0..template_schema.len() + 1)
+    let placeholders = (0..=template_schema.len())
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(", ");
