@@ -6,7 +6,10 @@ pub mod tabular;
 mod triangle_mesh;
 pub mod tsv_writer;
 
-pub use gpkg_writer::{convert_to_gpkg, GpkgExportOptions};
+pub use gpkg_writer::{
+    aggregate_metadata_gpkg, convert_to_gpkg, write_metadata_gpkg, GpkgExportOptions,
+    GpkgMetadataFragment,
+};
 pub use tabular::{
     semantic_primitive_geometry, tabulate_addresses, tabulate_cityobject_hierarchy,
     tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,

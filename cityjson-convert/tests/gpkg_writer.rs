@@ -3,7 +3,10 @@
 use std::fs;
 use std::path::Path;
 
-use cityjson_convert::{convert_to_gpkg, GpkgExportOptions};
+use cityjson_convert::{
+    aggregate_metadata_gpkg, convert_to_gpkg, write_metadata_gpkg, GpkgExportOptions,
+    GpkgMetadataFragment,
+};
 use cityjson_lib::{json, CityModel};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -122,4 +125,71 @@ fn rejects_missing_or_non_epsg_source_crs_before_writing() {
             b"keep me"
         );
     }
+}
+
+/// Purpose: preserve deterministic tile identity and GeoPackage paths while aggregating metadata.
+/// Input: two compatible per-tile metadata GeoPackages.
+/// Assertions: rows follow fragment order and the spatial metadata registration remains valid.
+#[test]
+fn aggregates_tile_metadata_geopackages() {
+    let model = model(
+        r#""building":{"type":"Building","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2,0]]]}]}"#,
+        Some("EPSG:7415"),
+    );
+    let directory = TempDir::new().expect("create temporary directory");
+    let first = directory.path().join("first.gpkg");
+    let second = directory.path().join("second.gpkg");
+    write_metadata_gpkg(&model, &first).expect("write first metadata fragment");
+    write_metadata_gpkg(&model, &second).expect("write second metadata fragment");
+
+    let output = directory.path().join("metadata.gpkg");
+    aggregate_metadata_gpkg(
+        &output,
+        &[
+            GpkgMetadataFragment {
+                tile_id: "0/0/0".to_string(),
+                gpkg_path: "t/0/0/0.gpkg".to_string(),
+                metadata_path: first,
+            },
+            GpkgMetadataFragment {
+                tile_id: "1/2/3".to_string(),
+                gpkg_path: "t/1/2/3.gpkg".to_string(),
+                metadata_path: second,
+            },
+        ],
+    )
+    .expect("aggregate metadata fragments");
+
+    let conn = Connection::open(output).expect("open aggregate metadata");
+    let rows = conn
+        .prepare("SELECT tile_id, gpkg_path FROM metadata ORDER BY id")
+        .expect("prepare aggregate row query")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query aggregate rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read aggregate rows");
+    assert_eq!(
+        rows,
+        vec![
+            ("0/0/0".to_string(), "t/0/0/0.gpkg".to_string()),
+            ("1/2/3".to_string(), "t/1/2/3.gpkg".to_string()),
+        ]
+    );
+    let registration: (String, String, i32) = conn
+        .query_row(
+            "SELECT table_name, column_name, srs_id FROM gpkg_geometry_columns WHERE table_name = 'metadata'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read geometry registration");
+    assert_eq!(
+        registration,
+        (
+            "metadata".to_string(),
+            "geographical_extent_wkb".to_string(),
+            7415
+        )
+    );
 }
