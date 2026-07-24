@@ -145,11 +145,12 @@ fn aggregates_tile_metadata_geopackages() {
     let output = directory.path().join("metadata.gpkg");
     aggregate_metadata_gpkg(
         &output,
+        &first,
         &[
             GpkgMetadataFragment {
                 tile_id: "0/0/0".to_string(),
                 gpkg_path: "t/0/0/0.gpkg".to_string(),
-                metadata_path: first,
+                metadata_path: first.clone(),
             },
             GpkgMetadataFragment {
                 tile_id: "1/2/3".to_string(),

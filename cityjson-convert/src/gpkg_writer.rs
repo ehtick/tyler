@@ -1116,12 +1116,11 @@ fn current_timestamp() -> Result<String> {
 /// written.
 pub fn aggregate_metadata_gpkg<P: AsRef<Path>>(
     output: P,
+    template: P,
     fragments: &[GpkgMetadataFragment],
 ) -> Result<()> {
     let output = output.as_ref();
-    let Some(template) = fragments.first() else {
-        bail!("cannot aggregate GeoPackage metadata without fragments");
-    };
+    let template = template.as_ref();
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1129,10 +1128,10 @@ pub fn aggregate_metadata_gpkg<P: AsRef<Path>>(
         fs::remove_file(output)
             .with_context(|| format!("remove existing output {}", output.display()))?;
     }
-    fs::copy(&template.metadata_path, output).with_context(|| {
+    fs::copy(template, output).with_context(|| {
         format!(
             "copy metadata template {} to {}",
-            template.metadata_path.display(),
+            template.display(),
             output.display()
         )
     })?;
