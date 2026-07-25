@@ -511,6 +511,33 @@ pub struct MetadataTable<'model> {
     schema: TableSchema<'model>,
 }
 
+/// Format-independent description of one tiled output.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileMetadata {
+    pub tile_id: String,
+    pub content_path: String,
+    pub geographical_extent: [f64; 6],
+}
+
+/// Metadata projected once for serialization by any tabular output format.
+#[derive(Debug)]
+pub struct TiledMetadataTable<'model> {
+    metadata: MetadataTable<'model>,
+    tiles: Vec<TileMetadata>,
+}
+
+impl<'model> TiledMetadataTable<'model> {
+    #[must_use]
+    pub fn metadata(&self) -> &MetadataTable<'model> {
+        &self.metadata
+    }
+
+    #[must_use]
+    pub fn tiles(&self) -> &[TileMetadata] {
+        &self.tiles
+    }
+}
+
 impl<'model> MetadataTable<'model> {
     /// Returns the source model backing this borrowed table.
     #[must_use]
@@ -1407,6 +1434,22 @@ pub fn tabulate_model_metadata(model: &CityModel) -> Result<MetadataTable<'_>> {
                 "contact_organization",
             ],
         ),
+    })
+}
+
+/// Projects tiled metadata independently of its physical serialization.
+///
+/// # Errors
+///
+/// Returns an error when model metadata cannot be represented by the tabular
+/// logical type vocabulary.
+pub fn tabulate_tiled_metadata(
+    model: &CityModel,
+    tiles: Vec<TileMetadata>,
+) -> Result<TiledMetadataTable<'_>> {
+    Ok(TiledMetadataTable {
+        metadata: tabulate_model_metadata(model)?,
+        tiles,
     })
 }
 

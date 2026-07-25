@@ -12,7 +12,8 @@ use crate::{
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow, MetadataTable,
-    SemanticHierarchyTable, SemanticPrimitiveRow, SemanticPrimitiveTable, Value,
+    SemanticHierarchyTable, SemanticPrimitiveRow, SemanticPrimitiveTable, TiledMetadataTable,
+    Value,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -253,6 +254,55 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
         tsv.write_record(record)?;
     }
 
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes format-independent tiled metadata as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails or a metadata value cannot be resolved.
+pub fn write_tiled_metadata_tsv<W: Write>(table: &TiledMetadataTable<'_>, writer: W) -> Result<()> {
+    let metadata = table.metadata();
+    let mut tsv = tsv_writer(writer);
+    let mut header = vec![
+        "tile_id".to_string(),
+        "content_path".to_string(),
+        "geographical_extent".to_string(),
+    ];
+    let mut metadata_header = metadata_fixed_header();
+    metadata_header.remove(4);
+    header.extend(metadata_header);
+    header.extend(
+        metadata
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.clone()),
+    );
+    tsv.write_record(header)?;
+
+    let row = metadata
+        .rows()
+        .next()
+        .context("metadata projection contains no rows")?;
+    let mut fixed_cells = metadata_fixed_cells(row.fixed());
+    fixed_cells.remove(4);
+    let dynamic = dynamic_cells(metadata.model(), row.values())?
+        .into_iter()
+        .map(|cell| cell.text)
+        .collect::<Vec<_>>();
+    for tile in table.tiles() {
+        let mut record = vec![
+            tile.tile_id.clone(),
+            tile.content_path.clone(),
+            bbox_wkt_2d(tile.geographical_extent),
+        ];
+        record.extend(fixed_cells.iter().cloned());
+        record.extend(dynamic.iter().cloned());
+        tsv.write_record(record)?;
+    }
     tsv.flush()?;
     Ok(())
 }

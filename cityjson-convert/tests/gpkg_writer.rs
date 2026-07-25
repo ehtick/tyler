@@ -4,7 +4,8 @@ use std::fs;
 use std::path::Path;
 
 use cityjson_convert::{
-    convert_to_gpkg, write_tiled_metadata_gpkg, GpkgExportOptions, GpkgTileMetadata,
+    convert_to_gpkg, tabulate_tiled_metadata, write_tiled_metadata_gpkg, GpkgExportOptions,
+    TileMetadata,
 };
 use cityjson_lib::{json, CityModel};
 use rusqlite::Connection;
@@ -137,28 +138,29 @@ fn writes_tiled_metadata_geopackage_from_memory() {
     );
     let directory = TempDir::new().expect("create temporary directory");
     let output = directory.path().join("metadata.gpkg");
-    write_tiled_metadata_gpkg(
+    let table = tabulate_tiled_metadata(
         &model,
-        &output,
-        &[
-            GpkgTileMetadata {
+        [
+            TileMetadata {
                 tile_id: "0/0/0".to_string(),
-                gpkg_path: "t/0/0/0.gpkg".to_string(),
+                content_path: "t/0/0/0.gpkg".to_string(),
                 geographical_extent: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
             },
-            GpkgTileMetadata {
+            TileMetadata {
                 tile_id: "1/2/3".to_string(),
-                gpkg_path: "t/1/2/3.gpkg".to_string(),
+                content_path: "t/1/2/3.gpkg".to_string(),
                 geographical_extent: [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
             },
-        ],
+        ]
+        .to_vec(),
     )
-    .expect("write tiled metadata");
+    .expect("tabulate tiled metadata");
+    write_tiled_metadata_gpkg(&table, &output).expect("write tiled metadata");
 
     let conn = Connection::open(output).expect("open tiled metadata");
     let rows = conn
         .prepare(
-            "SELECT tile_id, gpkg_path, geographical_extent_wkb, reference_system \
+            "SELECT tile_id, content_path, geographical_extent, reference_system \
              FROM metadata ORDER BY id",
         )
         .expect("prepare tiled metadata query")
@@ -183,7 +185,7 @@ fn writes_tiled_metadata_geopackage_from_memory() {
     assert!(rows.iter().all(|row| row.3 == "EPSG:7415"));
     assert_eq!(
         &column_names(&conn, "metadata")[..3],
-        ["id", "tile_id", "gpkg_path"]
+        ["id", "tile_id", "content_path"]
     );
     let registration: (String, String, i32) = conn
         .query_row(
@@ -196,7 +198,7 @@ fn writes_tiled_metadata_geopackage_from_memory() {
         registration,
         (
             "metadata".to_string(),
-            "geographical_extent_wkb".to_string(),
+            "geographical_extent".to_string(),
             7415
         )
     );
@@ -211,7 +213,8 @@ fn writes_empty_tiled_metadata_geopackage() {
     let directory = TempDir::new().expect("create temporary directory");
     let output = directory.path().join("metadata.gpkg");
 
-    write_tiled_metadata_gpkg(&model, &output, &[]).expect("write empty tiled metadata");
+    let table = tabulate_tiled_metadata(&model, Vec::new()).expect("tabulate empty metadata");
+    write_tiled_metadata_gpkg(&table, &output).expect("write empty tiled metadata");
 
     let conn = Connection::open(output).expect("open empty tiled metadata");
     let row_count: i64 = conn
@@ -220,6 +223,6 @@ fn writes_empty_tiled_metadata_geopackage() {
     assert_eq!(row_count, 0);
     assert_eq!(
         &column_names(&conn, "metadata")[..3],
-        ["id", "tile_id", "gpkg_path"]
+        ["id", "tile_id", "content_path"]
     );
 }

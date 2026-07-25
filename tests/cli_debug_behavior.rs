@@ -276,8 +276,8 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     let aggregate_metadata =
         fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
     let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
-    assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
-    assert!(metadata_header.contains("geographical_extent_wkt"));
+    assert!(metadata_header.starts_with("tile_id	content_path	geographical_extent	identifier"));
+    assert!(metadata_header.contains("geographical_extent"));
     assert!(aggregate_metadata
         .lines()
         .skip(1)
@@ -290,11 +290,11 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     );
     let extent_wkt_ix = rows[0]
         .iter()
-        .position(|column| column == "geographical_extent_wkt")
-        .expect("metadata.tsv should contain geographical_extent_wkt");
+        .position(|column| column == "geographical_extent")
+        .expect("metadata.tsv should contain geographical_extent");
     assert!(
         rows[1][extent_wkt_ix].starts_with("POLYGON(("),
-        "geographical_extent_wkt should contain polygon WKT"
+        "geographical_extent should contain polygon WKT"
     );
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
     assert!(!output_dir
@@ -352,7 +352,7 @@ fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
     let aggregate =
         rusqlite::Connection::open(&aggregate_path).expect("open aggregate metadata GeoPackage");
     let rows = aggregate
-        .prepare("SELECT tile_id, gpkg_path, geographical_extent_wkb FROM metadata ORDER BY id")
+        .prepare("SELECT tile_id, content_path, geographical_extent FROM metadata ORDER BY id")
         .expect("prepare aggregate query")
         .query_map([], |row| {
             Ok((
@@ -370,9 +370,9 @@ fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
         tile_databases.len(),
         "metadata.gpkg should contain exactly one row per tile GeoPackage"
     );
-    for (tile_id, gpkg_path, extent) in rows {
-        assert_eq!(gpkg_path, format!("t/{tile_id}.gpkg"));
-        assert!(output_dir.join(&gpkg_path).is_file());
+    for (tile_id, content_path, extent) in rows {
+        assert_eq!(content_path, format!("t/{tile_id}.gpkg"));
+        assert!(output_dir.join(&content_path).is_file());
         assert!(extent.starts_with(b"GP"));
     }
     let geometry_registration: (String, i32) = aggregate
@@ -382,7 +382,7 @@ fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("read aggregate geometry registration");
-    assert_eq!(geometry_registration.0, "geographical_extent_wkb");
+    assert_eq!(geometry_registration.0, "geographical_extent");
     assert!(!output_dir.join(".tyler-gpkg-metadata").exists());
     assert!(!output_dir.join("tileset.json").exists());
 }

@@ -18,7 +18,7 @@ use crate::{
     tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
     tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
     AddressTable, CityObjectHierarchyTable, CityObjectRow, LogicalType, MetadataTable,
-    SemanticHierarchyTable, SemanticPrimitiveTable, TableSchema, Value,
+    SemanticHierarchyTable, SemanticPrimitiveTable, TableSchema, TiledMetadataTable, Value,
 };
 
 const GPKG_APPLICATION_ID: i32 = 0x4750_4b47;
@@ -36,17 +36,6 @@ pub struct GpkgExportOptions {
     pub include_hierarchy: bool,
     pub include_metadata: bool,
     pub split_lod: bool,
-}
-
-/// One tile row written to an aggregate metadata `GeoPackage`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GpkgTileMetadata {
-    /// Stable tile identifier.
-    pub tile_id: String,
-    /// Portable path to the corresponding tile `GeoPackage`.
-    pub gpkg_path: String,
-    /// Tile bounds in the source coordinate reference system.
-    pub geographical_extent: [f64; 6],
 }
 
 #[derive(Debug)]
@@ -1055,27 +1044,25 @@ pub fn write_metadata_gpkg<P: AsRef<Path>>(model: &CityModel, output: P) -> Resu
     write_metadata_gpkg_impl(output, model, &metadata, &resolved_srs, &last_change)
 }
 
-/// Writes one aggregate metadata `GeoPackage` from in-memory tile descriptors.
+/// Writes one aggregate metadata `GeoPackage` from a shared tabular projection.
 ///
 /// The spatial `metadata` layer contains one row per tile, prefixed with its
-/// `tile_id` and relative `gpkg_path`. Source `CityJSON` metadata is projected
-/// into every row, while `geographical_extent_wkb` is taken from the tile
-/// descriptor.
+/// `tile_id`, relative `content_path`, and `geographical_extent`.
 ///
 /// # Errors
 ///
 /// Returns an error when metadata or the spatial reference system cannot be
 /// resolved, or when the output `GeoPackage` cannot be written.
 pub fn write_tiled_metadata_gpkg<P: AsRef<Path>>(
-    model: &CityModel,
+    table: &TiledMetadataTable<'_>,
     output: P,
-    tiles: &[GpkgTileMetadata],
 ) -> Result<()> {
     let output = output.as_ref();
-    let metadata = tabulate_model_metadata(model)?;
+    let metadata = table.metadata();
+    let model = metadata.model();
     let resolved_srs = resolve_srs(model)?;
     let last_change = current_timestamp()?;
-    write_tiled_metadata_gpkg_impl(output, model, &metadata, &resolved_srs, &last_change, tiles)
+    write_tiled_metadata_gpkg_impl(output, table, &resolved_srs, &last_change)
 }
 
 fn write_metadata_sidecar_gpkg(
@@ -1128,11 +1115,9 @@ PRAGMA synchronous = OFF;"
 
 fn write_tiled_metadata_gpkg_impl(
     metadata_output: &Path,
-    model: &CityModel,
-    metadata: &MetadataTable<'_>,
+    table: &TiledMetadataTable<'_>,
     resolved_srs: &ResolvedSrs,
     last_change: &str,
-    tiles: &[GpkgTileMetadata],
 ) -> Result<()> {
     if let Some(parent) = metadata_output.parent() {
         fs::create_dir_all(parent)?;
@@ -1158,8 +1143,8 @@ PRAGMA synchronous = OFF;"
     let tx = conn.transaction()?;
     create_core_tables(&tx)?;
     insert_standard_spatial_ref_systems(&tx, resolved_srs)?;
-    create_tiled_metadata_table(&tx, metadata, resolved_srs.srs_id, last_change)?;
-    insert_tiled_metadata_rows(&tx, metadata, model, resolved_srs.srs_id, tiles)?;
+    create_tiled_metadata_table(&tx, table.metadata(), resolved_srs.srs_id, last_change)?;
+    insert_tiled_metadata_rows(&tx, table, resolved_srs.srs_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -1206,15 +1191,20 @@ fn create_metadata_table_impl(
     if tiled {
         columns.extend([
             "tile_id TEXT NOT NULL".to_string(),
-            "gpkg_path TEXT NOT NULL".to_string(),
+            "content_path TEXT NOT NULL".to_string(),
         ]);
     }
+    let extent_column = if tiled {
+        "geographical_extent"
+    } else {
+        "geographical_extent_wkb"
+    };
     columns.extend([
         "identifier TEXT".to_string(),
         "reference_date TEXT".to_string(),
         "reference_system TEXT".to_string(),
         "title TEXT".to_string(),
-        "geographical_extent_wkb POLYGON".to_string(),
+        format!("{extent_column} POLYGON"),
         "contact_name TEXT".to_string(),
         "contact_email_address TEXT".to_string(),
         "contact_role TEXT".to_string(),
@@ -1238,9 +1228,11 @@ fn create_metadata_table_impl(
         params![last_change, srs_id],
     )?;
     tx.execute(
-        "INSERT INTO gpkg_geometry_columns (
+        &format!(
+            "INSERT INTO gpkg_geometry_columns (
             table_name, column_name, geometry_type_name, srs_id, z, m
-         ) VALUES ('metadata', 'geographical_extent_wkb', 'POLYGON', ?1, 1, 0)",
+         ) VALUES ('metadata', '{extent_column}', 'POLYGON', ?1, 1, 0)"
+        ),
         params![srs_id],
     )?;
     Ok(())
@@ -1269,11 +1261,11 @@ fn insert_metadata_rows(
 
 fn insert_tiled_metadata_rows(
     tx: &Transaction<'_>,
-    metadata: &MetadataTable<'_>,
-    model: &CityModel,
+    table: &TiledMetadataTable<'_>,
     srs_id: i32,
-    tiles: &[GpkgTileMetadata],
 ) -> Result<()> {
+    let metadata = table.metadata();
+    let model = metadata.model();
     let insert_sql = metadata_insert_sql(metadata.schema(), true);
     let mut statement = tx.prepare(&insert_sql)?;
     let row = metadata
@@ -1284,10 +1276,10 @@ fn insert_tiled_metadata_rows(
         .values()
         .map(|value| sqlite_value_from_tabular_value(model, value?))
         .collect::<Result<Vec<_>>>()?;
-    for tile in tiles {
+    for tile in table.tiles() {
         let mut params = vec![
             SqlValue::Text(tile.tile_id.clone()),
-            SqlValue::Text(tile.gpkg_path.clone()),
+            SqlValue::Text(tile.content_path.clone()),
         ];
         params.extend(metadata_fixed_sql_values_with_extent(
             row.fixed(),
@@ -1303,7 +1295,7 @@ fn insert_tiled_metadata_rows(
 fn metadata_insert_sql(schema: &crate::TableSchema<'_>, tiled: bool) -> String {
     let mut columns = Vec::new();
     if tiled {
-        columns.extend([quote_ident("tile_id"), quote_ident("gpkg_path")]);
+        columns.extend([quote_ident("tile_id"), quote_ident("content_path")]);
     }
     columns.extend(
         [
@@ -1311,7 +1303,11 @@ fn metadata_insert_sql(schema: &crate::TableSchema<'_>, tiled: bool) -> String {
             "reference_date",
             "reference_system",
             "title",
-            "geographical_extent_wkb",
+            if tiled {
+                "geographical_extent"
+            } else {
+                "geographical_extent_wkb"
+            },
             "contact_name",
             "contact_email_address",
             "contact_role",
