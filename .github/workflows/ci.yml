@@ -11,6 +11,8 @@ jobs:
   ci-check:
     name: ${{ matrix.os }} / ${{ matrix.mode }}
     runs-on: ${{ matrix.os }}
+    env:
+      CITYJSON_CORPUS_DIR: ${{ github.workspace }}/cityjson-corpus
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +25,15 @@ jobs:
             recipe: ci-check-bundled
     steps:
       - uses: actions/checkout@v6
+
+      - name: Check out CityJSON test corpus
+        if: matrix.mode == 'proj-system'
+        uses: actions/checkout@v6
+        with:
+          repository: 3DGI/cityjson-corpus
+          ref: 8d60e38d1c11278a1689bb8162cd9199978e06b0
+          path: cityjson-corpus
+          sparse-checkout: cases/conformance/v2_0/cityjson_fake_complete
 
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
