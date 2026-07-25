@@ -167,6 +167,34 @@ struct TileExportJob {
     clip: TileClip,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum TileExportOutcome {
+    Written(TileExportJob),
+    Skipped(TileExportJob),
+    Failed(TileExportJob),
+}
+
+#[derive(Debug, Default)]
+struct TileExportSummary {
+    written: Vec<TileExportJob>,
+    skipped: Vec<TileExportJob>,
+    failed: Vec<TileExportJob>,
+}
+
+impl FromIterator<TileExportOutcome> for TileExportSummary {
+    fn from_iter<T: IntoIterator<Item = TileExportOutcome>>(outcomes: T) -> Self {
+        let mut summary = Self::default();
+        for outcome in outcomes {
+            match outcome {
+                TileExportOutcome::Written(job) => summary.written.push(job),
+                TileExportOutcome::Skipped(job) => summary.skipped.push(job),
+                TileExportOutcome::Failed(job) => summary.failed.push(job),
+            }
+        }
+        summary
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct GeographicBounds {
     west: f64,
@@ -1581,8 +1609,7 @@ trait OutputFormatBackend: Sync {
         &self,
         cli: &crate::cli::Cli,
         quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
@@ -1770,22 +1797,21 @@ impl OutputFormatBackend for Cesium3dTilesBackend {
         &self,
         cli: &crate::cli::Cli,
         quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let PreparedOutput::Cesium3dTiles(prepared) = prepared else {
             return Err("3D Tiles backend received incompatible prepared output".into());
         };
-        info!("Pruning tileset of {} failed tiles", failed_jobs.len());
-        for (i, failed) in failed_jobs.iter().enumerate() {
+        info!("Pruning tileset of {} failed tiles", summary.failed.len());
+        for (i, failed) in summary.failed.iter().enumerate() {
             debug!(
                 "{}, removing failed from the tileset: {}",
                 i, failed.content_tile_coord
             );
         }
         if cli.cesium3dtiles_implicit {
-            let content_tile_ids = content_tile_ids_from_jobs(successful_jobs);
+            let content_tile_ids = content_tile_ids_from_jobs(&summary.written);
             let subtrees = make_implicit_subtrees(
                 &mut prepared.tileset,
                 &content_tile_ids,
@@ -1794,7 +1820,7 @@ impl OutputFormatBackend for Cesium3dTilesBackend {
             info!("Writing subtrees for implicit tiling");
             write_subtrees(&prepared.subtrees_path, &subtrees)?;
         } else {
-            let failed_tiles = failed_source_tiles(&prepared.tileset, failed_jobs);
+            let failed_tiles = failed_source_tiles(&prepared.tileset, &summary.failed);
             prepared.tileset.prune(&failed_tiles, quadtree);
             write_external_tilesets_if_needed(cli, &mut prepared.tileset)?;
         }
@@ -1876,11 +1902,10 @@ impl OutputFormatBackend for ObjBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed OBJ tile outputs", failed_jobs.len());
+        info!("Skipped {} failed OBJ tile outputs", summary.failed.len());
         Ok(())
     }
 
@@ -1940,11 +1965,13 @@ impl OutputFormatBackend for CityjsonBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed CityJSON tile outputs", failed_jobs.len());
+        info!(
+            "Skipped {} failed CityJSON tile outputs",
+            summary.failed.len()
+        );
         Ok(())
     }
 
@@ -2020,13 +2047,12 @@ impl OutputFormatBackend for CityjsonseqBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Skipped {} failed CityJSONSeq tile outputs",
-            failed_jobs.len()
+            summary.failed.len()
         );
         Ok(())
     }
@@ -2085,12 +2111,11 @@ impl OutputFormatBackend for TsvBackend {
         &self,
         cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed TSV tile outputs", failed_jobs.len());
-        aggregate_tsv_metadata(&cli.output, successful_jobs)?;
+        info!("Skipped {} failed TSV tile outputs", summary.failed.len());
+        aggregate_tsv_metadata(&cli.output, &summary.written)?;
         Ok(())
     }
 
@@ -2167,22 +2192,18 @@ impl OutputFormatBackend for GpkgBackend {
         &self,
         cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Skipped {} failed GeoPackage tile outputs",
-            failed_jobs.len()
+            summary.failed.len()
         );
         let PreparedOutput::Gpkg(prepared) = prepared else {
             return Err("GeoPackage finalization received incompatible prepared output".into());
         };
-        let mut tiles = Vec::with_capacity(successful_jobs.len());
-        for job in successful_jobs {
-            if job.feature_ids.is_empty() {
-                continue;
-            }
+        let mut tiles = Vec::with_capacity(summary.written.len());
+        for job in &summary.written {
             let Some(metadata) = prepared.tile_metadata.get(&job.content_tile_coord) else {
                 return Err(format!(
                     "GeoPackage tile {} is missing its prepared metadata descriptor",
@@ -2516,13 +2537,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
-        let tiles_failed_iter = export_jobs.par_iter().map(|job| {
+        let tile_outcomes_iter = export_jobs.par_iter().map(|job| {
             if job.feature_ids.is_empty() {
                 debug!(
                     "Tile is empty ({}), skipping conversion",
                     job.content_tile_coord
                 );
-                return None;
+                return TileExportOutcome::Skipped(job.clone());
             }
             let file_name = job.content_tile_coord.to_string();
             let model = match build_tile_model_from_feature_ids(
@@ -2537,7 +2558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Failed to build CityJSON model for tile {}: {}",
                         job.content_tile_coord, error
                     );
-                    return Some(job.clone());
+                    return TileExportOutcome::Failed(job.clone());
                 }
             };
             if should_dump_debug_data(&cli) {
@@ -2554,7 +2575,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Failed to build debug CityJSONFeature stream for tile {}: {}",
                             job.content_tile_coord, error
                         );
-                        return Some(job.clone());
+                        return TileExportOutcome::Failed(job.clone());
                     }
                 };
                 if let Err(error) = write_debug_tile_input(
@@ -2566,7 +2587,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Failed to write debug CityJSONFeature stream for tile {}: {}",
                         job.content_tile_coord, error
                     );
-                    return Some(job.clone());
+                    return TileExportOutcome::Failed(job.clone());
                 }
             }
             debug!(
@@ -2580,20 +2601,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Tile {} conversion failed: {}",
                     job.content_tile_coord, error
                 );
-                return Some(job.clone());
+                return TileExportOutcome::Failed(job.clone());
             }
 
-            None
+            TileExportOutcome::Written(job.clone())
         });
 
-        let mut tiles_results: Vec<Option<TileExportJob>> = Vec::with_capacity(tiles_len + 2);
+        let mut tile_outcomes: Vec<TileExportOutcome> = Vec::with_capacity(tiles_len + 2);
         if let Some(tiles_results_path) = debug_data.tiles_results {
             info!("Loading tiles_results from {tiles_results_path:?}");
             let tiles_results_file = File::open(tiles_results_path)?;
-            tiles_results = bincode::deserialize_from(tiles_results_file)?
+            tile_outcomes = bincode::deserialize_from(tiles_results_file)?
         } else {
             info!("Converting and optimizing {tiles_len} tiles");
-            tiles_failed_iter.collect_into_vec(&mut tiles_results);
+            tile_outcomes_iter.collect_into_vec(&mut tile_outcomes);
             if should_dump_debug_data(&cli) {
                 debug!(
                     "Exporting the tiles_results instance to bincode to {:?}",
@@ -2601,27 +2622,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let outpath = debug_data_output_path.join("tiles_results.bincode");
                 let tiles_results_file = File::create(outpath)?;
-                bincode::serialize_into(tiles_results_file, &tiles_results)?;
+                bincode::serialize_into(tiles_results_file, &tile_outcomes)?;
             }
         }
-        let tiles_failed: Vec<TileExportJob> = tiles_results.into_iter().flatten().collect();
-        let failed_content_tile_coords: HashSet<TileCoord> = tiles_failed
-            .iter()
-            .map(|failed| failed.content_tile_coord.clone())
-            .collect();
-        let tiles_successful: Vec<TileExportJob> = export_jobs
-            .iter()
-            .filter(|job| !failed_content_tile_coords.contains(&job.content_tile_coord))
-            .cloned()
-            .collect();
-        info!("Done");
-        backend.finalize(
-            &cli,
-            &quadtree,
-            &tiles_successful,
-            &tiles_failed,
-            &mut prepared_output,
-        )?;
+        let summary = tile_outcomes.into_iter().collect::<TileExportSummary>();
+        info!(
+            "Done: {} written, {} skipped, {} failed",
+            summary.written.len(),
+            summary.skipped.len(),
+            summary.failed.len()
+        );
+        backend.finalize(&cli, &quadtree, &summary, &mut prepared_output)?;
     } else {
         backend.write_manifest_only(&cli, &mut prepared_output)?;
     }
