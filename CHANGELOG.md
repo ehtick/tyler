@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Tile export jobs now record explicit `Written`, `Skipped`, or `Failed` outcomes;
+  empty jobs are skipped instead of being inferred as successful. Debug replay snapshots
+  now persist these outcomes and are intentionally incompatible with older snapshots.
+- Tiled TSV and GeoPackage metadata now use one projection from the
+  `cityjson-convert` `tabular` module. Both expose `tile_id`, `content_path`, and
+  `geographical_extent`, with only format-specific text or geometry serialization
+  in their writers.
+
 - Tyler and `cityjson-convert` now use `cityjson_lib::ops::Transformer` for PROJ
   coordinate transformations instead of maintaining local PROJ wrappers.
 - Tyler resolves `cityjson-lib`, `cityjson-types`, and `cityjson-json` through
@@ -28,6 +36,7 @@
 
 ### Added
 
+- Tiled GeoPackage output in Tyler with `--format gpkg`, optional `--gpkg-*` tables, and an always-generated aggregate `metadata.gpkg`.
 - `cjconvert` can now read dataset directories, including the legacy
   `metadata.json` plus per-feature `*.city.jsonl` layout, through
   `cityjson-index`.
@@ -40,6 +49,12 @@
 
 ### Fixed
 
+- Empty tile jobs are no longer counted as successful or included in aggregate
+  metadata and implicit content availability.
+
+- Tyler now builds tiled GeoPackage metadata in memory and writes a single
+  `metadata.gpkg`, with one spatial row containing the tile ID and relative path
+  for every successfully produced tile.
 - CityJSON color selectors now report as no-op for CityJSON and CityJSONSeq
   output formats.
 - CityJSONFeature filtering no longer duplicates CityObjects when aliased

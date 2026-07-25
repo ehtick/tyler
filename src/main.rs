@@ -76,7 +76,6 @@ use crate::coordinates::RootEnuFrame;
 use crate::formats::cesium3dtiles::{Tile, TileId};
 use cityjson_lib::cityjson_types::prelude::CityObjectHandle;
 use cityjson_lib::cityjson_types::v2_0::appearance::RGB;
-use cityjson_lib::cityjson_types::v2_0::BBox;
 use cityjson_lib::ops::Transformer;
 use clap::{Parser, ValueEnum};
 use log::{debug, info, log_enabled, warn, Level};
@@ -93,6 +92,7 @@ pub enum OutputFormatKind {
     Cityjson,
     Cityjsonseq,
     Tsv,
+    Gpkg,
 }
 
 #[derive(Default, Debug)]
@@ -164,6 +164,34 @@ struct TileExportJob {
     content_tile_coord: TileCoord,
     feature_ids: Vec<usize>,
     clip: TileClip,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum TileExportOutcome {
+    Written(TileExportJob),
+    Skipped(TileExportJob),
+    Failed(TileExportJob),
+}
+
+#[derive(Debug, Default)]
+struct TileExportSummary {
+    written: Vec<TileExportJob>,
+    skipped: Vec<TileExportJob>,
+    failed: Vec<TileExportJob>,
+}
+
+impl FromIterator<TileExportOutcome> for TileExportSummary {
+    fn from_iter<T: IntoIterator<Item = TileExportOutcome>>(outcomes: T) -> Self {
+        let mut summary = Self::default();
+        for outcome in outcomes {
+            match outcome {
+                TileExportOutcome::Written(job) => summary.written.push(job),
+                TileExportOutcome::Skipped(job) => summary.skipped.push(job),
+                TileExportOutcome::Failed(job) => summary.failed.push(job),
+            }
+        }
+        summary
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -244,7 +272,18 @@ fn build_tsv_export_options(cli: &crate::cli::Cli) -> cityjson_convert::TsvExpor
         include_hierarchy: cli.tsv_include_hierarchy,
         include_cityjson_ordinal: cli.tsv_include_cityjson_ordinal,
         include_metadata: false,
-        split_semantics: cli.tsv_split_semantics,
+        include_semantics: cli.tsv_include_semantics,
+        include_address: cli.tsv_include_address,
+    }
+}
+
+fn build_gpkg_export_options(cli: &crate::cli::Cli) -> cityjson_convert::GpkgExportOptions {
+    cityjson_convert::GpkgExportOptions {
+        include_semantics: cli.gpkg_include_semantics,
+        include_address: cli.gpkg_include_address,
+        include_hierarchy: cli.gpkg_include_hierarchy,
+        include_metadata: false,
+        split_lod: cli.gpkg_split_lod,
     }
 }
 
@@ -1327,103 +1366,43 @@ fn cleanup_and_update_extents(
     Ok(model)
 }
 
-fn write_tsv_metadata_fragment(
+fn tile_metadata_extent(
+    format_name: &str,
     job: &TileExportJob,
-    model: &cityjson_lib::CityModel,
-    context: &TileWriteContext<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(&context.tsv_metadata_dir)?;
-    let mut metadata_model = model.clone();
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<[f64; 6], Box<dyn std::error::Error>> {
     let source_node_id = job.source_node_id.as_ref().ok_or_else(|| {
         format!(
-            "TSV tile {} is missing its source quadtree node",
+            "{format_name} tile {} is missing its source quadtree node",
             job.content_tile_coord
         )
     })?;
     let qtree_node_id = spatial_structs::QuadTreeNodeId::from(source_node_id);
-    let qtree_node = context.quadtree.node(&qtree_node_id).ok_or_else(|| {
+    let qtree_node = quadtree.node(&qtree_node_id).ok_or_else(|| {
         format!(
-            "TSV tile {} references missing source quadtree node {}",
+            "{format_name} tile {} references missing source quadtree node {}",
             job.content_tile_coord, qtree_node_id
         )
     })?;
-    let extent = qtree_node.bbox(&context.world.grid);
-    metadata_model
-        .metadata_mut()
-        .set_geographical_extent(BBox::new(
-            extent[0], extent[1], extent[2], extent[3], extent[4], extent[5],
-        ));
-    let metadata = cityjson_convert::tabulate_model_metadata(&metadata_model)?;
-    let output = File::create(tsv_metadata_fragment_path(
-        &context.tsv_metadata_dir,
-        &job.content_tile_coord,
-    ))?;
-    cityjson_convert::write_metadata_tsv(&metadata, output)?;
-    Ok(())
+    Ok(qtree_node.bbox(&world.grid))
 }
 
-fn aggregate_tsv_metadata(
-    output_dir: &Path,
-    successful_jobs: &[TileExportJob],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata_dir = output_dir.join(".tyler-tsv-metadata");
-    let output_file = output_dir.join("metadata.tsv");
-    let file = File::create(&output_file)?;
-    let mut writer = csv::WriterBuilder::new()
-        .delimiter(b'\t')
-        .terminator(csv::Terminator::Any(b'\n'))
-        .from_writer(file);
-    let mut wrote_header = false;
-
-    for job in successful_jobs {
-        let fragment_path = tsv_metadata_fragment_path(&metadata_dir, &job.content_tile_coord);
-        if !fragment_path.exists() {
-            continue;
-        }
-
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(b'\t')
-            .has_headers(false)
-            .from_path(&fragment_path)?;
-        let mut records = reader.records();
-        let Some(header) = records.next().transpose()? else {
-            continue;
-        };
-
-        if !wrote_header {
-            let mut aggregate_header = csv::StringRecord::from(vec!["tile_id", "cityobjects_path"]);
-            aggregate_header.extend(header.iter());
-            writer.write_record(&aggregate_header)?;
-            wrote_header = true;
-        }
-
-        for record in records {
-            let record = record?;
-            let tile_id = job.content_tile_coord.to_string();
-            let cityobjects_path = format!("t/{tile_id}/cityobjects.tsv");
-            let mut aggregate_record = csv::StringRecord::from(vec![tile_id, cityobjects_path]);
-            aggregate_record.extend(record.iter());
-            writer.write_record(&aggregate_record)?;
-        }
-    }
-
-    if !wrote_header {
-        writer.write_record(["tile_id", "cityobjects_path"])?;
-    }
-    writer.flush()?;
-
-    if metadata_dir.exists() {
-        fs::remove_dir_all(metadata_dir)?;
-    }
-    info!("Wrote aggregate TSV metadata to {}", output_file.display());
-    Ok(())
-}
-
-fn tsv_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> PathBuf {
-    metadata_dir.join(format!(
-        "{}-{}-{}.tsv",
-        tile_coord.level, tile_coord.x, tile_coord.y
-    ))
+fn tile_metadata(
+    format_name: &str,
+    job: &TileExportJob,
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<cityjson_convert::TileMetadata, Box<dyn std::error::Error>> {
+    Ok(cityjson_convert::TileMetadata {
+        tile_id: job.content_tile_coord.to_string(),
+        content_path: match format_name {
+            "TSV" => format!("t/{}/cityobjects.tsv", job.content_tile_coord),
+            "GeoPackage" => format!("t/{}.gpkg", job.content_tile_coord),
+            _ => return Err(format!("unsupported tabular format {format_name}").into()),
+        },
+        geographical_extent: tile_metadata_extent(format_name, job, world, quadtree)?,
+    })
 }
 
 fn write_debug_tile_input(
@@ -1452,7 +1431,7 @@ struct TileWriteContext<'a> {
     include_parent_attributes: bool,
     cityjson_colors: BTreeMap<String, RGB>,
     tsv_export_options: cityjson_convert::TsvExportOptions,
-    tsv_metadata_dir: PathBuf,
+    gpkg_export_options: cityjson_convert::GpkgExportOptions,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1469,12 +1448,43 @@ struct TileFilesPreparedOutput {
     source_crs: String,
 }
 
+struct TabularPreparedOutput {
+    export_jobs: Vec<TileExportJob>,
+    source_crs: String,
+    metadata_model: cityjson_lib::CityModel,
+    tile_metadata: HashMap<TileCoord, cityjson_convert::TileMetadata>,
+}
+
+fn prepare_tabular_output(
+    format_name: &str,
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<TabularPreparedOutput, Box<dyn std::error::Error>> {
+    let export_jobs = quadtree_leaf_tile_export_jobs(world, quadtree);
+    let tile_metadata = export_jobs
+        .iter()
+        .map(|job| {
+            Ok((
+                job.content_tile_coord.clone(),
+                tile_metadata(format_name, job, world, quadtree)?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+    Ok(TabularPreparedOutput {
+        export_jobs,
+        source_crs: format!("EPSG:{}", world.crs.to_epsg()?),
+        metadata_model: cityjson_lib::json::from_slice(&world.feature_base_document)?,
+        tile_metadata,
+    })
+}
+
 enum PreparedOutput {
     Cesium3dTiles(Box<Cesium3dTilesPreparedOutput>),
     Obj(TileFilesPreparedOutput),
     Cityjson(TileFilesPreparedOutput),
     Cityjsonseq(TileFilesPreparedOutput),
-    Tsv(TileFilesPreparedOutput),
+    Tsv(Box<TabularPreparedOutput>),
+    Gpkg(Box<TabularPreparedOutput>),
 }
 
 impl PreparedOutput {
@@ -1483,8 +1493,9 @@ impl PreparedOutput {
             PreparedOutput::Cesium3dTiles(prepared) => &prepared.source_crs,
             PreparedOutput::Obj(prepared)
             | PreparedOutput::Cityjson(prepared)
-            | PreparedOutput::Cityjsonseq(prepared)
-            | PreparedOutput::Tsv(prepared) => &prepared.source_crs,
+            | PreparedOutput::Cityjsonseq(prepared) => &prepared.source_crs,
+            PreparedOutput::Tsv(prepared) => &prepared.source_crs,
+            PreparedOutput::Gpkg(prepared) => &prepared.source_crs,
         }
     }
 
@@ -1494,7 +1505,8 @@ impl PreparedOutput {
             PreparedOutput::Obj(_)
             | PreparedOutput::Cityjson(_)
             | PreparedOutput::Cityjsonseq(_)
-            | PreparedOutput::Tsv(_) => None,
+            | PreparedOutput::Tsv(_)
+            | PreparedOutput::Gpkg(_) => None,
         }
     }
 }
@@ -1523,8 +1535,7 @@ trait OutputFormatBackend: Sync {
         &self,
         cli: &crate::cli::Cli,
         quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
@@ -1712,22 +1723,21 @@ impl OutputFormatBackend for Cesium3dTilesBackend {
         &self,
         cli: &crate::cli::Cli,
         quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let PreparedOutput::Cesium3dTiles(prepared) = prepared else {
             return Err("3D Tiles backend received incompatible prepared output".into());
         };
-        info!("Pruning tileset of {} failed tiles", failed_jobs.len());
-        for (i, failed) in failed_jobs.iter().enumerate() {
+        info!("Pruning tileset of {} failed tiles", summary.failed.len());
+        for (i, failed) in summary.failed.iter().enumerate() {
             debug!(
                 "{}, removing failed from the tileset: {}",
                 i, failed.content_tile_coord
             );
         }
         if cli.cesium3dtiles_implicit {
-            let content_tile_ids = content_tile_ids_from_jobs(successful_jobs);
+            let content_tile_ids = content_tile_ids_from_jobs(&summary.written);
             let subtrees = make_implicit_subtrees(
                 &mut prepared.tileset,
                 &content_tile_ids,
@@ -1736,7 +1746,7 @@ impl OutputFormatBackend for Cesium3dTilesBackend {
             info!("Writing subtrees for implicit tiling");
             write_subtrees(&prepared.subtrees_path, &subtrees)?;
         } else {
-            let failed_tiles = failed_source_tiles(&prepared.tileset, failed_jobs);
+            let failed_tiles = failed_source_tiles(&prepared.tileset, &summary.failed);
             prepared.tileset.prune(&failed_tiles, quadtree);
             write_external_tilesets_if_needed(cli, &mut prepared.tileset)?;
         }
@@ -1818,11 +1828,10 @@ impl OutputFormatBackend for ObjBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed OBJ tile outputs", failed_jobs.len());
+        info!("Skipped {} failed OBJ tile outputs", summary.failed.len());
         Ok(())
     }
 
@@ -1882,11 +1891,13 @@ impl OutputFormatBackend for CityjsonBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed CityJSON tile outputs", failed_jobs.len());
+        info!(
+            "Skipped {} failed CityJSON tile outputs",
+            summary.failed.len()
+        );
         Ok(())
     }
 
@@ -1962,13 +1973,12 @@ impl OutputFormatBackend for CityjsonseqBackend {
         &self,
         _cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        _successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Skipped {} failed CityJSONSeq tile outputs",
-            failed_jobs.len()
+            summary.failed.len()
         );
         Ok(())
     }
@@ -1992,10 +2002,9 @@ impl OutputFormatBackend for TsvBackend {
         _geometric_error_factor: f64,
         _debug_data_output_path: &Path,
     ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
-        Ok(PreparedOutput::Tsv(TileFilesPreparedOutput {
-            export_jobs: quadtree_leaf_tile_export_jobs(world, quadtree),
-            source_crs: format!("EPSG:{}", world.crs.to_epsg()?),
-        }))
+        Ok(PreparedOutput::Tsv(Box::new(prepare_tabular_output(
+            "TSV", world, quadtree,
+        )?)))
     }
 
     fn jobs(&self, prepared: &PreparedOutput) -> Vec<TileExportJob> {
@@ -2016,9 +2025,7 @@ impl OutputFormatBackend for TsvBackend {
             .join(job.content_tile_coord.to_string());
         let mut options = context.tsv_export_options.clone();
         options.include_metadata = false;
-        cityjson_convert::convert_to_tsv(model, &output_dir, &options)?;
-
-        write_tsv_metadata_fragment(job, model, context)?;
+        cityjson_convert::convert_to_tsv(model, output_dir.join("cityobjects.tsv"), &options)?;
 
         Ok(())
     }
@@ -2027,12 +2034,121 @@ impl OutputFormatBackend for TsvBackend {
         &self,
         cli: &crate::cli::Cli,
         _quadtree: &spatial_structs::QuadTree,
-        successful_jobs: &[TileExportJob],
-        failed_jobs: &[TileExportJob],
+        summary: &TileExportSummary,
+        prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Skipped {} failed TSV tile outputs", summary.failed.len());
+        let PreparedOutput::Tsv(prepared) = prepared else {
+            return Err("TSV finalization received incompatible prepared output".into());
+        };
+        let tiles = summary
+            .written
+            .iter()
+            .map(|job| {
+                prepared
+                    .tile_metadata
+                    .get(&job.content_tile_coord)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "TSV tile {} is missing its metadata descriptor",
+                            job.content_tile_coord
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let table = cityjson_convert::tabulate_tiled_metadata(&prepared.metadata_model, tiles)?;
+        let output_file = cli.output.join("metadata.tsv");
+        cityjson_convert::write_tiled_metadata_tsv(&table, File::create(&output_file)?)?;
+        info!("Wrote aggregate TSV metadata to {}", output_file.display());
+        Ok(())
+    }
+
+    fn write_manifest_only(
+        &self,
+        _cli: &crate::cli::Cli,
         _prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Skipped {} failed TSV tile outputs", failed_jobs.len());
-        aggregate_tsv_metadata(&cli.output, successful_jobs)?;
+        Ok(())
+    }
+}
+
+struct GpkgBackend;
+
+impl OutputFormatBackend for GpkgBackend {
+    fn prepare(
+        &self,
+        cli: &crate::cli::Cli,
+        world: &parser::World,
+        quadtree: &spatial_structs::QuadTree,
+        _grid_cellsize: u32,
+        _geometric_error_factor: f64,
+        _debug_data_output_path: &Path,
+    ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
+        let legacy_metadata_dir = cli.output.join(".tyler-gpkg-metadata");
+        if legacy_metadata_dir.exists() {
+            fs::remove_dir_all(&legacy_metadata_dir)?;
+        }
+
+        Ok(PreparedOutput::Gpkg(Box::new(prepare_tabular_output(
+            "GeoPackage",
+            world,
+            quadtree,
+        )?)))
+    }
+
+    fn jobs(&self, prepared: &PreparedOutput) -> Vec<TileExportJob> {
+        let PreparedOutput::Gpkg(prepared) = prepared else {
+            return Vec::new();
+        };
+        prepared.export_jobs.clone()
+    }
+
+    fn write_tile(
+        &self,
+        job: &TileExportJob,
+        model: &cityjson_lib::CityModel,
+        context: &TileWriteContext<'_>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let output_file = context
+            .output_tiles_dir
+            .join(job.content_tile_coord.to_string())
+            .with_extension("gpkg");
+        let mut options = context.gpkg_export_options.clone();
+        options.include_metadata = false;
+        cityjson_convert::convert_to_gpkg(model, &output_file, &options)?;
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        cli: &crate::cli::Cli,
+        _quadtree: &spatial_structs::QuadTree,
+        summary: &TileExportSummary,
+        prepared: &mut PreparedOutput,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        info!(
+            "Skipped {} failed GeoPackage tile outputs",
+            summary.failed.len()
+        );
+        let PreparedOutput::Gpkg(prepared) = prepared else {
+            return Err("GeoPackage finalization received incompatible prepared output".into());
+        };
+        let mut tiles = Vec::with_capacity(summary.written.len());
+        for job in &summary.written {
+            let Some(metadata) = prepared.tile_metadata.get(&job.content_tile_coord) else {
+                return Err(format!(
+                    "GeoPackage tile {} is missing its prepared metadata descriptor",
+                    job.content_tile_coord
+                )
+                .into());
+            };
+            tiles.push(metadata.clone());
+        }
+        let output_file = cli.output.join("metadata.gpkg");
+        let table = cityjson_convert::tabulate_tiled_metadata(&prepared.metadata_model, tiles)?;
+        cityjson_convert::write_tiled_metadata_gpkg(&table, &output_file)?;
+        info!("Wrote GeoPackage metadata to {}", output_file.display());
         Ok(())
     }
 
@@ -2052,6 +2168,7 @@ fn output_format_backend(kind: OutputFormatKind) -> Box<dyn OutputFormatBackend>
         OutputFormatKind::Cityjson => Box::new(CityjsonBackend),
         OutputFormatKind::Cityjsonseq => Box::new(CityjsonseqBackend),
         OutputFormatKind::Tsv => Box::new(TsvBackend),
+        OutputFormatKind::Gpkg => Box::new(GpkgBackend),
     }
 }
 
@@ -2085,7 +2202,7 @@ fn write_subtrees(
             .join(&subtree_id.to_string())
             .with_extension("subtree");
         let mut subtree_file = File::create(&out_path)
-            .unwrap_or_else(|_| panic!("could not create {:?} for writing", &out_path));
+            .unwrap_or_else(|_| panic!("could not create {:?} for writing", out_path));
         if let Err(_e) = subtree_file.write_all(subtree_bytes) {
             warn!("Failed to write subtree {} content", subtree_id);
         }
@@ -2146,11 +2263,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Begin argument parsing
     let cli = crate::cli::Cli::parse();
     cli.validate_parameter_combinations(&[cli.format])?;
-    debug!("{:?}", &cli);
+    debug!("{:?}", cli);
     info!("tyler version: {}", clap::crate_version!());
     if !cli.output.is_dir() {
         fs::create_dir_all(&cli.output)?;
-        info!("Created output directory {:#?}", &cli.output);
+        info!("Created output directory {:#?}", cli.output);
     }
     // Since we have a default value, we can safely unwrap.
     let grid_cellsize = cli.grid_cellsize.unwrap();
@@ -2257,13 +2374,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if cli.debug_dump_grid {
-        info!("Exporting the grid to TSV to {:?}", &debug_data_output_path);
+        info!("Exporting the grid to TSV to {:?}", debug_data_output_path);
         world.export_grid(cli.debug_dump_grid_features, Some(&debug_data_output_path))?;
     }
     if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the world instance to bincode to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         world.export_bincode(Some("world"), Some(&debug_data_output_path))?;
     }
@@ -2284,14 +2401,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.debug_dump_grid {
         info!(
             "Exporting the quadtree to TSV to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         quadtree.export(&world, Some(&debug_data_output_path))?;
     }
     if should_dump_debug_data(&cli) {
         debug!(
             "Exporting the quadtree instance to bincode to {:?}",
-            &debug_data_output_path
+            debug_data_output_path
         );
         quadtree.export_bincode(Some("quadtree"), Some(&debug_data_output_path))?;
     }
@@ -2316,10 +2433,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if output_format != OutputFormatKind::Cesium3dTiles || !cli.debug_cesium3dtiles_tileset_only {
         fs::create_dir_all(&path_output_tiles)?;
-        info!("Created output directory {:#?}", &path_output_tiles);
+        info!("Created output directory {:#?}", path_output_tiles);
         if should_dump_debug_data(&cli) {
             fs::create_dir_all(&path_features_input_dir)?;
-            info!("Created output directory {:#?}", &path_features_input_dir);
+            info!("Created output directory {:#?}", path_features_input_dir);
         }
 
         let geometry_placement = if let Some(root_enu_frame) = prepared_output.root_enu_frame() {
@@ -2344,17 +2461,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_parent_attributes: cli.include_parent_attributes,
             cityjson_colors: build_cityjson_object_colors(&cli),
             tsv_export_options: build_tsv_export_options(&cli),
-            tsv_metadata_dir: cli.output.join(".tyler-tsv-metadata"),
+            gpkg_export_options: build_gpkg_export_options(&cli),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();
-        let tiles_failed_iter = export_jobs.par_iter().map(|job| {
+        let tile_outcomes_iter = export_jobs.par_iter().map(|job| {
             if job.feature_ids.is_empty() {
                 debug!(
                     "Tile is empty ({}), skipping conversion",
                     job.content_tile_coord
                 );
-                return None;
+                return TileExportOutcome::Skipped(job.clone());
             }
             let file_name = job.content_tile_coord.to_string();
             let model = match build_tile_model_from_feature_ids(
@@ -2369,7 +2486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Failed to build CityJSON model for tile {}: {}",
                         job.content_tile_coord, error
                     );
-                    return Some(job.clone());
+                    return TileExportOutcome::Failed(job.clone());
                 }
             };
             if should_dump_debug_data(&cli) {
@@ -2386,7 +2503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "Failed to build debug CityJSONFeature stream for tile {}: {}",
                             job.content_tile_coord, error
                         );
-                        return Some(job.clone());
+                        return TileExportOutcome::Failed(job.clone());
                     }
                 };
                 if let Err(error) = write_debug_tile_input(
@@ -2398,7 +2515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Failed to write debug CityJSONFeature stream for tile {}: {}",
                         job.content_tile_coord, error
                     );
-                    return Some(job.clone());
+                    return TileExportOutcome::Failed(job.clone());
                 }
             }
             debug!(
@@ -2412,48 +2529,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Tile {} conversion failed: {}",
                     job.content_tile_coord, error
                 );
-                return Some(job.clone());
+                return TileExportOutcome::Failed(job.clone());
             }
 
-            None
+            TileExportOutcome::Written(job.clone())
         });
 
-        let mut tiles_results: Vec<Option<TileExportJob>> = Vec::with_capacity(tiles_len + 2);
+        let mut tile_outcomes: Vec<TileExportOutcome> = Vec::with_capacity(tiles_len + 2);
         if let Some(tiles_results_path) = debug_data.tiles_results {
             info!("Loading tiles_results from {tiles_results_path:?}");
             let tiles_results_file = File::open(tiles_results_path)?;
-            tiles_results = bincode::deserialize_from(tiles_results_file)?
+            tile_outcomes = bincode::deserialize_from(tiles_results_file)?
         } else {
             info!("Converting and optimizing {tiles_len} tiles");
-            tiles_failed_iter.collect_into_vec(&mut tiles_results);
+            tile_outcomes_iter.collect_into_vec(&mut tile_outcomes);
             if should_dump_debug_data(&cli) {
                 debug!(
                     "Exporting the tiles_results instance to bincode to {:?}",
-                    &debug_data_output_path
+                    debug_data_output_path
                 );
                 let outpath = debug_data_output_path.join("tiles_results.bincode");
                 let tiles_results_file = File::create(outpath)?;
-                bincode::serialize_into(tiles_results_file, &tiles_results)?;
+                bincode::serialize_into(tiles_results_file, &tile_outcomes)?;
             }
         }
-        let tiles_failed: Vec<TileExportJob> = tiles_results.into_iter().flatten().collect();
-        let failed_content_tile_coords: HashSet<TileCoord> = tiles_failed
-            .iter()
-            .map(|failed| failed.content_tile_coord.clone())
-            .collect();
-        let tiles_successful: Vec<TileExportJob> = export_jobs
-            .iter()
-            .filter(|job| !failed_content_tile_coords.contains(&job.content_tile_coord))
-            .cloned()
-            .collect();
-        info!("Done");
-        backend.finalize(
-            &cli,
-            &quadtree,
-            &tiles_successful,
-            &tiles_failed,
-            &mut prepared_output,
-        )?;
+        let summary = tile_outcomes.into_iter().collect::<TileExportSummary>();
+        info!(
+            "Done: {} written, {} skipped, {} failed",
+            summary.written.len(),
+            summary.skipped.len(),
+            summary.failed.len()
+        );
+        backend.finalize(&cli, &quadtree, &summary, &mut prepared_output)?;
     } else {
         backend.write_manifest_only(&cli, &mut prepared_output)?;
     }

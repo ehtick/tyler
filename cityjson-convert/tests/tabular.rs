@@ -2,10 +2,23 @@ use std::env;
 use std::path::PathBuf;
 
 use cityjson_convert::{
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType, TableSchema, Value,
+    tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_assignments, tabulate_semantic_hierarchy,
+    tabulate_semantic_primitives, tabulate_semantics, ColumnOrigin, LogicalType, PrimitiveType,
+    TableSchema, Value,
 };
+use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::json;
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
 
 /// Locates the complete `CityJSON` 2.0 conformance fixture used by the public
 /// table test.
@@ -248,7 +261,7 @@ fn borrows_source_values_and_traverses_nested_values_lazily() {
 }
 
 #[test]
-fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
+fn tabulates_cityobject_extra_without_prefix_and_resolves_case_insensitive_collisions() {
     let model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -258,7 +271,7 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
                     "type":"Building",
                     "attributes":{"name":"Library"},
                     "name":"extra-name",
-                    "cityobject_id":"extra-id"
+                    "CityObject_ID":"extra-id"
                 }
             },
             "vertices":[]
@@ -268,7 +281,7 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
     let table = tabulate_cityobjects(&model).unwrap();
 
     let extra_name = column_index(&table, "name");
-    let fixed_conflict = column_index(&table, "cityobject_id__2");
+    let fixed_conflict = column_index(&table, "CityObject_ID__2");
     assert_eq!(
         table.schema().columns[extra_name].origin,
         ColumnOrigin::Extra
@@ -286,6 +299,40 @@ fn tabulates_cityobject_extra_without_prefix_and_resolves_collisions() {
     assert!(matches!(
         row.value(fixed_conflict).unwrap().unwrap(),
         Value::Utf8("extra-id")
+    ));
+}
+
+#[test]
+fn tabulates_cityobject_attributes_with_case_insensitive_collisions() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "attributes":{
+                        "eindRegistratie":"first",
+                        "eindregistratie":"second"
+                    }
+                }
+            },
+            "vertices":[]
+        }"#,
+    )
+    .expect("parse collision CityJSON");
+    let table = tabulate_cityobjects(&model).unwrap();
+
+    let first = column_index(&table, "attributes__eindRegistratie");
+    let second = column_index(&table, "attributes__eindregistratie__2");
+    let row = table.rows().next().unwrap();
+    assert!(matches!(
+        row.value(first).unwrap().unwrap(),
+        Value::Utf8("first")
+    ));
+    assert!(matches!(
+        row.value(second).unwrap().unwrap(),
+        Value::Utf8("second")
     ));
 }
 
@@ -310,10 +357,19 @@ fn exposes_cityobject_hierarchy_as_resolved_id_lists() {
     assert_eq!(rows[0].parents().unwrap().ids(), &[] as &[&str]);
     assert_eq!(rows[1].parents().unwrap().ids(), &["building"]);
     assert_eq!(rows[1].children().unwrap().ids(), &[] as &[&str]);
+
+    let hierarchy = tabulate_cityobject_hierarchy(&model).unwrap();
+    assert_eq!(
+        hierarchy.rows().collect::<Vec<_>>(),
+        [&cityjson_convert::HierarchyRow {
+            parent_id: "building",
+            child_id: "room",
+        }]
+    );
 }
 
 #[test]
-fn tabulates_model_metadata_with_extent_wkt_and_extra_schema() {
+fn tabulates_model_metadata_with_extent_and_extra_schema() {
     let model = json::from_slice(
         br#"{
             "type":"CityJSON",
@@ -352,13 +408,9 @@ fn tabulates_model_metadata_with_extent_wkt_and_extra_schema() {
         fixed.geographical_extent,
         Some([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     );
-    assert_eq!(
-        fixed.geographical_extent_wkt.as_deref(),
-        Some("POLYGON((1 2, 4 2, 4 5, 1 5, 1 2))")
-    );
     assert_eq!(fixed.contact_name.as_deref(), Some("Ada"));
 
-    let score = schema_column_index(table.schema(), "metadata_extra__+quality__score");
+    let score = schema_column_index(table.schema(), "+quality__score");
     assert_eq!(
         table.schema().columns[score].origin,
         ColumnOrigin::MetadataExtra
@@ -406,8 +458,16 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert_eq!(second.semantic_type_name().to_string(), "WallSurface");
     assert_eq!(first.children, vec![second.semantic_id]);
     assert_eq!(second.parent, Some(first.semantic_id));
+    let hierarchy = tabulate_semantic_hierarchy(&model);
+    assert_eq!(
+        hierarchy.rows().collect::<Vec<_>>(),
+        [&cityjson_convert::SemanticHierarchyRow {
+            parent_id: first.semantic_id,
+            child_id: second.semantic_id,
+        }]
+    );
 
-    let slope = schema_column_index(table.schema(), "attributes__slope");
+    let slope = schema_column_index(table.schema(), "attribute__slope");
     assert_eq!(
         table.schema().columns[slope].origin,
         ColumnOrigin::SemanticAttributes
@@ -419,6 +479,24 @@ fn tabulates_semantic_definitions_with_attributes_and_relationships() {
     assert!(matches!(
         rows[1].value(slope).unwrap().unwrap(),
         Value::Null
+    ));
+
+    let primitives = tabulate_semantic_primitives(&model).unwrap();
+    let primitive_rows = primitives.rows().collect::<Vec<_>>();
+    assert_eq!(primitive_rows.len(), 1);
+    let primitive = primitive_rows[0].fixed();
+    assert_eq!(primitive.cityobject_id, "building");
+    assert_eq!(primitive.geometry_id, 0);
+    assert_eq!(primitive.semantic_id, Some(first.semantic_id));
+    assert_eq!(primitive.primitive_ix, 0);
+    assert_eq!(
+        primitive.semantic_type_name().unwrap().to_string(),
+        "RoofSurface"
+    );
+    let slope = schema_column_index(primitives.schema(), "attribute__slope");
+    assert!(matches!(
+        primitive_rows[0].value(slope).unwrap().unwrap(),
+        Value::UInt64(30)
     ));
 }
 
@@ -662,4 +740,184 @@ fn tabulates_resolved_geometry_instance_semantic_assignments() {
             assert_eq!(rows[0].semantic_id, Some(0));
         },
     );
+}
+
+#[test]
+fn omits_geometry_ref_attributes_from_cityobject_schema() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.attributes_mut().insert(
+        "location".to_string(),
+        OwnedAttributeValue::Geometry(geometry_handle),
+    );
+
+    let table = tabulate_cityobjects(&model).expect("tabulate CityObjects");
+
+    assert!(table
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.name != "attributes__location"));
+}
+
+#[test]
+fn serializes_geometry_attribute_values_as_wkb_hex_json() {
+    let model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiSurface",
+                        "lod":"1",
+                        "boundaries":[[[0,1,2,0]]]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0],[1,0,0],[0,1,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let expected = bytes_to_hex(
+        &cityjson_convert::tabular::geometry_ref_to_wkb(&model, geometry_handle)
+            .expect("encode geometry as WKB"),
+    );
+
+    let json = cityjson_convert::tabular::attribute_value_to_json(
+        &model,
+        &OwnedAttributeValue::Geometry(geometry_handle),
+    )
+    .expect("serialize geometry attribute");
+
+    assert_eq!(json, serde_json::Value::String(expected));
+}
+
+#[test]
+fn tabulates_address_location_separately_from_dynamic_address_columns() {
+    let mut model = json::from_slice(
+        br#"{
+            "type":"CityJSON",
+            "version":"2.0",
+            "CityObjects":{
+                "building":{
+                    "type":"Building",
+                    "geometry":[{
+                        "type":"MultiPoint",
+                        "lod":"1",
+                        "boundaries":[0]
+                    }]
+                }
+            },
+            "vertices":[[0,0,0]]
+        }"#,
+    )
+    .expect("parse inline CityJSON");
+    let geometry_handle = model
+        .cityobjects()
+        .iter()
+        .next()
+        .and_then(|(_, object)| object.geometry())
+        .and_then(|geometries| geometries.first().copied())
+        .expect("geometry handle");
+    let (_, cityobject) = model
+        .cityobjects_mut()
+        .iter_mut()
+        .next()
+        .expect("cityobject");
+    cityobject.extra_mut().insert(
+        "address".to_string(),
+        OwnedAttributeValue::Vec(vec![
+            OwnedAttributeValue::Map(std::collections::HashMap::from([
+                (
+                    "location".to_string(),
+                    OwnedAttributeValue::Geometry(geometry_handle),
+                ),
+                (
+                    "street".to_string(),
+                    OwnedAttributeValue::String("Main Street".to_string()),
+                ),
+            ])),
+            OwnedAttributeValue::Map(std::collections::HashMap::from([(
+                "street".to_string(),
+                OwnedAttributeValue::String("Second Street".to_string()),
+            )])),
+        ]),
+    );
+
+    let cityobjects = tabulate_cityobjects(&model).expect("tabulate CityObjects");
+    assert!(cityobjects
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.path.first().copied() != Some("address")));
+
+    let expected_wkb =
+        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(&model, geometry_handle)
+            .expect("encode address location as WKB");
+    let table = tabulate_addresses(&model).expect("tabulate addresses");
+    let rows = table.rows().collect::<Vec<_>>();
+    let street_column = schema_column_index(table.schema(), "street");
+
+    assert_eq!(rows.len(), 2);
+    assert!(matches!(
+        rows[0].fixed().location().unwrap(),
+        Value::GeometryRef(handle) if handle == geometry_handle
+    ));
+    assert!(matches!(rows[1].fixed().location().unwrap(), Value::Null));
+    assert_eq!(
+        cityjson_convert::tabular::geometry_ref_to_multipoint_wkb(table.model(), geometry_handle)
+            .unwrap(),
+        expected_wkb
+    );
+    assert!(matches!(
+        rows[0].value(street_column).unwrap().unwrap(),
+        Value::Utf8("Main Street")
+    ));
+    assert!(matches!(
+        rows[1].value(street_column).unwrap().unwrap(),
+        Value::Utf8("Second Street")
+    ));
+    assert!(table
+        .schema()
+        .columns
+        .iter()
+        .all(|column| column.name != "location"));
+    assert_ne!(bytes_to_hex(&expected_wkb), "0");
 }

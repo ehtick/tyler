@@ -1,19 +1,19 @@
-use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use cityjson_lib::cityjson_types::v2_0::OwnedAttributeValue;
 use cityjson_lib::CityModel;
 use csv::Terminator;
-use serde_json::{json, Map};
 
 use crate::{
-    tabulate_cityobjects, tabulate_model_metadata, tabulate_semantic_assignments,
-    tabulate_semantics, CityObjectTable, IdList, MetadataRow, MetadataTable, SemanticAssignmentRow,
-    SemanticAssignmentTable, SemanticTable, Value,
+    tabular::{value_to_text_cell, TextCell},
+    tabulate_addresses, tabulate_cityobject_hierarchy, tabulate_cityobjects,
+    tabulate_model_metadata, tabulate_semantic_hierarchy, tabulate_semantic_primitives,
+    AddressTable, CityObjectHierarchyTable, CityObjectTable, MetadataRow, MetadataTable,
+    SemanticHierarchyTable, SemanticPrimitiveRow, SemanticPrimitiveTable, TiledMetadataTable,
+    Value,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -23,7 +23,8 @@ pub struct TsvExportOptions {
     pub include_hierarchy: bool,
     pub include_cityjson_ordinal: bool,
     pub include_metadata: bool,
-    pub split_semantics: bool,
+    pub include_semantics: bool,
+    pub include_address: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -33,7 +34,10 @@ pub struct TsvWriteOptions {
     pub include_cityjson_ordinal: bool,
 }
 
-/// Converts a `CityJSON` model to TSV files in an output directory.
+/// Converts a `CityJSON` model to TSV files.
+///
+/// The requested output file receives the `CityObject` table. Optional tables
+/// are written beside it using the output stem, for example `model_metadata.tsv`.
 ///
 /// # Errors
 ///
@@ -41,11 +45,13 @@ pub struct TsvWriteOptions {
 /// cannot be resolved or serialized.
 pub fn convert_to_tsv<P: AsRef<Path>>(
     model: &CityModel,
-    output_dir: P,
+    output: P,
     options: &TsvExportOptions,
 ) -> Result<()> {
-    let output_dir = output_dir.as_ref();
-    fs::create_dir_all(output_dir)?;
+    let output = output.as_ref();
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
 
     let write_options = TsvWriteOptions {
         include_null_rows: options.include_null_rows,
@@ -54,23 +60,46 @@ pub fn convert_to_tsv<P: AsRef<Path>>(
     };
 
     let cityobjects = tabulate_cityobjects(model)?;
-    let mut file = File::create(output_dir.join("cityobjects.tsv"))?;
+    let mut file = File::create(output)?;
     write_cityobjects_tsv(&cityobjects, &write_options, &mut file)?;
+
+    if options.include_hierarchy {
+        let hierarchy = tabulate_cityobject_hierarchy(model)?;
+        let mut file = File::create(sidecar_path(output, "cityobject_hierarchy"))?;
+        write_cityobject_hierarchy_tsv(&hierarchy, &mut file)?;
+
+        let hierarchy = tabulate_semantic_hierarchy(model);
+        let mut file = File::create(sidecar_path(output, "semantic_hierarchy"))?;
+        write_semantic_hierarchy_tsv(&hierarchy, &mut file)?;
+    }
 
     if options.include_metadata {
         let metadata = tabulate_model_metadata(model)?;
-        let mut file = File::create(output_dir.join("metadata.tsv"))?;
+        let mut file = File::create(sidecar_path(output, "metadata"))?;
         write_metadata_tsv(&metadata, &mut file)?;
     }
 
-    if options.split_semantics {
-        let semantics = tabulate_semantics(model)?;
-        let assignments = tabulate_semantic_assignments(model)?;
-        let mut file = File::create(output_dir.join("semantics.tsv"))?;
-        write_split_semantics_tsv(&semantics, &assignments, &write_options, &mut file)?;
+    if options.include_address {
+        let addresses = tabulate_addresses(model)?;
+        let mut file = File::create(sidecar_path(output, "addresses"))?;
+        write_addresses_tsv(&addresses, &write_options, &mut file)?;
+    }
+
+    if options.include_semantics {
+        let semantics = tabulate_semantic_primitives(model)?;
+        let mut file = File::create(sidecar_path(output, "semantics"))?;
+        write_semantics_tsv(&semantics, &write_options, &mut file)?;
     }
 
     Ok(())
+}
+
+fn sidecar_path(output: &Path, suffix: &str) -> std::path::PathBuf {
+    let stem = output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("cityobjects");
+    output.with_file_name(format!("{stem}_{suffix}.tsv"))
 }
 
 /// Writes `CityObject` rows as TSV.
@@ -88,9 +117,6 @@ pub fn write_cityobjects_tsv<W: Write>(
     if options.include_cityjson_ordinal {
         header.push("cityobject_ix".to_string());
     }
-    if options.include_hierarchy {
-        header.extend(["parents".to_string(), "children".to_string()]);
-    }
     header.extend(
         table
             .schema()
@@ -101,7 +127,7 @@ pub fn write_cityobjects_tsv<W: Write>(
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let dynamic = dynamic_cells(row.values()).with_context(|| {
+        let dynamic = dynamic_cells(table.model(), row.values()).with_context(|| {
             format!(
                 "resolve dynamic values for CityObject {}",
                 row.cityobject_id
@@ -118,11 +144,82 @@ pub fn write_cityobjects_tsv<W: Write>(
         if options.include_cityjson_ordinal {
             record.push(row.cityobject_ix.to_string());
         }
-        if options.include_hierarchy {
-            record.push(id_list_cell(&row.parents()?)?);
-            record.push(id_list_cell(&row.children()?)?);
-        }
         record.extend(dynamic.into_iter().map(|cell| cell.text));
+        tsv.write_record(record)?;
+    }
+
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes `CityObject` hierarchy edges as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails.
+pub fn write_cityobject_hierarchy_tsv<W: Write>(
+    table: &CityObjectHierarchyTable<'_>,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    tsv.write_record(["parent_id", "child_id"])?;
+    for row in table.rows() {
+        tsv.write_record([row.parent_id, row.child_id])?;
+    }
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes semantic hierarchy edges as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails.
+pub fn write_semantic_hierarchy_tsv<W: Write>(
+    table: &SemanticHierarchyTable,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    tsv.write_record(["parent_id", "child_id"])?;
+    for row in table.rows() {
+        tsv.write_record([row.parent_id.to_string(), row.child_id.to_string()])?;
+    }
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes address rows as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails or address values cannot be resolved.
+pub fn write_addresses_tsv<W: Write>(
+    table: &AddressTable<'_>,
+    _options: &TsvWriteOptions,
+    writer: W,
+) -> Result<()> {
+    let mut tsv = tsv_writer(writer);
+    let mut header = vec!["cityobject_id".to_string(), "cityobject_type".to_string()];
+    header.extend(
+        table
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.clone()),
+    );
+    tsv.write_record(header)?;
+
+    for row in table.rows() {
+        let fixed = row.fixed();
+        let mut record = vec![
+            fixed.cityobject_id.to_string(),
+            fixed.cityobject_type_name().to_string(),
+        ];
+        record.extend(
+            dynamic_cells(table.model(), row.values())?
+                .into_iter()
+                .map(|cell| cell.text),
+        );
         tsv.write_record(record)?;
     }
 
@@ -148,9 +245,9 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let mut record = metadata_fixed_cells(row.fixed())?;
+        let mut record = metadata_fixed_cells(row.fixed());
         record.extend(
-            dynamic_cells(row.values())?
+            dynamic_cells(table.model(), row.values())?
                 .into_iter()
                 .map(|cell| cell.text),
         );
@@ -161,21 +258,68 @@ pub fn write_metadata_tsv<W: Write>(table: &MetadataTable<'_>, writer: W) -> Res
     Ok(())
 }
 
-/// Writes semantic definitions as TSV.
+/// Writes format-independent tiled metadata as TSV.
 ///
 /// # Errors
 ///
-/// Returns an error when writing fails or a row value cannot be resolved.
-pub fn write_semantic_definitions_tsv<W: Write>(
-    table: &SemanticTable<'_>,
-    options: &TsvWriteOptions,
+/// Returns an error when writing fails or a metadata value cannot be resolved.
+pub fn write_tiled_metadata_tsv<W: Write>(table: &TiledMetadataTable<'_>, writer: W) -> Result<()> {
+    let metadata = table.metadata();
+    let mut tsv = tsv_writer(writer);
+    let mut header = vec![
+        "tile_id".to_string(),
+        "content_path".to_string(),
+        "geographical_extent".to_string(),
+    ];
+    let mut metadata_header = metadata_fixed_header();
+    metadata_header.remove(4);
+    header.extend(metadata_header);
+    header.extend(
+        metadata
+            .schema()
+            .columns
+            .iter()
+            .map(|column| column.name.clone()),
+    );
+    tsv.write_record(header)?;
+
+    let row = metadata
+        .rows()
+        .next()
+        .context("metadata projection contains no rows")?;
+    let mut fixed_cells = metadata_fixed_cells(row.fixed());
+    fixed_cells.remove(4);
+    let dynamic = dynamic_cells(metadata.model(), row.values())?
+        .into_iter()
+        .map(|cell| cell.text)
+        .collect::<Vec<_>>();
+    for tile in table.tiles() {
+        let mut record = vec![
+            tile.tile_id.clone(),
+            tile.content_path.clone(),
+            bbox_wkt_2d(tile.geographical_extent),
+        ];
+        record.extend(fixed_cells.iter().cloned());
+        record.extend(dynamic.iter().cloned());
+        tsv.write_record(record)?;
+    }
+    tsv.flush()?;
+    Ok(())
+}
+
+/// Writes semantic primitive rows as TSV.
+///
+/// # Errors
+///
+/// Returns an error when writing fails or semantic attribute values cannot be
+/// resolved.
+pub fn write_semantics_tsv<W: Write>(
+    table: &SemanticPrimitiveTable<'_>,
+    _options: &TsvWriteOptions,
     writer: W,
 ) -> Result<()> {
     let mut tsv = tsv_writer(writer);
-    let mut header = vec!["semantic_id".to_string(), "semantic_type".to_string()];
-    if options.include_hierarchy {
-        header.extend(["parent".to_string(), "children".to_string()]);
-    }
+    let mut header = semantic_primitive_header();
     header.extend(
         table
             .schema()
@@ -186,119 +330,15 @@ pub fn write_semantic_definitions_tsv<W: Write>(
     tsv.write_record(header)?;
 
     for row in table.rows() {
-        let dynamic = dynamic_cells(row.values())?;
-        if !options.include_null_rows && all_null(&dynamic) {
-            continue;
-        }
-
         let fixed = row.fixed();
-        let mut record = vec![
-            fixed.semantic_id.to_string(),
-            fixed.semantic_type_name().to_string(),
-        ];
-        if options.include_hierarchy {
-            record.push(optional_u64_cell(fixed.parent));
-            record.push(serde_json::to_string(&fixed.children)?);
-        }
-        record.extend(dynamic.into_iter().map(|cell| cell.text));
-        tsv.write_record(record)?;
-    }
+        let dynamic = dynamic_cells(table.model(), row.values()).with_context(|| {
+            format!(
+                "resolve dynamic values for semantic primitive {} on CityObject {}",
+                fixed.primitive_ix, fixed.cityobject_id
+            )
+        })?;
 
-    tsv.flush()?;
-    Ok(())
-}
-
-/// Writes semantic assignment rows as TSV.
-///
-/// # Errors
-///
-/// Returns an error when writing fails.
-pub fn write_semantic_assignments_tsv<W: Write>(
-    table: &SemanticAssignmentTable<'_>,
-    options: &TsvWriteOptions,
-    writer: W,
-) -> Result<()> {
-    let mut tsv = tsv_writer(writer);
-    tsv.write_record(semantic_assignment_header(options.include_cityjson_ordinal))?;
-
-    for row in table.rows() {
-        if !options.include_null_rows && row.semantic_id.is_none() {
-            continue;
-        }
-        tsv.write_record(semantic_assignment_cells(
-            row,
-            options.include_cityjson_ordinal,
-        ))?;
-    }
-
-    tsv.flush()?;
-    Ok(())
-}
-
-/// Writes semantic assignment rows joined to semantic definition attributes.
-///
-/// # Errors
-///
-/// Returns an error when writing fails or semantic values cannot be resolved.
-pub fn write_split_semantics_tsv<W: Write>(
-    semantics: &SemanticTable<'_>,
-    assignments: &SemanticAssignmentTable<'_>,
-    options: &TsvWriteOptions,
-    writer: W,
-) -> Result<()> {
-    let semantic_rows = semantics.rows().collect::<Vec<_>>();
-    let semantic_by_id = semantic_rows
-        .iter()
-        .copied()
-        .map(|row| (row.fixed().semantic_id, row))
-        .collect::<HashMap<_, _>>();
-
-    let mut tsv = tsv_writer(writer);
-    let mut header = semantic_assignment_header(options.include_cityjson_ordinal);
-    header.push("semantic_type".to_string());
-    if options.include_hierarchy {
-        header.extend(["parent".to_string(), "children".to_string()]);
-    }
-    header.extend(
-        semantics
-            .schema()
-            .columns
-            .iter()
-            .map(|column| column.name.clone()),
-    );
-    tsv.write_record(header)?;
-
-    for assignment in assignments.rows() {
-        let semantic = assignment
-            .semantic_id
-            .and_then(|semantic_id| semantic_by_id.get(&semantic_id).copied());
-        let dynamic = match semantic {
-            Some(row) => dynamic_cells(row.values()).with_context(|| {
-                format!(
-                    "resolve dynamic values for semantic {}",
-                    row.fixed().semantic_id
-                )
-            })?,
-            None => null_cells(semantics.schema().columns.len()),
-        };
-        if !options.include_null_rows && all_null(&dynamic) {
-            continue;
-        }
-
-        let mut record = semantic_assignment_cells(assignment, options.include_cityjson_ordinal);
-        if let Some(row) = semantic {
-            let fixed = row.fixed();
-            record.push(fixed.semantic_type_name().to_string());
-            if options.include_hierarchy {
-                record.push(optional_u64_cell(fixed.parent));
-                record.push(serde_json::to_string(&fixed.children)?);
-            }
-        } else {
-            record.push(String::new());
-            if options.include_hierarchy {
-                record.extend([String::new(), String::new()]);
-            }
-        }
+        let mut record = semantic_primitive_cells(fixed);
         record.extend(dynamic.into_iter().map(|cell| cell.text));
         tsv.write_record(record)?;
     }
@@ -314,126 +354,18 @@ fn tsv_writer<W: Write>(writer: W) -> csv::Writer<W> {
         .from_writer(writer)
 }
 
-#[derive(Clone, Debug)]
-struct Cell {
-    text: String,
-    is_null: bool,
-}
-
 fn dynamic_cells<'value, 'model: 'value>(
+    model: &'model CityModel,
     values: impl IntoIterator<Item = Result<Value<'value, 'model>>>,
-) -> Result<Vec<Cell>> {
+) -> Result<Vec<TextCell>> {
     values
         .into_iter()
-        .map(|value| Cell::try_from(value?))
+        .map(|value| value_to_text_cell(model, value?))
         .collect::<Result<Vec<_>>>()
 }
 
-fn null_cells(count: usize) -> Vec<Cell> {
-    (0..count)
-        .map(|_| Cell {
-            text: String::new(),
-            is_null: true,
-        })
-        .collect()
-}
-
-fn all_null(cells: &[Cell]) -> bool {
+fn all_null(cells: &[TextCell]) -> bool {
     cells.iter().all(|cell| cell.is_null)
-}
-
-impl TryFrom<Value<'_, '_>> for Cell {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Value<'_, '_>) -> Result<Self> {
-        Ok(match value {
-            Value::Null => Self {
-                text: String::new(),
-                is_null: true,
-            },
-            Value::Boolean(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::UInt64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Int64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Float64(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            Value::Utf8(value) => Self {
-                text: value.to_string(),
-                is_null: false,
-            },
-            nested => Self {
-                text: serde_json::to_string(&value_to_json(nested)?)?,
-                is_null: false,
-            },
-        })
-    }
-}
-
-fn value_to_json(value: Value<'_, '_>) -> Result<serde_json::Value> {
-    Ok(match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(value) => json!(value),
-        Value::UInt64(value) => json!(value),
-        Value::Int64(value) => json!(value),
-        Value::Float64(value) => json!(value),
-        Value::Utf8(value) => json!(value),
-        Value::GeometryRef(value) => json!(value.raw_parts().0),
-        Value::Json(value) => attribute_value_to_json(value)?,
-        Value::List(values) => {
-            let mut items = Vec::with_capacity(values.len());
-            for item in values.iter() {
-                items.push(value_to_json(item?)?);
-            }
-            serde_json::Value::Array(items)
-        }
-        Value::Struct(values) => {
-            let mut fields = Map::new();
-            for field in values.fields() {
-                let (name, value) = field?;
-                fields.insert(name.to_string(), value_to_json(value)?);
-            }
-            serde_json::Value::Object(fields)
-        }
-    })
-}
-
-fn attribute_value_to_json(value: &OwnedAttributeValue) -> Result<serde_json::Value> {
-    Ok(match value {
-        OwnedAttributeValue::Null => serde_json::Value::Null,
-        OwnedAttributeValue::Bool(value) => json!(value),
-        OwnedAttributeValue::Unsigned(value) => json!(value),
-        OwnedAttributeValue::Integer(value) => json!(value),
-        OwnedAttributeValue::Float(value) => json!(value),
-        OwnedAttributeValue::String(value) => json!(value),
-        OwnedAttributeValue::Vec(values) => values
-            .iter()
-            .map(attribute_value_to_json)
-            .collect::<Result<Vec<_>>>()?
-            .into(),
-        OwnedAttributeValue::Map(values) => {
-            let mut fields = Map::new();
-            for (name, value) in values {
-                fields.insert(name.clone(), attribute_value_to_json(value)?);
-            }
-            serde_json::Value::Object(fields)
-        }
-        OwnedAttributeValue::Geometry(value) => json!(value.raw_parts().0),
-        unsupported => anyhow::bail!("unsupported attribute value variant {unsupported}"),
-    })
-}
-
-fn id_list_cell(ids: &IdList<'_>) -> Result<String> {
-    Ok(serde_json::to_string(ids.ids())?)
 }
 
 fn metadata_fixed_header() -> Vec<String> {
@@ -442,7 +374,6 @@ fn metadata_fixed_header() -> Vec<String> {
         "reference_date",
         "reference_system",
         "title",
-        "geographical_extent",
         "geographical_extent_wkt",
         "contact_name",
         "contact_email_address",
@@ -457,17 +388,13 @@ fn metadata_fixed_header() -> Vec<String> {
     .collect()
 }
 
-fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Result<Vec<String>> {
-    Ok(vec![
+fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Vec<String> {
+    vec![
         option_string_cell(row.identifier.as_deref()),
         option_string_cell(row.reference_date.as_deref()),
         option_string_cell(row.reference_system.as_deref()),
         option_string_cell(row.title.as_deref()),
-        row.geographical_extent
-            .map(|bbox| serde_json::to_string(&bbox))
-            .transpose()?
-            .unwrap_or_default(),
-        option_string_cell(row.geographical_extent_wkt.as_deref()),
+        row.geographical_extent.map(bbox_wkt_2d).unwrap_or_default(),
         option_string_cell(row.contact_name.as_deref()),
         option_string_cell(row.contact_email_address.as_deref()),
         option_string_cell(row.contact_role.as_deref()),
@@ -475,45 +402,42 @@ fn metadata_fixed_cells(row: &MetadataRow<'_>) -> Result<Vec<String>> {
         option_string_cell(row.contact_type.as_deref()),
         option_string_cell(row.contact_phone.as_deref()),
         option_string_cell(row.contact_organization.as_deref()),
-    ])
+    ]
 }
 
-fn semantic_assignment_header(include_cityobject_ix: bool) -> Vec<String> {
-    let mut header = vec!["semantic_id".to_string(), "cityobject_id".to_string()];
-    if include_cityobject_ix {
-        header.push("cityobject_ix".to_string());
-    }
-    header.extend(
-        [
-            "geometry_ix",
-            "geometry_type",
-            "geometry_lod",
-            "primitive_ix",
-        ]
-        .into_iter()
-        .map(str::to_string),
-    );
-    header
+fn bbox_wkt_2d([min_x, min_y, _, max_x, max_y, _]: [f64; 6]) -> String {
+    format!(
+        "POLYGON(({min_x} {min_y}, {max_x} {min_y}, {max_x} {max_y}, {min_x} {max_y}, {min_x} {min_y}))"
+    )
 }
 
-fn semantic_assignment_cells(
-    row: &SemanticAssignmentRow<'_>,
-    include_cityobject_ix: bool,
-) -> Vec<String> {
-    let mut cells = vec![
-        optional_u64_cell(row.semantic_id),
+fn semantic_primitive_header() -> Vec<String> {
+    [
+        "cityobject_id",
+        "geometry_id",
+        "semantic_id",
+        "primitive_ix",
+        "geometry_type",
+        "geometry_lod",
+        "semantic_type",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn semantic_primitive_cells(row: &SemanticPrimitiveRow<'_>) -> Vec<String> {
+    vec![
         row.cityobject_id.to_string(),
-    ];
-    if include_cityobject_ix {
-        cells.push(row.cityobject_ix.to_string());
-    }
-    cells.extend([
-        row.geometry_ix.to_string(),
+        row.geometry_id.to_string(),
+        optional_u64_cell(row.semantic_id),
+        row.primitive_ix.to_string(),
         row.geometry_type.to_string(),
         option_string_cell(row.geometry_lod.as_deref()),
-        row.primitive_ix.to_string(),
-    ]);
-    cells
+        row.semantic_type_name()
+            .map(|semantic_type| semantic_type.to_string())
+            .unwrap_or_default(),
+    ]
 }
 
 fn option_string_cell(value: Option<&str>) -> String {

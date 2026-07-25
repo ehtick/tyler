@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use cityjson_convert::{
     convert_to_cityjson, convert_to_cityjsonseq, convert_to_glb, convert_to_obj, convert_to_tsv,
-    CityJsonSeqExportOptions, ExportOptions, GeometryPlacement, JsonExportOptions,
-    ObjExportOptions, TsvExportOptions,
+    CityJsonSeqExportOptions, ExportOptions, GeometryPlacement, GpkgExportOptions,
+    JsonExportOptions, ObjExportOptions, TsvExportOptions,
 };
 use cityjson_lib::json;
 use clap::{Args, Parser, ValueEnum};
@@ -23,6 +23,7 @@ enum OutputFormat {
     Cityjson,
     Cityjsonseq,
     Tsv,
+    Gpkg,
 }
 
 #[derive(Parser, Debug)]
@@ -51,6 +52,9 @@ struct Cli {
     /// Metadata class name for `EXT_structural_metadata`.
     #[arg(long = "3dtiles-metadata-class", default_value = "cityobject")]
     metadata_class_name: String,
+    // GeoPackage options.
+    #[command(flatten)]
+    gpkg: GpkgCliOptions,
     /// TSV row-shape options.
     #[command(flatten)]
     tsv_rows: TsvRowCliOptions,
@@ -78,8 +82,48 @@ struct TsvFileCliOptions {
     #[arg(long = "tsv-include-metadata", default_value_t = false)]
     tsv_include_metadata: bool,
     /// Write a separate TSV semantics file joined from primitive assignments.
-    #[arg(long = "tsv-split-semantics", default_value_t = false)]
-    tsv_split_semantics: bool,
+    #[arg(long = "tsv-include-semantics", default_value_t = false)]
+    tsv_include_semantics: bool,
+    /// Write `CityObject` extra.address values to addresses.tsv.
+    #[arg(long = "tsv-include-address", default_value_t = false)]
+    tsv_include_address: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgCliOptions {
+    #[command(flatten)]
+    semantics: GpkgSemanticCliOptions,
+    #[command(flatten)]
+    address: GpkgAddressCliOptions,
+    #[command(flatten)]
+    metadata: GpkgMetadataCliOptions,
+    /// Split feature layers by `CityObject` type, geometry family, and `CityJSON` `LoD`.
+    #[arg(long = "gpkg-split-lod", default_value_t = false)]
+    split_lod: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgSemanticCliOptions {
+    /// Add a `semantics` feature layer containing semantic primitive rows.
+    #[arg(long = "gpkg-include-semantics", default_value_t = false)]
+    include_semantics: bool,
+    /// Add the non-spatial `cityobject_hierarchy` and `semantic_hierarchy` tables.
+    #[arg(long = "gpkg-include-hierarchy", default_value_t = false)]
+    include_hierarchy: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgAddressCliOptions {
+    /// Add an `addresses` feature layer from `CityObject.extra.address` values.
+    #[arg(long = "gpkg-include-address", default_value_t = false)]
+    include_address: bool,
+}
+
+#[derive(Args, Debug, Default)]
+struct GpkgMetadataCliOptions {
+    /// Export source `CityJSON` metadata through the `GeoPackage` metadata extension.
+    #[arg(long = "gpkg-include-metadata", default_value_t = false)]
+    include_source: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -133,6 +177,19 @@ fn main() -> anyhow::Result<()> {
             )?;
             info!("CityJSONSeq written to {}", cli.output.display());
         }
+        OutputFormat::Gpkg => {
+            let model = read_model(&cli.input)?;
+            let options = GpkgExportOptions {
+                include_semantics: cli.gpkg.semantics.include_semantics,
+                include_address: cli.gpkg.address.include_address,
+                include_hierarchy: cli.gpkg.semantics.include_hierarchy,
+                include_metadata: cli.gpkg.metadata.include_source,
+                split_lod: cli.gpkg.split_lod,
+            };
+            info!("Converting to GeoPackage");
+            cityjson_convert::convert_to_gpkg(&model, &cli.output, &options)?;
+            info!("GeoPackage written to {}", cli.output.display());
+        }
         OutputFormat::Tsv => {
             let model = json::from_file(&cli.input)?;
             let options = TsvExportOptions {
@@ -140,7 +197,8 @@ fn main() -> anyhow::Result<()> {
                 include_hierarchy: cli.tsv_rows.tsv_include_hierarchy,
                 include_cityjson_ordinal: cli.tsv_rows.tsv_include_cityjson_ordinal,
                 include_metadata: cli.tsv_files.tsv_include_metadata,
-                split_semantics: cli.tsv_files.tsv_split_semantics,
+                include_semantics: cli.tsv_files.tsv_include_semantics,
+                include_address: cli.tsv_files.tsv_include_address,
             };
             info!("Converting to TSV");
             convert_to_tsv(&model, &cli.output, &options)?;

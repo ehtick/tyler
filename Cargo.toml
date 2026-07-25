@@ -47,6 +47,9 @@ proj-bundled = [
     "cityjson-convert/proj-bundled",
 ]
 
+[dev-dependencies]
+rusqlite = "0.37.0"
+
 [workspace]
 members = [".", "cityjson-convert"]
 resolver = "2"

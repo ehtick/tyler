@@ -59,7 +59,7 @@ feature layers and extends `cityobjects` with geometry identity.
 | `cityobject_id`   | `Utf8`          | yes      | owning CityObject id                                    |
 | `cityobject_ix`   | `UInt64`        | yes      | owning CityObject ordinal                               |
 | `cityobject_type` | `Utf8`          | yes      | owning CityObject type                                  |
-| `geometry_ix`     | `UInt64`        | yes      | geometry index within the CityObject                    |
+| `geometry_id`     | `UInt64`        | yes      | stable geometry resource id within the projected model/export |
 | `geometry_type`   | `Utf8`          | yes      | CityJSON geometry type                                  |
 | `lod`             | `Utf8`          | no       | CityJSON LoD value                                      |
 | `geom`            | format geometry | yes      | physical geometry column, if the format stores geometry |
@@ -75,12 +75,16 @@ GeoPackage uses this row schema with the physical columns required by
 
 One row per exported semantic primitive when Tyler splits semantics.
 
+`geometry_id` and `semantic_id` are resource ids that are stable within one
+projected model/export. They are not guaranteed to be stable across unrelated
+conversions unless the input and resource allocation order are unchanged.
+
 | Logical field   | Type            | Required | Source                                     |
 |-----------------|-----------------|----------|--------------------------------------------|
-| `semantic_id`   | `UInt64`        | yes      | stable semantic row ordinal                |
+| `semantic_id`   | `UInt64`        | yes      | stable semantic resource id within the projected model/export |
 | `cityobject_id` | `Utf8`          | yes      | owning CityObject id                       |
 | `cityobject_ix` | `UInt64`        | yes      | owning CityObject ordinal                  |
-| `geometry_ix`   | `UInt64`        | yes      | owning geometry index                      |
+| `geometry_id`   | `UInt64`        | yes      | owning geometry resource id within the projected model/export |
 | `geometry_type` | `Utf8`          | yes      | resolved CityJSON geometry type            |
 | `geometry_lod`  | `Utf8`          | no       | CityJSON LoD value                         |
 | `primitive_ix`  | `UInt64`        | yes      | semantic primitive index within geometry   |
@@ -221,10 +225,13 @@ cityobjects.attributes.tags: List<Utf8>
 cityobjects.attributes.mixed: Json
 ```
 
-Addresses use the same projection rules as other attributes. A stable address
-object can therefore produce typed projected fields. It only becomes compact
-JSON text when the address path is inferred as logical `Json` or when a physical
-format cannot represent a projected field directly.
+Geometry-valued attribute values are ignored by normal tabular serializers.
+The only supported geometry-valued attribute path is `CityObject.extra.address.location`,
+which must reference a `MultiPoint` geometry. When address splitting is enabled,
+addresses are written to a separate address output: TSV uses a `location_wkb`
+hex ISO WKB column, and GeoPackage uses a registered `MULTIPOINT` geometry
+layer. Non-geometry address fields use the same flattened projection rules as
+other dynamic values, excluding the `location` field from ordinary columns.
 
 #### 3DBAG
 
@@ -261,7 +268,7 @@ Output with `split-semantics` enabled creates a separate semantics table:
   attributes values.
 - CityObject and Semantic hierarchy is opt-in with the `--tsv-include-hierarchy` flag.
 - The `--tsv-include-cityjson-ordinal` flag adds the `cityjson_ix` field to the TSV output.
-- Tyler always writes aggregate metadata for TSV output to `metadata.tsv`. It appends the Metadata of each TSV tile to a single Metadata file and includes the WKT of the file extent for each tile.
+- Tyler projects tiled metadata once in the `tabular` module for both TSV and GeoPackage. Both expose `tile_id`, `content_path`, and `geographical_extent`; TSV serializes the extent as WKT and GeoPackage as a registered polygon geometry. Only written tiles receive rows.
 
 ## Consequences
 

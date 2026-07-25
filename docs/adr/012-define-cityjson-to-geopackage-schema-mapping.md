@@ -36,19 +36,16 @@ hierarchy are written as separate attributes tables.
 
 ### Coordinates and CRS
 
-CityJSON coordinates are transformed before export:
-
-```text
-real_world_coordinate = vertex * transform.scale + transform.translate
-```
-
-The GeoPackage stores real-world XYZ coordinates directly. The CityJSON
-`transform` object is not written because it has already been applied.
+The GeoPackage stores real-world XYZ coordinates directly.
+The CityJSON `transform` object is not written because it has already been applied when
+deserializing a CityJSON document into a `CityModel`.
 
 The GeoPackage uses one CRS for all feature layers. The CRS is stored in
-`gpkg_spatial_ref_sys` and referenced by `gpkg_geometry_columns`. If the input
-CRS is missing or ambiguous, the converter must require an explicit output CRS.
-Use the GeoPackage WKT CRS extension when needed for an accurate CRS definition.
+`gpkg_spatial_ref_sys` and referenced by `gpkg_geometry_columns`. The source `metadata.referenceSystem` must contain a parseable EPSG identifier.
+Missing or non-EPSG source CRS metadata is rejected before the converter creates,
+removes, or modifies the requested output path. The converter does not provide an
+output CRS override because relabelling coordinates would produce misleading GIS
+data. Use the GeoPackage WKT CRS extension for the declared source EPSG CRS.
 
 ### Layer Model
 
@@ -163,17 +160,19 @@ The intended scalar mapping is:
 | `Int64`       | `INTEGER`       |
 | `Float64`     | `REAL`          |
 | `Utf8`        | `TEXT`          |
-| `GeometryRef` | `TEXT`          |
+| `GeometryRef` | ignored in normal attribute columns |
 | `Json`        | `TEXT`          |
 
 `Null` contributes nullability but does not by itself require a non-null
 physical type. Extension-defined CityObject types are exported like normal
 CityObject types.
 
-CityJSON addresses use the same projection rules as other attributes. A stable
-address object can produce typed flattened address columns. It only becomes
-compact JSON `TEXT` when the address path is inferred as logical `Json` or
-cannot be represented by the GeoPackage physical rules.
+Geometry-valued attribute values are ignored in normal GeoPackage feature
+attribute columns. The only supported geometry-valued attribute path is
+`CityObject.extra.address.location`, which must reference a `MultiPoint`.
+When `--gpkg-split-address` is set, create an `addresses` feature layer with a
+registered `MULTIPOINT` `geom` column and flattened dynamic address columns for
+all address members except `location`.
 
 ### CityObject Hierarchy
 
@@ -227,7 +226,8 @@ Semantic feature layers include:
 | Column          | Type                    | Description                           |
 |-----------------|-------------------------|---------------------------------------|
 | `id`            | `INTEGER PRIMARY KEY`   | GeoPackage row id                     |
-| `semantic_id`   | `TEXT NOT NULL`         | Stable generated semantic id          |
+| `semantic_id`   | `INTEGER NOT NULL`      | Stable semantic resource id within the projected model/export |
+| `geometry_id`   | `INTEGER NOT NULL`      | Owning geometry resource id within the projected model/export |
 | `semantic_type` | `TEXT NOT NULL`         | CityJSON semantic object type         |
 | `cityobject_id` | `TEXT NOT NULL`         | Source CityObject id                  |
 | `geom`          | layer-specific geometry | Registered GeoPackage geometry column |

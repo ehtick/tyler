@@ -64,6 +64,21 @@ fn export(model: &CityModel) -> anyhow::Result<()> {
 OBJ output is geometry-only Wavefront OBJ grouped by CityObject ID. Coordinates
 are written in the source CityJSON coordinate space.
 
+### GeoPackage
+
+```rust
+use cityjson_convert::{convert_to_gpkg, GpkgExportOptions};
+use cityjson_lib::CityModel;
+
+fn export(model: &CityModel) -> anyhow::Result<()> {
+    convert_to_gpkg(model, "output/model.gpkg", &GpkgExportOptions::default())
+}
+```
+
+GeoPackage output requires `metadata.referenceSystem` to contain a parseable EPSG
+identifier. The converter rejects missing or non-EPSG CRS metadata before it
+changes the output path; it intentionally has no output-CRS override.
+
 ### CityJSONSeq
 
 ```rust
@@ -148,4 +163,36 @@ cjconvert input.city.json \
   --native-glb-color "#FFC0CB" \
   --3dtiles-metadata-class cityobject \
   --smooth-normals
+```
+
+### GeoPackage options
+
+Write GeoPackage output with `--format gpkg`:
+
+```shell
+cjconvert input.city.json --output output/model.gpkg --format gpkg
+```
+
+The source `CityJSON` must provide a parseable EPSG identifier in
+`metadata.referenceSystem`. All GeoPackage-specific options are disabled by
+default.
+
+| Option | Effect |
+|--------|--------|
+| `--gpkg-split-lod` | Writes separate feature layers for each CityObject type, geometry family, and LoD. Without this option, LoDs share a layer and are stored in its `lod` column. |
+| `--gpkg-include-semantics` | Adds a `semantics` feature layer containing semantic primitive rows. |
+| `--gpkg-include-hierarchy` | Adds the non-spatial `cityobject_hierarchy` and `semantic_hierarchy` tables. |
+| `--gpkg-include-address` | Adds an `addresses` feature layer from `CityObject.extra.address` values. |
+| `--gpkg-include-metadata` | Exports source CityJSON metadata through the GeoPackage metadata extension. |
+
+For example, to export every optional GeoPackage product and split the main
+feature layers by LoD:
+
+```shell
+cjconvert input.city.json --output output/model.gpkg --format gpkg \
+  --gpkg-split-lod \
+  --gpkg-include-semantics \
+  --gpkg-include-hierarchy \
+  --gpkg-include-address \
+  --gpkg-include-metadata
 ```

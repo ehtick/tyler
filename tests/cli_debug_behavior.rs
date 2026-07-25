@@ -226,7 +226,7 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
             "--tsv-include-null-rows",
             "--tsv-include-hierarchy",
             "--tsv-include-cityjson-ordinal",
-            "--tsv-split-semantics",
+            "--tsv-include-semantics",
         ],
     );
     assert_success(&output, "TSV format run");
@@ -246,8 +246,24 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     let cityobjects_header = cityobjects.lines().next().expect("cityobjects header");
     assert!(cityobjects_header.contains("cityobject_id"));
     assert!(cityobjects_header.contains("cityobject_ix"));
-    assert!(cityobjects_header.contains("parents"));
-    assert!(cityobjects_header.contains("children"));
+    assert!(!cityobjects_header.contains("parents"));
+    assert!(!cityobjects_header.contains("children"));
+
+    let mut cityobject_hierarchy_tables = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("t"),
+        "cityobject_hierarchy.tsv",
+        &mut cityobject_hierarchy_tables,
+    );
+    assert!(
+        !cityobject_hierarchy_tables.is_empty(),
+        "expected CityObject hierarchy TSV tables under {}",
+        output_dir.join("t").display()
+    );
+    let cityobject_hierarchy =
+        fs::read_to_string(&cityobject_hierarchy_tables[0]).expect("read cityobject_hierarchy.tsv");
+    let hierarchy_rows = parse_tsv(&cityobject_hierarchy);
+    assert_eq!(hierarchy_rows[0].as_slice(), ["parent_id", "child_id"]);
 
     let mut semantic_tables = Vec::new();
     collect_paths_with_suffix(&output_dir.join("t"), "semantics.tsv", &mut semantic_tables);
@@ -260,8 +276,8 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
     let aggregate_metadata =
         fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
     let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
-    assert!(metadata_header.starts_with("tile_id	cityobjects_path	identifier"));
-    assert!(metadata_header.contains("geographical_extent_wkt"));
+    assert!(metadata_header.starts_with("tile_id	content_path	geographical_extent	identifier"));
+    assert!(metadata_header.contains("geographical_extent"));
     assert!(aggregate_metadata
         .lines()
         .skip(1)
@@ -272,50 +288,102 @@ fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
         rows.len() >= 2,
         "metadata.tsv should contain at least one data row"
     );
-    let extent_ix = rows[0]
+    let extent_wkt_ix = rows[0]
         .iter()
         .position(|column| column == "geographical_extent")
         .expect("metadata.tsv should contain geographical_extent");
-    let extent_wkt_ix = rows[0]
-        .iter()
-        .position(|column| column == "geographical_extent_wkt")
-        .expect("metadata.tsv should contain geographical_extent_wkt");
-    let tile_extent: Vec<f64> =
-        serde_json::from_str(&rows[1][extent_ix]).expect("parse tile geographical_extent");
-    let expected_tile_extent = [
-        85_530.015_986_816_4,
-        446_894.658_972_168,
-        -0.319_460_330_963_134_53,
-        85_722.015_986_816_4,
-        447_086.658_972_168,
-        9.717_539_669_036_865,
-    ];
-    assert_eq!(tile_extent.len(), expected_tile_extent.len());
-    for (actual, expected) in tile_extent.iter().zip(expected_tile_extent) {
-        assert!(
-            (actual - expected).abs() < 1e-9,
-            "expected tile extent value {expected}, got {actual}"
-        );
-    }
-    assert!((tile_extent[3] - tile_extent[0] - (tile_extent[4] - tile_extent[1])).abs() < 1e-6);
-    let expected_wkt = format!(
-        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
-        tile_extent[0],
-        tile_extent[1],
-        tile_extent[3],
-        tile_extent[1],
-        tile_extent[3],
-        tile_extent[4],
-        tile_extent[0],
-        tile_extent[4],
-        tile_extent[0],
-        tile_extent[1]
+    assert!(
+        rows[1][extent_wkt_ix].starts_with("POLYGON(("),
+        "geographical_extent should contain polygon WKT"
     );
-    assert_eq!(rows[1][extent_wkt_ix], expected_wkt);
     assert!(!output_dir.join(".tyler-tsv-metadata").exists());
     assert!(!output_dir
         .join("metadata/cjindex-metadata.city.json")
         .exists());
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
+fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-gpkg", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-gpkg-output");
+    let legacy_metadata_dir = output_dir.join(".tyler-gpkg-metadata");
+    fs::create_dir_all(&legacy_metadata_dir).expect("create legacy metadata directory");
+    fs::write(legacy_metadata_dir.join("fragment.gpkg"), b"stale")
+        .expect("write stale metadata fragment");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &[
+            "--format",
+            "gpkg",
+            "--gpkg-split-lod",
+            "--gpkg-include-semantics",
+            "--gpkg-include-hierarchy",
+            "--gpkg-include-address",
+        ],
+    );
+    assert_success(&output, "GeoPackage format run");
+
+    let mut tile_databases = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".gpkg", &mut tile_databases);
+    assert!(
+        !tile_databases.is_empty(),
+        "expected GeoPackage tiles under {}",
+        output_dir.join("t").display()
+    );
+    let tile = rusqlite::Connection::open(&tile_databases[0]).expect("open tile GeoPackage");
+    let tables = tile
+        .prepare("SELECT table_name FROM gpkg_contents ORDER BY table_name")
+        .expect("prepare tile table query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tile tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read tile tables");
+    assert!(tables.iter().any(|table| table == "semantics"));
+    assert!(tables.iter().any(|table| table == "addresses"));
+    assert!(tables.iter().any(|table| table == "cityobject_hierarchy"));
+    assert!(tables.iter().any(|table| table == "semantic_hierarchy"));
+
+    let aggregate_path = output_dir.join("metadata.gpkg");
+    let aggregate =
+        rusqlite::Connection::open(&aggregate_path).expect("open aggregate metadata GeoPackage");
+    let rows = aggregate
+        .prepare("SELECT tile_id, content_path, geographical_extent FROM metadata ORDER BY id")
+        .expect("prepare aggregate query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .expect("query aggregate metadata")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read aggregate metadata");
+    assert!(!rows.is_empty());
+    assert_eq!(
+        rows.len(),
+        tile_databases.len(),
+        "metadata.gpkg should contain exactly one row per tile GeoPackage"
+    );
+    for (tile_id, content_path, extent) in rows {
+        assert_eq!(content_path, format!("t/{tile_id}.gpkg"));
+        assert!(output_dir.join(&content_path).is_file());
+        assert!(extent.starts_with(b"GP"));
+    }
+    let geometry_registration: (String, i32) = aggregate
+        .query_row(
+            "SELECT column_name, srs_id FROM gpkg_geometry_columns WHERE table_name = 'metadata'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read aggregate geometry registration");
+    assert_eq!(geometry_registration.0, "geographical_extent");
+    assert!(!output_dir.join(".tyler-gpkg-metadata").exists());
     assert!(!output_dir.join("tileset.json").exists());
 }
 

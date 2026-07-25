@@ -1,0 +1,23 @@
+services:
+  tests:
+    build:
+      context: ../../..
+      dockerfile: cityjson-convert/tools/gis-integration/Dockerfile
+    working_dir: /workspace
+    volumes:
+      - ../../..:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target:/workspace/cityjson-convert/tools/gis-integration/target
+    command:
+      - cargo
+      - test
+      - --manifest-path
+      - cityjson-convert/tools/gis-integration/Cargo.toml
+      - --
+      - --nocapture
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target:
