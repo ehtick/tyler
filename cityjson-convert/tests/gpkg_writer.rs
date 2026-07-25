@@ -4,8 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use cityjson_convert::{
-    aggregate_metadata_gpkg, convert_to_gpkg, write_metadata_gpkg, GpkgExportOptions,
-    GpkgMetadataFragment,
+    convert_to_gpkg, write_tiled_metadata_gpkg, GpkgExportOptions, GpkgTileMetadata,
 };
 use cityjson_lib::{json, CityModel};
 use rusqlite::Connection;
@@ -127,56 +126,64 @@ fn rejects_missing_or_non_epsg_source_crs_before_writing() {
     }
 }
 
-/// Purpose: preserve deterministic tile identity and `GeoPackage` paths while aggregating metadata.
-/// Input: two compatible per-tile metadata `GeoPackages`.
-/// Assertions: rows follow fragment order and the spatial metadata registration remains valid.
+/// Purpose: preserve deterministic tile identity, paths, and spatial extents without metadata fragments.
+/// Input: one source metadata model and two in-memory tile descriptors.
+/// Assertions: rows follow descriptor order and the spatial metadata registration remains valid.
 #[test]
-fn aggregates_tile_metadata_geopackages() {
+fn writes_tiled_metadata_geopackage_from_memory() {
     let model = model(
         r#""building":{"type":"Building","geometry":[{"type":"MultiSurface","lod":"1","boundaries":[[[0,1,2,0]]]}]}"#,
         Some("EPSG:7415"),
     );
     let directory = TempDir::new().expect("create temporary directory");
-    let first = directory.path().join("first.gpkg");
-    let second = directory.path().join("second.gpkg");
-    write_metadata_gpkg(&model, &first).expect("write first metadata fragment");
-    write_metadata_gpkg(&model, &second).expect("write second metadata fragment");
-
     let output = directory.path().join("metadata.gpkg");
-    aggregate_metadata_gpkg(
+    write_tiled_metadata_gpkg(
+        &model,
         &output,
-        &first,
         &[
-            GpkgMetadataFragment {
+            GpkgTileMetadata {
                 tile_id: "0/0/0".to_string(),
                 gpkg_path: "t/0/0/0.gpkg".to_string(),
-                metadata_path: first.clone(),
+                geographical_extent: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
             },
-            GpkgMetadataFragment {
+            GpkgTileMetadata {
                 tile_id: "1/2/3".to_string(),
                 gpkg_path: "t/1/2/3.gpkg".to_string(),
-                metadata_path: second,
+                geographical_extent: [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
             },
         ],
     )
-    .expect("aggregate metadata fragments");
+    .expect("write tiled metadata");
 
-    let conn = Connection::open(output).expect("open aggregate metadata");
+    let conn = Connection::open(output).expect("open tiled metadata");
     let rows = conn
-        .prepare("SELECT tile_id, gpkg_path FROM metadata ORDER BY id")
-        .expect("prepare aggregate row query")
+        .prepare(
+            "SELECT tile_id, gpkg_path, geographical_extent_wkb, reference_system \
+             FROM metadata ORDER BY id",
+        )
+        .expect("prepare tiled metadata query")
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })
-        .expect("query aggregate rows")
+        .expect("query tiled metadata")
         .collect::<rusqlite::Result<Vec<_>>>()
-        .expect("read aggregate rows");
+        .expect("read tiled metadata");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "0/0/0");
+    assert_eq!(rows[0].1, "t/0/0/0.gpkg");
+    assert_eq!(rows[1].0, "1/2/3");
+    assert_eq!(rows[1].1, "t/1/2/3.gpkg");
+    assert!(rows.iter().all(|row| row.2.starts_with(b"GP")));
+    assert_ne!(rows[0].2, rows[1].2);
+    assert!(rows.iter().all(|row| row.3 == "EPSG:7415"));
     assert_eq!(
-        rows,
-        vec![
-            ("0/0/0".to_string(), "t/0/0/0.gpkg".to_string()),
-            ("1/2/3".to_string(), "t/1/2/3.gpkg".to_string()),
-        ]
+        &column_names(&conn, "metadata")[..3],
+        ["id", "tile_id", "gpkg_path"]
     );
     let registration: (String, String, i32) = conn
         .query_row(
@@ -195,24 +202,24 @@ fn aggregates_tile_metadata_geopackages() {
     );
 }
 
-/// Purpose: retain a valid metadata schema when there are no successful tiles.
-/// Input: a metadata template and no fragments.
-/// Assertions: the aggregate metadata layer exists and contains no rows.
+/// Purpose: retain a valid metadata schema when there are no output tiles.
+/// Input: one source metadata model and an empty descriptor slice.
+/// Assertions: the spatial metadata layer exists with tile columns and no rows.
 #[test]
-fn writes_empty_metadata_aggregate_from_template() {
+fn writes_empty_tiled_metadata_geopackage() {
     let model = model("", Some("EPSG:7415"));
     let directory = TempDir::new().expect("create temporary directory");
-    let template = directory.path().join("template.gpkg");
-    write_metadata_gpkg(&model, &template).expect("write metadata template");
     let output = directory.path().join("metadata.gpkg");
 
-    aggregate_metadata_gpkg(&output, &template, &[]).expect("write empty aggregate");
+    write_tiled_metadata_gpkg(&model, &output, &[]).expect("write empty tiled metadata");
 
-    let conn = Connection::open(output).expect("open empty aggregate");
+    let conn = Connection::open(output).expect("open empty tiled metadata");
     let row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
-        .expect("count aggregate rows");
+        .expect("count tiled metadata rows");
     assert_eq!(row_count, 0);
-    assert!(column_names(&conn, "metadata").contains(&"tile_id".to_string()));
-    assert!(column_names(&conn, "metadata").contains(&"gpkg_path".to_string()));
+    assert_eq!(
+        &column_names(&conn, "metadata")[..3],
+        ["id", "tile_id", "gpkg_path"]
+    );
 }

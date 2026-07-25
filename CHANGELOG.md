@@ -41,6 +41,9 @@
 
 ### Fixed
 
+- Tyler now builds tiled GeoPackage metadata in memory and writes a single
+  `metadata.gpkg`, with one spatial row containing the tile ID and relative path
+  for every successfully produced tile.
 - CityJSON color selectors now report as no-op for CityJSON and CityJSONSeq
   output formats.
 - CityJSONFeature filtering no longer duplicates CityObjects when aliased

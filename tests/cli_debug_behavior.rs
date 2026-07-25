@@ -309,6 +309,10 @@ fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
     let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
     let dataset = write_ndjson_dataset("format-gpkg", &metadata, &[feature]);
     let output_dir = unique_test_dir("format-gpkg-output");
+    let legacy_metadata_dir = output_dir.join(".tyler-gpkg-metadata");
+    fs::create_dir_all(&legacy_metadata_dir).expect("create legacy metadata directory");
+    fs::write(legacy_metadata_dir.join("fragment.gpkg"), b"stale")
+        .expect("write stale metadata fragment");
 
     let output = run_tyler(
         &dataset,
@@ -361,6 +365,11 @@ fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("read aggregate metadata");
     assert!(!rows.is_empty());
+    assert_eq!(
+        rows.len(),
+        tile_databases.len(),
+        "metadata.gpkg should contain exactly one row per tile GeoPackage"
+    );
     for (tile_id, gpkg_path, extent) in rows {
         assert_eq!(gpkg_path, format!("t/{tile_id}.gpkg"));
         assert!(output_dir.join(&gpkg_path).is_file());

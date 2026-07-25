@@ -1339,13 +1339,12 @@ fn cleanup_and_update_extents(
     Ok(model)
 }
 
-fn tile_metadata_model(
+fn tile_metadata_extent(
     format_name: &str,
     job: &TileExportJob,
-    model: &cityjson_lib::CityModel,
-    context: &TileWriteContext<'_>,
-) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
-    let mut metadata_model = model.clone();
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<[f64; 6], Box<dyn std::error::Error>> {
     let source_node_id = job.source_node_id.as_ref().ok_or_else(|| {
         format!(
             "{format_name} tile {} is missing its source quadtree node",
@@ -1353,19 +1352,41 @@ fn tile_metadata_model(
         )
     })?;
     let qtree_node_id = spatial_structs::QuadTreeNodeId::from(source_node_id);
-    let qtree_node = context.quadtree.node(&qtree_node_id).ok_or_else(|| {
+    let qtree_node = quadtree.node(&qtree_node_id).ok_or_else(|| {
         format!(
             "{format_name} tile {} references missing source quadtree node {}",
             job.content_tile_coord, qtree_node_id
         )
     })?;
-    let extent = qtree_node.bbox(&context.world.grid);
+    Ok(qtree_node.bbox(&world.grid))
+}
+
+fn tile_metadata_model(
+    format_name: &str,
+    job: &TileExportJob,
+    model: &cityjson_lib::CityModel,
+    context: &TileWriteContext<'_>,
+) -> Result<cityjson_lib::CityModel, Box<dyn std::error::Error>> {
+    let mut metadata_model = model.clone();
+    let extent = tile_metadata_extent(format_name, job, context.world, context.quadtree)?;
     metadata_model
         .metadata_mut()
         .set_geographical_extent(BBox::new(
             extent[0], extent[1], extent[2], extent[3], extent[4], extent[5],
         ));
     Ok(metadata_model)
+}
+
+fn gpkg_tile_metadata(
+    job: &TileExportJob,
+    world: &parser::World,
+    quadtree: &spatial_structs::QuadTree,
+) -> Result<cityjson_convert::GpkgTileMetadata, Box<dyn std::error::Error>> {
+    Ok(cityjson_convert::GpkgTileMetadata {
+        tile_id: job.content_tile_coord.to_string(),
+        gpkg_path: gpkg_tile_relative_path(&job.content_tile_coord),
+        geographical_extent: tile_metadata_extent("GeoPackage", job, world, quadtree)?,
+    })
 }
 
 fn write_tsv_metadata_fragment(
@@ -1448,39 +1469,8 @@ fn tsv_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> Pa
     ))
 }
 
-fn gpkg_metadata_fragment_path(metadata_dir: &Path, tile_coord: &TileCoord) -> PathBuf {
-    metadata_dir.join(format!(
-        "{}-{}-{}.gpkg",
-        tile_coord.level, tile_coord.x, tile_coord.y
-    ))
-}
-
 fn gpkg_tile_relative_path(tile_coord: &TileCoord) -> String {
     format!("t/{tile_coord}.gpkg")
-}
-
-fn aggregate_gpkg_metadata(
-    output_dir: &Path,
-    successful_jobs: &[TileExportJob],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata_dir = output_dir.join(".tyler-gpkg-metadata");
-    let template = metadata_dir.join("template.gpkg");
-    let fragments = successful_jobs
-        .iter()
-        .map(|job| cityjson_convert::GpkgMetadataFragment {
-            tile_id: job.content_tile_coord.to_string(),
-            gpkg_path: gpkg_tile_relative_path(&job.content_tile_coord),
-            metadata_path: gpkg_metadata_fragment_path(&metadata_dir, &job.content_tile_coord),
-        })
-        .collect::<Vec<_>>();
-    let output_file = output_dir.join("metadata.gpkg");
-    cityjson_convert::aggregate_metadata_gpkg(&output_file, &template, &fragments)?;
-    fs::remove_dir_all(&metadata_dir)?;
-    info!(
-        "Wrote aggregate GeoPackage metadata to {}",
-        output_file.display()
-    );
-    Ok(())
 }
 
 fn write_debug_tile_input(
@@ -1511,7 +1501,6 @@ struct TileWriteContext<'a> {
     tsv_export_options: cityjson_convert::TsvExportOptions,
     tsv_metadata_dir: PathBuf,
     gpkg_export_options: cityjson_convert::GpkgExportOptions,
-    gpkg_metadata_dir: PathBuf,
 }
 
 struct Cesium3dTilesPreparedOutput {
@@ -1528,13 +1517,20 @@ struct TileFilesPreparedOutput {
     source_crs: String,
 }
 
+struct GpkgPreparedOutput {
+    export_jobs: Vec<TileExportJob>,
+    source_crs: String,
+    metadata_model: cityjson_lib::CityModel,
+    tile_metadata: HashMap<TileCoord, cityjson_convert::GpkgTileMetadata>,
+}
+
 enum PreparedOutput {
     Cesium3dTiles(Box<Cesium3dTilesPreparedOutput>),
     Obj(TileFilesPreparedOutput),
     Cityjson(TileFilesPreparedOutput),
     Cityjsonseq(TileFilesPreparedOutput),
     Tsv(TileFilesPreparedOutput),
-    Gpkg(TileFilesPreparedOutput),
+    Gpkg(Box<GpkgPreparedOutput>),
 }
 
 impl PreparedOutput {
@@ -1544,8 +1540,8 @@ impl PreparedOutput {
             PreparedOutput::Obj(prepared)
             | PreparedOutput::Cityjson(prepared)
             | PreparedOutput::Cityjsonseq(prepared)
-            | PreparedOutput::Tsv(prepared)
-            | PreparedOutput::Gpkg(prepared) => &prepared.source_crs,
+            | PreparedOutput::Tsv(prepared) => &prepared.source_crs,
+            PreparedOutput::Gpkg(prepared) => &prepared.source_crs,
         }
     }
 
@@ -2119,14 +2115,29 @@ impl OutputFormatBackend for GpkgBackend {
         _geometric_error_factor: f64,
         _debug_data_output_path: &Path,
     ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
-        let metadata_dir = cli.output.join(".tyler-gpkg-metadata");
-        fs::create_dir_all(&metadata_dir)?;
-        let base_model = cityjson_lib::json::from_slice(&world.feature_base_document)?;
-        cityjson_convert::write_metadata_gpkg(&base_model, metadata_dir.join("template.gpkg"))?;
-        Ok(PreparedOutput::Gpkg(TileFilesPreparedOutput {
-            export_jobs: quadtree_leaf_tile_export_jobs(world, quadtree),
+        let legacy_metadata_dir = cli.output.join(".tyler-gpkg-metadata");
+        if legacy_metadata_dir.exists() {
+            fs::remove_dir_all(&legacy_metadata_dir)?;
+        }
+
+        let export_jobs = quadtree_leaf_tile_export_jobs(world, quadtree);
+        let tile_metadata = export_jobs
+            .iter()
+            .filter(|job| !job.feature_ids.is_empty())
+            .map(|job| {
+                Ok((
+                    job.content_tile_coord.clone(),
+                    gpkg_tile_metadata(job, world, quadtree)?,
+                ))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+        let metadata_model = cityjson_lib::json::from_slice(&world.feature_base_document)?;
+        Ok(PreparedOutput::Gpkg(Box::new(GpkgPreparedOutput {
+            export_jobs,
             source_crs: format!("EPSG:{}", world.crs.to_epsg()?),
-        }))
+            metadata_model,
+            tile_metadata,
+        })))
     }
 
     fn jobs(&self, prepared: &PreparedOutput) -> Vec<TileExportJob> {
@@ -2149,13 +2160,6 @@ impl OutputFormatBackend for GpkgBackend {
         let mut options = context.gpkg_export_options.clone();
         options.include_metadata = false;
         cityjson_convert::convert_to_gpkg(model, &output_file, &options)?;
-
-        fs::create_dir_all(&context.gpkg_metadata_dir)?;
-        let metadata_model = tile_metadata_model("GeoPackage", job, model, context)?;
-        cityjson_convert::write_metadata_gpkg(
-            &metadata_model,
-            gpkg_metadata_fragment_path(&context.gpkg_metadata_dir, &job.content_tile_coord),
-        )?;
         Ok(())
     }
 
@@ -2165,13 +2169,36 @@ impl OutputFormatBackend for GpkgBackend {
         _quadtree: &spatial_structs::QuadTree,
         successful_jobs: &[TileExportJob],
         failed_jobs: &[TileExportJob],
-        _prepared: &mut PreparedOutput,
+        prepared: &mut PreparedOutput,
     ) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Skipped {} failed GeoPackage tile outputs",
             failed_jobs.len()
         );
-        aggregate_gpkg_metadata(&cli.output, successful_jobs)?;
+        let PreparedOutput::Gpkg(prepared) = prepared else {
+            return Err("GeoPackage finalization received incompatible prepared output".into());
+        };
+        let mut tiles = Vec::with_capacity(successful_jobs.len());
+        for job in successful_jobs {
+            if job.feature_ids.is_empty() {
+                continue;
+            }
+            let Some(metadata) = prepared.tile_metadata.get(&job.content_tile_coord) else {
+                return Err(format!(
+                    "GeoPackage tile {} is missing its prepared metadata descriptor",
+                    job.content_tile_coord
+                )
+                .into());
+            };
+            tiles.push(metadata.clone());
+        }
+        let output_file = cli.output.join("metadata.gpkg");
+        cityjson_convert::write_tiled_metadata_gpkg(
+            &prepared.metadata_model,
+            &output_file,
+            &tiles,
+        )?;
+        info!("Wrote GeoPackage metadata to {}", output_file.display());
         Ok(())
     }
 
@@ -2486,7 +2513,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tsv_export_options: build_tsv_export_options(&cli),
             tsv_metadata_dir: cli.output.join(".tyler-tsv-metadata"),
             gpkg_export_options: build_gpkg_export_options(&cli),
-            gpkg_metadata_dir: cli.output.join(".tyler-gpkg-metadata"),
         };
         let object_attribute_types = object_attribute_types.clone();
         let tiles_len = export_jobs.len();

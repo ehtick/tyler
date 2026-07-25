@@ -38,11 +38,15 @@ pub struct GpkgExportOptions {
     pub split_lod: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct GpkgMetadataFragment {
+/// One tile row written to an aggregate metadata `GeoPackage`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpkgTileMetadata {
+    /// Stable tile identifier.
     pub tile_id: String,
+    /// Portable path to the corresponding tile `GeoPackage`.
     pub gpkg_path: String,
-    pub metadata_path: PathBuf,
+    /// Tile bounds in the source coordinate reference system.
+    pub geographical_extent: [f64; 6],
 }
 
 #[derive(Debug)]
@@ -1051,6 +1055,29 @@ pub fn write_metadata_gpkg<P: AsRef<Path>>(model: &CityModel, output: P) -> Resu
     write_metadata_gpkg_impl(output, model, &metadata, &resolved_srs, &last_change)
 }
 
+/// Writes one aggregate metadata `GeoPackage` from in-memory tile descriptors.
+///
+/// The spatial `metadata` layer contains one row per tile, prefixed with its
+/// `tile_id` and relative `gpkg_path`. Source `CityJSON` metadata is projected
+/// into every row, while `geographical_extent_wkb` is taken from the tile
+/// descriptor.
+///
+/// # Errors
+///
+/// Returns an error when metadata or the spatial reference system cannot be
+/// resolved, or when the output `GeoPackage` cannot be written.
+pub fn write_tiled_metadata_gpkg<P: AsRef<Path>>(
+    model: &CityModel,
+    output: P,
+    tiles: &[GpkgTileMetadata],
+) -> Result<()> {
+    let output = output.as_ref();
+    let metadata = tabulate_model_metadata(model)?;
+    let resolved_srs = resolve_srs(model)?;
+    let last_change = current_timestamp()?;
+    write_tiled_metadata_gpkg_impl(output, model, &metadata, &resolved_srs, &last_change, tiles)
+}
+
 fn write_metadata_sidecar_gpkg(
     output: &Path,
     model: &CityModel,
@@ -1099,130 +1126,47 @@ PRAGMA synchronous = OFF;"
     Ok(())
 }
 
-fn current_timestamp() -> Result<String> {
-    let conn = Connection::open_in_memory()?;
-    Ok(conn.query_row(SQLITE_LAST_CHANGE_SQL, [], |row| row.get(0))?)
-}
-
-/// Aggregates per-tile metadata `GeoPackages` into one metadata `GeoPackage`.
-///
-/// The aggregate contains one row per metadata row in fragment order, with
-/// `tile_id` and `gpkg_path` columns identifying the corresponding tile.
-///
-/// # Errors
-///
-/// Returns an error when no fragments are supplied, fragment schemas or
-/// spatial reference systems differ, or a `GeoPackage` cannot be read or
-/// written.
-pub fn aggregate_metadata_gpkg<P: AsRef<Path>>(
-    output: P,
-    template: P,
-    fragments: &[GpkgMetadataFragment],
+fn write_tiled_metadata_gpkg_impl(
+    metadata_output: &Path,
+    model: &CityModel,
+    metadata: &MetadataTable<'_>,
+    resolved_srs: &ResolvedSrs,
+    last_change: &str,
+    tiles: &[GpkgTileMetadata],
 ) -> Result<()> {
-    let output = output.as_ref();
-    let template = template.as_ref();
-    if let Some(parent) = output.parent() {
+    if let Some(parent) = metadata_output.parent() {
         fs::create_dir_all(parent)?;
     }
-    if output.exists() {
-        fs::remove_file(output)
-            .with_context(|| format!("remove existing output {}", output.display()))?;
-    }
-    fs::copy(template, output).with_context(|| {
-        format!(
-            "copy metadata template {} to {}",
-            template.display(),
-            output.display()
-        )
-    })?;
-
-    let mut output_conn =
-        Connection::open(output).with_context(|| format!("open {}", output.display()))?;
-    let template_schema = metadata_table_schema(&output_conn)?;
-    let template_srs = metadata_srs_signature(&output_conn)?;
-    let tx = output_conn.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE metadata ADD COLUMN tile_id TEXT;
-         ALTER TABLE metadata ADD COLUMN gpkg_path TEXT;
-         DELETE FROM metadata;",
-    )?;
-
-    let source_columns = template_schema
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut insert_columns = vec!["tile_id".to_string(), "gpkg_path".to_string()];
-    insert_columns.extend(template_schema.iter().skip(1).cloned());
-    let insert_columns = insert_columns
-        .iter()
-        .map(|column| quote_ident(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = (0..=template_schema.len())
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let insert_sql = format!("INSERT INTO metadata ({insert_columns}) VALUES ({placeholders})");
-
-    for fragment in fragments {
-        let source = Connection::open(&fragment.metadata_path)
-            .with_context(|| format!("open {}", fragment.metadata_path.display()))?;
-        let schema = metadata_table_schema(&source)?;
-        if schema != template_schema {
-            bail!(
-                "metadata schema in {} differs from the aggregate template",
-                fragment.metadata_path.display()
-            );
-        }
-        if metadata_srs_signature(&source)? != template_srs {
-            bail!(
-                "metadata spatial reference system in {} differs from the aggregate template",
-                fragment.metadata_path.display()
-            );
-        }
-
-        let mut select = source.prepare(&format!("SELECT {source_columns} FROM metadata"))?;
-        let rows = select.query_map([], |row| {
-            (0..template_schema.len())
-                .map(|index| row.get::<_, SqlValue>(index))
-                .collect::<rusqlite::Result<Vec<_>>>()
+    if metadata_output.exists() {
+        fs::remove_file(metadata_output).with_context(|| {
+            format!(
+                "remove existing metadata GeoPackage {}",
+                metadata_output.display()
+            )
         })?;
-        for row in rows {
-            let row = row?;
-            let mut values = vec![
-                SqlValue::Text(fragment.tile_id.clone()),
-                SqlValue::Text(fragment.gpkg_path.clone()),
-            ];
-            values.extend(row.into_iter().skip(1));
-            tx.execute(&insert_sql, params_from_iter(values))?;
-        }
     }
+
+    let mut conn = Connection::open(metadata_output)
+        .with_context(|| format!("open metadata GeoPackage {}", metadata_output.display()))?;
+    conn.execute_batch(&format!(
+        "PRAGMA application_id = {GPKG_APPLICATION_ID};
+PRAGMA user_version = {GPKG_USER_VERSION};
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = OFF;
+PRAGMA synchronous = OFF;"
+    ))?;
+    let tx = conn.transaction()?;
+    create_core_tables(&tx)?;
+    insert_standard_spatial_ref_systems(&tx, resolved_srs)?;
+    create_tiled_metadata_table(&tx, metadata, resolved_srs.srs_id, last_change)?;
+    insert_tiled_metadata_rows(&tx, metadata, model, resolved_srs.srs_id, tiles)?;
     tx.commit()?;
     Ok(())
 }
 
-fn metadata_table_schema(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn.prepare("PRAGMA table_info(metadata)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if columns.is_empty() {
-        bail!("GeoPackage does not contain a metadata table");
-    }
-    Ok(columns)
-}
-
-fn metadata_srs_signature(conn: &Connection) -> Result<(i32, String, String)> {
-    Ok(conn.query_row(
-        "SELECT s.srs_id, s.organization, s.definition
-         FROM gpkg_geometry_columns AS g
-         JOIN gpkg_spatial_ref_sys AS s ON s.srs_id = g.srs_id
-         WHERE g.table_name = 'metadata'
-           AND g.column_name = 'geographical_extent_wkb'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?)
+fn current_timestamp() -> Result<String> {
+    let conn = Connection::open_in_memory()?;
+    Ok(conn.query_row(SQLITE_LAST_CHANGE_SQL, [], |row| row.get(0))?)
 }
 
 fn metadata_output_path(output: &Path) -> PathBuf {
@@ -1239,8 +1183,33 @@ fn create_metadata_table(
     srs_id: i32,
     last_change: &str,
 ) -> Result<()> {
-    let mut columns = vec![
-        "id INTEGER PRIMARY KEY".to_string(),
+    create_metadata_table_impl(tx, metadata, srs_id, last_change, false)
+}
+
+fn create_tiled_metadata_table(
+    tx: &Transaction<'_>,
+    metadata: &MetadataTable<'_>,
+    srs_id: i32,
+    last_change: &str,
+) -> Result<()> {
+    create_metadata_table_impl(tx, metadata, srs_id, last_change, true)
+}
+
+fn create_metadata_table_impl(
+    tx: &Transaction<'_>,
+    metadata: &MetadataTable<'_>,
+    srs_id: i32,
+    last_change: &str,
+    tiled: bool,
+) -> Result<()> {
+    let mut columns = vec!["id INTEGER PRIMARY KEY".to_string()];
+    if tiled {
+        columns.extend([
+            "tile_id TEXT NOT NULL".to_string(),
+            "gpkg_path TEXT NOT NULL".to_string(),
+        ]);
+    }
+    columns.extend([
         "identifier TEXT".to_string(),
         "reference_date TEXT".to_string(),
         "reference_system TEXT".to_string(),
@@ -1253,7 +1222,7 @@ fn create_metadata_table(
         "contact_type TEXT".to_string(),
         "contact_phone TEXT".to_string(),
         "contact_organization TEXT".to_string(),
-    ];
+    ]);
     columns.extend(metadata.schema().columns.iter().map(|column| {
         format!(
             "{} {}",
@@ -1283,7 +1252,7 @@ fn insert_metadata_rows(
     model: &CityModel,
     srs_id: i32,
 ) -> Result<()> {
-    let insert_sql = metadata_insert_sql(metadata.schema());
+    let insert_sql = metadata_insert_sql(metadata.schema(), false);
     let mut statement = tx.prepare(&insert_sql)?;
     for row in metadata.rows() {
         let fixed = row.fixed();
@@ -1298,24 +1267,62 @@ fn insert_metadata_rows(
     Ok(())
 }
 
-fn metadata_insert_sql(schema: &crate::TableSchema<'_>) -> String {
-    let mut columns = [
-        "identifier",
-        "reference_date",
-        "reference_system",
-        "title",
-        "geographical_extent_wkb",
-        "contact_name",
-        "contact_email_address",
-        "contact_role",
-        "contact_website",
-        "contact_type",
-        "contact_phone",
-        "contact_organization",
-    ]
-    .into_iter()
-    .map(quote_ident)
-    .collect::<Vec<_>>();
+fn insert_tiled_metadata_rows(
+    tx: &Transaction<'_>,
+    metadata: &MetadataTable<'_>,
+    model: &CityModel,
+    srs_id: i32,
+    tiles: &[GpkgTileMetadata],
+) -> Result<()> {
+    let insert_sql = metadata_insert_sql(metadata.schema(), true);
+    let mut statement = tx.prepare(&insert_sql)?;
+    let row = metadata
+        .rows()
+        .next()
+        .expect("metadata projection always contains one row");
+    let dynamic_values = row
+        .values()
+        .map(|value| sqlite_value_from_tabular_value(model, value?))
+        .collect::<Result<Vec<_>>>()?;
+    for tile in tiles {
+        let mut params = vec![
+            SqlValue::Text(tile.tile_id.clone()),
+            SqlValue::Text(tile.gpkg_path.clone()),
+        ];
+        params.extend(metadata_fixed_sql_values_with_extent(
+            row.fixed(),
+            srs_id,
+            Some(tile.geographical_extent),
+        ));
+        params.extend(dynamic_values.iter().cloned());
+        statement.execute(params_from_iter(params))?;
+    }
+    Ok(())
+}
+
+fn metadata_insert_sql(schema: &crate::TableSchema<'_>, tiled: bool) -> String {
+    let mut columns = Vec::new();
+    if tiled {
+        columns.extend([quote_ident("tile_id"), quote_ident("gpkg_path")]);
+    }
+    columns.extend(
+        [
+            "identifier",
+            "reference_date",
+            "reference_system",
+            "title",
+            "geographical_extent_wkb",
+            "contact_name",
+            "contact_email_address",
+            "contact_role",
+            "contact_website",
+            "contact_type",
+            "contact_phone",
+            "contact_organization",
+        ]
+        .into_iter()
+        .map(quote_ident),
+    );
     columns.extend(
         schema
             .columns
@@ -1334,12 +1341,20 @@ fn metadata_insert_sql(schema: &crate::TableSchema<'_>) -> String {
 }
 
 fn metadata_fixed_sql_values(row: &crate::MetadataRow<'_>, srs_id: i32) -> Vec<SqlValue> {
+    metadata_fixed_sql_values_with_extent(row, srs_id, row.geographical_extent)
+}
+
+fn metadata_fixed_sql_values_with_extent(
+    row: &crate::MetadataRow<'_>,
+    srs_id: i32,
+    geographical_extent: Option<[f64; 6]>,
+) -> Vec<SqlValue> {
     vec![
         option_sql_text(row.identifier.as_deref()),
         option_sql_text(row.reference_date.as_deref()),
         option_sql_text(row.reference_system.as_deref()),
         option_sql_text(row.title.as_deref()),
-        row.geographical_extent.map_or(SqlValue::Null, |bbox| {
+        geographical_extent.map_or(SqlValue::Null, |bbox| {
             let wkb = bbox_wkb_2d(bbox);
             SqlValue::Blob(wrap_geopackage_binary(&wkb, None, false, srs_id))
         }),
