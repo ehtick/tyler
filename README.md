@@ -241,7 +241,7 @@ shape used by `--debug-dump-data`.
 
 Use `--format tsv` to write tabular files under
 `t/<level>/<x>/<y>/`. Tyler always writes `metadata.tsv` at the output root,
-with one row per successful tile and `tile_id` and `cityobjects_path` columns.
+with one row per written tile and shared `tile_id`, `content_path`, and `geographical_extent` columns.
 Use the `--tsv-*` options to include null rows, hierarchy, source ordinals,
 semantics, or addresses.
 
@@ -249,8 +249,8 @@ semantics, or addresses.
 
 Use `--format gpkg` to write each non-empty tile to
 `t/<level>/<x>/<y>.gpkg`. Tyler always writes a separate `metadata.gpkg` at the
-output root. Its spatial `metadata` layer contains one row per successful tile,
-including `tile_id`, the relative `gpkg_path`, projected CityJSON metadata, and
+output root. Its spatial `metadata` layer contains one row per written tile,
+including `tile_id`, the relative `content_path`, projected CityJSON metadata, and
 the quadtree leaf extent.
 
 ```shell
@@ -425,7 +425,7 @@ Run *tyler* in debug mode, by setting the logging level to `debug` in the `RUST_
 RUST_LOG=debug tyler ...
 ```
 
-In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and `tiles_failed` instances as [bincode](https://crates.io/crates/bincode) under `debug/`.
+In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and explicit `tiles_results` outcomes as [bincode](https://crates.io/crates/bincode) under `debug/`.
 In case of a large area and lots of features (eg. an entire country and multiple millions of features), the `world.bincode` file can become a couple GB in size.
 When `--debug-dump-data` is enabled, Tyler also writes intermediary per-tile CityJSONFeature streams under `debug/inputs/`.
 
@@ -438,7 +438,7 @@ The order in which *tyler* creates the instances:
 2. quadtree
 3. tileset
 4. (implicit tileset)
-5. tiles_failed
+5. tiles_results (written, skipped, or failed per export job)
 6. pruned tileset
 
 In addition to the instance data, *tyler* can export the grid (part of the `world`), quadtree and tileset data to Tab-separated values (`.tsv`), which you can load into a GIS.

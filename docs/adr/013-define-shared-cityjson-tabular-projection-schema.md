@@ -268,7 +268,7 @@ Output with `split-semantics` enabled creates a separate semantics table:
   attributes values.
 - CityObject and Semantic hierarchy is opt-in with the `--tsv-include-hierarchy` flag.
 - The `--tsv-include-cityjson-ordinal` flag adds the `cityjson_ix` field to the TSV output.
-- Tyler always writes aggregate metadata for TSV output to `metadata.tsv`. It appends the Metadata of each TSV tile to a single Metadata file and includes the WKT of the file extent for each tile.
+- Tyler projects tiled metadata once in the `tabular` module for both TSV and GeoPackage. Both expose `tile_id`, `content_path`, and `geographical_extent`; TSV serializes the extent as WKT and GeoPackage as a registered polygon geometry. Only written tiles receive rows.
 
 ## Consequences
 
