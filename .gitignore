@@ -13,6 +13,7 @@
 # misc
 /tmp
 .env
+local.justfile
 
 # Test data
 /tests/output*
