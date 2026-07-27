@@ -12,7 +12,8 @@
 
 6. Breaking changes are allowed and desirable if they lead to simpler code and architecture.
 
-7. Do not add regression tests on previous behavior when implementing new features, because they create noise without utility. Prefer refactoring existing tests to match new behavior instead of adding
-   new tests. Provide explanation on every new test and explicitly ask for approval.
+7. Do not preserve compatibility with legacy API and legacy logic when refactoring the codebase. Do not add regression tests on legacy behavior when refactoring the codebase.
 
-8. Implementation is accepted when `just ci` passes. Do not add clippy allow-s, but fix warnings and errors. 
+8. Prefer refactoring existing tests to match new behavior instead of adding new tests. Provide explanation on every new test and explicitly ask for approval.
+
+9. Implementation is accepted when `just ci` passes. Do not add clippy allow-s, but fix warnings and errors. 
