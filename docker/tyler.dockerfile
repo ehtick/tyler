@@ -1,14 +1,14 @@
-FROM rust:1-bookworm AS builder
+FROM rust:1.97.1-trixie AS builder
 
 USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
-    clang-15 \
     cmake \
     libsqlite3-dev \
     pkg-config \
+    libproj-dev \
     proj-data \
     unzip \
     wget \
@@ -24,10 +24,9 @@ RUN mkdir -p /usr/local/share/proj && \
 WORKDIR /usr/src/tyler
 COPY Cargo.toml Cargo.lock ./
 COPY cityjson-convert ./cityjson-convert
-COPY resources ./resources
 COPY src ./src
-COPY proj ./proj
-RUN --mount=type=cache,target=/usr/src/tyler/target cargo install --path .
+
+RUN --mount=type=cache,target=/usr/src/tyler/target cargo install --features proj-system --path .
 
 COPY docker/strip-docker-image-export ./
 RUN rm -rf /export
@@ -38,7 +37,7 @@ RUN mkdir /export && \
     -f /usr/local/share/proj/proj.db \
     -f /usr/local/cargo/bin/tyler
 
-FROM ubuntu:noble-20260410
+FROM debian:trixie-slim
 ARG VERSION
 LABEL org.opencontainers.image.authors="Balázs Dukai <balazs.dukai@3dgi.nl>"
 LABEL org.opencontainers.image.vendor="3DGI"

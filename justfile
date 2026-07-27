@@ -73,3 +73,7 @@ feature-check-bundled:
     cargo tree -e features -i cityjson-lib --no-default-features --features proj-bundled | grep 'cityjson-lib feature "proj-bundled"'
     cargo tree -e features -i proj-sys --no-default-features --features proj-bundled | grep 'proj-sys feature "bundled_proj"'
     ! cargo tree -e features -i cityjson-lib --no-default-features --features proj-bundled | grep 'cityjson-lib feature "proj-network"'
+
+# Build docker image
+build-docker version="develop" *args:
+    docker build --build-arg VERSION={{version}} -t 3dgi/tyler:{{version}} {{args}} -f docker/tyler.dockerfile .
