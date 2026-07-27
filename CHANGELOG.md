@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Tile export jobs now record explicit `Written`, `Skipped`, or `Failed` outcomes;
+  empty jobs are skipped instead of being inferred as successful. Debug replay snapshots
+  now persist these outcomes and are intentionally incompatible with older snapshots.
+- Tiled TSV and GeoPackage metadata now use one projection from the
+  `cityjson-convert` `tabular` module. Both expose `tile_id`, `content_path`, and
+  `geographical_extent`, with only format-specific text or geometry serialization
+  in their writers.
+
+- Tyler and `cityjson-convert` now use `cityjson_lib::ops::Transformer` for PROJ
+  coordinate transformations instead of maintaining local PROJ wrappers.
+- Tyler resolves `cityjson-lib`, `cityjson-types`, and `cityjson-json` through
+  the local `cityjson-rs` checkout while depending on the new `cityjson-lib`
+  `proj` feature.
+- Tyler and `cityjson-convert` now expose explicit `proj-system` and
+  `proj-bundled` build modes, with system builds using native PROJ networking
+  capability and bundled builds kept separate from it.
+- Tyler now relies on upstream `cityjson-index` freshness reporting and
+  rebuilds stale cjindex sidecars before reading them.
+- Tyler was updated for the newer `cityjson-index` package API, including
+  package-based filtering and package references.
+- The build documentation now distinguishes reproducible/offline packaged
+  grids from opt-in native PROJ network fetching and documents the local cache
+  behavior used for downloaded grid chunks.
+- Linux, macOS, and Windows CI now validate both PROJ build modes, and the
+  devcontainer installs the native PROJ toolchain used for repeatable local
+  validation.
+- The devcontainer now supports rootless Podman, uses `GH_TOKEN` for GitHub
+  auth, installs Debian packages noninteractively, and includes the `tools`
+  feature.
+
+### Added
+
+- Tiled GeoPackage output in Tyler with `--format gpkg`, optional `--gpkg-*` tables, and an always-generated aggregate `metadata.gpkg`.
+- `cjconvert` can now read dataset directories, including the legacy
+  `metadata.json` plus per-feature `*.city.jsonl` layout, through
+  `cityjson-index`.
+- Feature-resolution checks that verify system mode does not activate bundled
+  PROJ and bundled mode does not imply native PROJ networking.
+- CityJSON color editing support, including `--color-*` selectors for CityJSON
+  and CityJSONSeq output.
+- TSV format output in tyler and cityjson-convert with `--format tsv`. Format specific parameters are set with `--tsv-*`.
+- Tabular projection for a CityModel, which supports TSV, GeoPackage and other tabular formats. Implemented in `cityjson-convert` `tabular` module.
+
+### Fixed
+
+- Empty tile jobs are no longer counted as successful or included in aggregate
+  metadata and implicit content availability.
+
+- Tyler now builds tiled GeoPackage metadata in memory and writes a single
+  `metadata.gpkg`, with one spatial row containing the tile ID and relative path
+  for every successfully produced tile.
+- CityJSON color selectors now report as no-op for CityJSON and CityJSONSeq
+  output formats.
+- CityJSONFeature filtering no longer duplicates CityObjects when aliased
+  cjindex rows resolve to the same physical package.
+
+### Removed
+
+- Removed Tyler's direct `proj-sys`, `libc`, `num-traits`, and `thiserror`
+  dependencies that only supported the deleted local PROJ wrappers.
+- Removed the duplicate local PROJ wrapper modules from Tyler and
+  `cityjson-convert`.
+
 ## tyler 0.4.1 (2026-04-30)
 
 The main features of the new version:

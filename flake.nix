@@ -60,11 +60,13 @@
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes = {
-                "cityjson-0.8.0" = "sha256-isq+Ud97hShMwum6vhHMaJE1/KTDOFWLu7vMsJee83E=";
+                "cityjson-index-0.9.0" = "sha256-WrPSNM3u7ckfQTje++L0DCjQCZP+oyBKH6I0d7W2OG4=";
               };
             };
 
             inherit nativeBuildInputs buildInputs;
+
+            cargoBuildFlags = [ "--workspace" ];
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             PROJ_DATA = "${projData}/share/proj";
@@ -73,6 +75,8 @@
 
             postInstall = ''
               wrapProgram "$out/bin/tyler" \
+                --set-default PROJ_DATA "${projData}/share/proj"
+              wrapProgram "$out/bin/cjconvert" \
                 --set-default PROJ_DATA "${projData}/share/proj"
             '';
           };

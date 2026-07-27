@@ -1,18 +1,17 @@
 #![allow(clippy::too_many_lines)]
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::proj::Proj;
+use crate::triangle_mesh::{build_triangle_mesh, TriangleMeshOptions};
 use crate::{ExportOptions, GeographicClipRegion, GeometryPlacement};
 use anyhow::{bail, Context, Result};
-use cityjson_lib::cityjson_types::v2_0::{AttributeValue, CityObject, GeometryType, VertexIndex};
+use cityjson_lib::cityjson_types::v2_0::{AttributeValue, CityObject};
+use cityjson_lib::ops::Transformer;
 use cityjson_lib::CityModel;
-use earcutr::earcut;
 use gltf::json;
 use log::debug;
 use meshopt::{
@@ -32,10 +31,6 @@ const QUANTIZED_POSITION_STRIDE: usize = std::mem::size_of::<QuantizedPosition>(
 const QUANTIZED_NORMAL_STRIDE: usize = std::mem::size_of::<QuantizedNormal>();
 const CLIP_PLANE_EPSILON: f64 = 1.0e-12;
 const GEOGRAPHIC_CLIP_INTERSECTION_ITERATIONS: usize = 64;
-
-thread_local! {
-    static PROJ_TRANSFORM_CACHE: RefCell<HashMap<(String, String), Proj>> = RefCell::new(HashMap::new());
-}
 
 /// Parse hex color string (#RRGGBB) to RGBA f32 array [R, G, B, A]
 fn hex_to_rgba(hex: &str) -> Result<[f32; 4], anyhow::Error> {
@@ -84,51 +79,6 @@ fn create_default_material(base_color: &str) -> Result<json::Material, anyhow::E
         alpha_cutoff: None,
         double_sided: true,
     })
-}
-
-/// Strip consecutive bit-identical vertices from each ring
-/// before triangulation. earcutr 0.5.0 can spin forever on polygons that
-/// contain inner rings whose vertices repeat
-#[allow(clippy::float_cmp)]
-fn dedupe_polygon_rings(
-    flat_coords: &[f64],
-    hole_indices: &[usize],
-) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
-    let mut ring_offsets: Vec<usize> = std::iter::once(0)
-        .chain(hole_indices.iter().copied())
-        .collect();
-    ring_offsets.push(flat_coords.len() / 2);
-
-    let mut new_flat: Vec<f64> = Vec::with_capacity(flat_coords.len());
-    let mut new_holes: Vec<usize> = Vec::with_capacity(hole_indices.len());
-    let mut index_map: Vec<usize> = Vec::with_capacity(flat_coords.len() / 2);
-
-    for ring_idx in 0..ring_offsets.len() - 1 {
-        let start_vertex = ring_offsets[ring_idx];
-        let end_vertex = ring_offsets[ring_idx + 1];
-        if ring_idx > 0 {
-            new_holes.push(new_flat.len() / 2);
-        }
-
-        let ring_start_in_new_flat = new_flat.len();
-        for orig_idx in start_vertex..end_vertex {
-            let x = flat_coords[orig_idx * 2];
-            let y = flat_coords[orig_idx * 2 + 1];
-            if new_flat.len() >= ring_start_in_new_flat + 2 {
-                if let Some(&[px, py]) = new_flat.last_chunk::<2>() {
-                    if px == x && py == y {
-                        continue;
-                    }
-                }
-            }
-
-            new_flat.push(x);
-            new_flat.push(y);
-            index_map.push(orig_idx);
-        }
-    }
-
-    (new_flat, new_holes, index_map)
 }
 
 /// Writes a `CityJSON` model as a binary glTF file.
@@ -442,35 +392,18 @@ struct SmoothVertexKey {
 
 #[derive(Clone, Debug)]
 struct CachedProjTransform {
-    key: (String, String),
+    transformer: Transformer,
 }
 
 impl CachedProjTransform {
-    fn new(source_crs: String, target_crs: &'static str) -> Self {
-        Self {
-            key: (source_crs, target_crs.to_owned()),
-        }
+    fn new(source_crs: &str, target_crs: &'static str) -> Result<Self> {
+        let transformer = cityjson_lib::ops::transformer(source_crs, target_crs)
+            .with_context(|| format!("failed to create {source_crs} to {target_crs} transform"))?;
+        Ok(Self { transformer })
     }
 
     fn convert(&self, point: [f64; 3]) -> Result<[f64; 3]> {
-        PROJ_TRANSFORM_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if !cache.contains_key(&self.key) {
-                let transformer = Proj::new_known_crs(&self.key.0, &self.key.1, None)
-                    .with_context(|| {
-                        format!(
-                            "failed to create {} to {} transform",
-                            self.key.0, self.key.1
-                        )
-                    })?;
-                cache.insert(self.key.clone(), transformer);
-            }
-            let transformer = cache
-                .get(&self.key)
-                .expect("cached PROJ transform should have been inserted");
-            let output = transformer.convert((point[0], point[1], point[2]))?;
-            Ok([output.0, output.1, output.2])
-        })
+        self.transformer.transform(point).map_err(Into::into)
     }
 }
 
@@ -499,6 +432,33 @@ struct StructuralMetadataExtension {
     class_name: String,
     columns: BTreeMap<String, StructuralMetadataColumn>,
     feature_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MeshoptCompressionKind {
+    Attributes,
+    Triangles,
+}
+
+impl MeshoptCompressionKind {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::Attributes => "ATTRIBUTES",
+            Self::Triangles => "TRIANGLES",
+        }
+    }
+
+    fn filter(self) -> Option<&'static str> {
+        match self {
+            Self::Attributes | Self::Triangles => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MeshoptFallback {
+    byte_length: usize,
+    alignment: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -610,7 +570,7 @@ impl CoordinateTransform {
             GeometryPlacement::SourceCoordinates => CoordinatePlacement::SourceCoordinates,
             GeometryPlacement::EcefRelative { source_crs, origin } => {
                 let source_crs = canonical_epsg_crs(source_crs)?;
-                let vertex_transformer = source_to_ecef_transformer(&source_crs);
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
                 CoordinatePlacement::EcefRelative {
                     vertex_transformer,
                     origin: *origin,
@@ -624,7 +584,7 @@ impl CoordinateTransform {
                 up,
             } => {
                 let source_crs = canonical_epsg_crs(source_crs)?;
-                let vertex_transformer = source_to_ecef_transformer(&source_crs);
+                let vertex_transformer = source_to_ecef_transformer(&source_crs)?;
                 CoordinatePlacement::Enu {
                     vertex_transformer,
                     ecef_origin: *ecef_origin,
@@ -693,8 +653,11 @@ impl ClipVolume {
 
     fn geographic_region(region: &GeographicClipRegion) -> Result<Self> {
         let source_crs = canonical_epsg_crs(&region.source_crs)?;
-        let transformer = (source_crs != "EPSG:4979")
-            .then(|| CachedProjTransform::new(source_crs.clone(), "EPSG:4979"));
+        let transformer = if source_crs == "EPSG:4979" {
+            None
+        } else {
+            Some(CachedProjTransform::new(&source_crs, "EPSG:4979")?)
+        };
         Ok(Self::GeographicRegion(GeographicClipVolume {
             transformer,
             west: region.west,
@@ -860,9 +823,12 @@ fn canonical_epsg_crs(value: &str) -> Result<String> {
     Ok(format!("EPSG:{parsed}"))
 }
 
-fn source_to_ecef_transformer(source_crs: &str) -> Option<CachedProjTransform> {
-    (source_crs != "EPSG:4978")
-        .then(|| CachedProjTransform::new(source_crs.to_owned(), "EPSG:4978"))
+fn source_to_ecef_transformer(source_crs: &str) -> Result<Option<CachedProjTransform>> {
+    if source_crs == "EPSG:4978" {
+        Ok(None)
+    } else {
+        Ok(Some(CachedProjTransform::new(source_crs, "EPSG:4978")?))
+    }
 }
 
 fn transform_to_ecef(
@@ -913,62 +879,35 @@ impl MeshCollector {
     }
 
     fn add_model(&mut self, model: &CityModel) -> Result<()> {
-        for (object_id, cityobject) in model.cityobjects().iter() {
-            let Some(geometry_handles) = cityobject.geometry() else {
+        let mesh = build_triangle_mesh(model, &TriangleMeshOptions::default())?;
+        for object in mesh.objects {
+            let Some(cityobject) = model.cityobjects().get(object.handle) else {
                 continue;
             };
-            let feature_type = cityobject.type_cityobject().to_string();
-            let mut feature_index = None;
-            for geometry_handle in geometry_handles {
-                let geometry = model.resolve_geometry(*geometry_handle)?;
-                let feature_index = *feature_index.get_or_insert_with(|| {
-                    let feature_index =
-                        u32::try_from(self.features.len()).expect("feature count within u32 range");
-                    self.features.push(FeatureRecord {
-                        object_id: object_id.to_string(),
-                        feature_type: feature_type.clone(),
-                        attributes: Self::collect_feature_attributes(model, cityobject),
-                    });
-                    feature_index
-                });
-                match geometry.geometry().type_geometry() {
-                    GeometryType::MultiSurface | GeometryType::CompositeSurface => {
-                        let Some(boundary) = geometry.geometry().boundaries() else {
-                            continue;
-                        };
-                        for surface in boundary.to_nested_multi_or_composite_surface()? {
-                            self.add_surface(&feature_type, feature_index, &surface, model)?;
-                        }
-                    }
-                    GeometryType::Solid => {
-                        let Some(boundary) = geometry.geometry().boundaries() else {
-                            continue;
-                        };
-                        for shell in boundary.to_nested_solid()? {
-                            for surface in shell {
-                                self.add_surface(&feature_type, feature_index, &surface, model)?;
-                            }
-                        }
-                    }
-                    GeometryType::MultiSolid | GeometryType::CompositeSolid => {
-                        let Some(boundary) = geometry.geometry().boundaries() else {
-                            continue;
-                        };
-                        for solid in boundary.to_nested_multi_or_composite_solid()? {
-                            for shell in solid {
-                                for surface in shell {
-                                    self.add_surface(
-                                        &feature_type,
-                                        feature_index,
-                                        &surface,
-                                        model,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            let feature_index =
+                u32::try_from(self.features.len()).expect("feature count within u32 range");
+            self.features.push(FeatureRecord {
+                object_id: object.object_id,
+                feature_type: object.feature_type.clone(),
+                attributes: Self::collect_feature_attributes(model, cityobject),
+            });
+            let primitive = self
+                .primitives
+                .entry(object.feature_type.clone())
+                .or_default();
+            for triangle in object.triangles {
+                let local_positions = triangle
+                    .source_positions
+                    .map(|position| self.coordinate_transform.transform_position(position))
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
+                primitive.add_triangle(
+                    feature_index,
+                    triangle.source_positions,
+                    [local_positions[0], local_positions[1], local_positions[2]],
+                    Self::compute_face_normal,
+                    self.smooth_normals,
+                );
             }
         }
 
@@ -977,124 +916,6 @@ impl MeshCollector {
 
     fn finish(self) -> Result<ProcessedScene> {
         ProcessedScene::from_collector(self)
-    }
-
-    fn add_surface(
-        &mut self,
-        feature_type: &str,
-        feature_id: u32,
-        surface: &[Vec<u32>],
-        model: &CityModel,
-    ) -> Result<()> {
-        if surface.is_empty() {
-            return Ok(());
-        }
-        let exterior = &surface[0];
-        if exterior.len() < 3 {
-            return Ok(());
-        }
-
-        let mut source_positions: Vec<[f64; 3]> = Vec::new();
-        let mut local_positions: Vec<[f32; 3]> = Vec::new();
-        let mut flat_coords: Vec<f64> = Vec::new();
-        let mut hole_indices: Vec<usize> = Vec::new();
-        let mut vertex_count = 0usize;
-
-        for (ring_idx, ring) in surface.iter().enumerate() {
-            if ring.len() < 3 {
-                continue;
-            }
-            if ring_idx > 0 {
-                hole_indices.push(vertex_count);
-            }
-
-            for &vertex_id in ring {
-                let vertex = model
-                    .get_vertex(VertexIndex::new(vertex_id))
-                    .ok_or_else(|| anyhow::anyhow!("missing vertex {vertex_id}"))?;
-                let source_position = vertex.to_array();
-                let local_position = self
-                    .coordinate_transform
-                    .transform_position(source_position)?;
-                source_positions.push(source_position);
-                local_positions.push(local_position);
-                vertex_count += 1;
-            }
-        }
-
-        if local_positions.len() < 3 {
-            return Ok(());
-        }
-
-        if surface.len() == 1 && exterior.len() == 3 {
-            let primitive = self.primitives.entry(feature_type.to_string()).or_default();
-            let source_triangle = [
-                source_positions[0],
-                source_positions[1],
-                source_positions[2],
-            ];
-            let local_triangle = [local_positions[0], local_positions[1], local_positions[2]];
-            primitive.add_triangle(
-                feature_id,
-                source_triangle,
-                local_triangle,
-                Self::compute_face_normal,
-                self.smooth_normals,
-            );
-            return Ok(());
-        }
-
-        let drop_axis = Self::find_projection_axis(&local_positions[..exterior.len()]);
-        for pos in &local_positions {
-            match drop_axis {
-                0 => {
-                    flat_coords.push(f64::from(pos[1]));
-                    flat_coords.push(f64::from(pos[2]));
-                }
-                1 => {
-                    flat_coords.push(f64::from(pos[0]));
-                    flat_coords.push(f64::from(pos[2]));
-                }
-                _ => {
-                    flat_coords.push(f64::from(pos[0]));
-                    flat_coords.push(f64::from(pos[1]));
-                }
-            }
-        }
-
-        let (flat_coords, hole_indices, source_index_map) =
-            dedupe_polygon_rings(&flat_coords, &hole_indices);
-        let triangulated =
-            earcut(&flat_coords, &hole_indices, 2).context("Failed to triangulate surface")?;
-        if triangulated.len() < 3 {
-            return Ok(());
-        }
-
-        let primitive = self.primitives.entry(feature_type.to_string()).or_default();
-        for tri in triangulated.chunks_exact(3) {
-            let orig0 = source_index_map[tri[0]];
-            let orig1 = source_index_map[tri[1]];
-            let orig2 = source_index_map[tri[2]];
-            let source_triangle = [
-                source_positions[orig0],
-                source_positions[orig1],
-                source_positions[orig2],
-            ];
-            let local_triangle = [
-                local_positions[orig0],
-                local_positions[orig1],
-                local_positions[orig2],
-            ];
-            primitive.add_triangle(
-                feature_id,
-                source_triangle,
-                local_triangle,
-                Self::compute_face_normal,
-                self.smooth_normals,
-            );
-        }
-
-        Ok(())
     }
 
     fn collect_feature_attributes(
@@ -1165,59 +986,6 @@ impl MeshCollector {
             AttributeValue::String(value) => Some(MetadataValue::String(value.clone())),
             _ => None,
         }
-    }
-
-    fn find_projection_axis(positions: &[[f32; 3]]) -> usize {
-        if let Some(normal) = Self::compute_polygon_normal(positions) {
-            return Self::dominant_axis(normal);
-        }
-
-        let mut min = [f32::INFINITY; 3];
-        let mut max = [f32::NEG_INFINITY; 3];
-        for pos in positions {
-            for (axis, coordinate) in pos.iter().enumerate() {
-                min[axis] = min[axis].min(*coordinate);
-                max[axis] = max[axis].max(*coordinate);
-            }
-        }
-
-        (0..3)
-            .min_by(|&lhs, &rhs| {
-                (max[lhs] - min[lhs])
-                    .partial_cmp(&(max[rhs] - min[rhs]))
-                    .unwrap()
-            })
-            .unwrap_or(2)
-    }
-
-    fn compute_polygon_normal(positions: &[[f32; 3]]) -> Option<[f32; 3]> {
-        if positions.len() < 3 {
-            return None;
-        }
-
-        let mut normal = [0.0_f32; 3];
-        for (current, next) in positions
-            .iter()
-            .zip(positions.iter().cycle().skip(1))
-            .take(positions.len())
-        {
-            normal[0] += (current[1] - next[1]) * (current[2] + next[2]);
-            normal[1] += (current[2] - next[2]) * (current[0] + next[0]);
-            normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
-        }
-
-        let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
-        if length > f32::EPSILON {
-            Some([normal[0] / length, normal[1] / length, normal[2] / length])
-        } else {
-            None
-        }
-    }
-
-    fn dominant_axis(normal: [f32; 3]) -> usize {
-        (0..3)
-            .max_by(|&lhs, &rhs| normal[lhs].abs().partial_cmp(&normal[rhs].abs()).unwrap())
-            .unwrap_or(2)
     }
 
     fn compute_face_normal(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> [f32; 3] {
@@ -2520,13 +2288,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode quantized position stream")?;
             self.push_meshopt_buffer_view(
                 &position_bytes,
-                positions.len() * QUANTIZED_POSITION_STRIDE,
+                MeshoptFallback {
+                    byte_length: positions.len() * QUANTIZED_POSITION_STRIDE,
+                    alignment: std::mem::align_of::<i16>(),
+                },
                 Some(QUANTIZED_POSITION_STRIDE),
                 positions.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<i16>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2561,13 +2330,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode quantized normal stream")?;
             self.push_meshopt_buffer_view(
                 &normal_bytes,
-                normals.len() * QUANTIZED_NORMAL_STRIDE,
+                MeshoptFallback {
+                    byte_length: normals.len() * QUANTIZED_NORMAL_STRIDE,
+                    alignment: std::mem::align_of::<i8>(),
+                },
                 Some(QUANTIZED_NORMAL_STRIDE),
                 normals.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<i8>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2630,13 +2400,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode float position stream")?;
             self.push_meshopt_buffer_view(
                 &position_bytes,
-                positions.len() * position_stride,
+                MeshoptFallback {
+                    byte_length: positions.len() * position_stride,
+                    alignment: std::mem::align_of::<f32>(),
+                },
                 Some(position_stride),
                 positions.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<f32>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2671,13 +2442,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode float normal stream")?;
             self.push_meshopt_buffer_view(
                 &normal_bytes,
-                normals.len() * normal_stride,
+                MeshoptFallback {
+                    byte_length: normals.len() * normal_stride,
+                    alignment: std::mem::align_of::<f32>(),
+                },
                 Some(normal_stride),
                 normals.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<f32>(),
+                MeshoptCompressionKind::Attributes,
             )
         } else {
             self.push_buffer_view(
@@ -2741,13 +2513,15 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        MeshoptFallback {
+                            byte_length: padded_feature_ids.len()
+                                * FeatureIdBuffer::meshopt_byte_stride(),
+                            alignment: std::mem::align_of::<PaddedFeatureIdU8>(),
+                        },
                         Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
-                        "ATTRIBUTES",
-                        None,
-                        std::mem::align_of::<PaddedFeatureIdU8>(),
+                        MeshoptCompressionKind::Attributes,
                     )
                 } else {
                     self.push_buffer_view(
@@ -2771,13 +2545,15 @@ impl BufferBuilder {
                         .context("failed to meshopt-encode feature ID stream")?;
                     self.push_meshopt_buffer_view(
                         &encoded,
-                        padded_feature_ids.len() * FeatureIdBuffer::meshopt_byte_stride(),
+                        MeshoptFallback {
+                            byte_length: padded_feature_ids.len()
+                                * FeatureIdBuffer::meshopt_byte_stride(),
+                            alignment: std::mem::align_of::<PaddedFeatureIdU16>(),
+                        },
                         Some(FeatureIdBuffer::meshopt_byte_stride()),
                         feature_id_values.len(),
                         json::buffer::Target::ArrayBuffer,
-                        "ATTRIBUTES",
-                        None,
-                        std::mem::align_of::<PaddedFeatureIdU16>(),
+                        MeshoptCompressionKind::Attributes,
                     )
                 } else {
                     self.push_buffer_view(
@@ -2816,13 +2592,14 @@ impl BufferBuilder {
                 .context("failed to meshopt-encode index stream")?;
             self.push_meshopt_buffer_view(
                 &encoded_indices,
-                index_buffer.byte_length(),
+                MeshoptFallback {
+                    byte_length: index_buffer.byte_length(),
+                    alignment: index_buffer.byte_stride(),
+                },
                 None,
                 index_buffer.count(),
                 json::buffer::Target::ElementArrayBuffer,
-                "TRIANGLES",
-                None,
-                index_buffer.byte_stride(),
+                MeshoptCompressionKind::Triangles,
             )
         } else {
             match index_buffer {
@@ -2891,18 +2668,19 @@ impl BufferBuilder {
         data: &[T],
         meshopt_compression: bool,
     ) -> Result<json::Index<json::buffer::View>> {
-        if meshopt_compression && std::mem::size_of::<T>() % 4 == 0 {
+        if meshopt_compression && std::mem::size_of::<T>().is_multiple_of(4) {
             let encoded = encode_vertex_buffer(data)
                 .context("failed to meshopt-encode structural metadata column")?;
             Ok(self.push_meshopt_buffer_view(
                 &encoded,
-                std::mem::size_of_val(data),
+                MeshoptFallback {
+                    byte_length: std::mem::size_of_val(data),
+                    alignment: std::mem::align_of::<T>(),
+                },
                 Some(std::mem::size_of::<T>()),
                 data.len(),
                 json::buffer::Target::ArrayBuffer,
-                "ATTRIBUTES",
-                None,
-                std::mem::align_of::<T>(),
+                MeshoptCompressionKind::Attributes,
             ))
         } else {
             Ok(self.push_scalar_buffer_view(data, json::buffer::Target::ArrayBuffer))
@@ -2920,25 +2698,23 @@ impl BufferBuilder {
     fn push_meshopt_buffer_view(
         &mut self,
         compressed_data: &[u8],
-        fallback_byte_length: usize,
+        fallback: MeshoptFallback,
         byte_stride: Option<usize>,
         count: usize,
         target: json::buffer::Target,
-        mode: &'static str,
-        filter: Option<&'static str>,
-        fallback_alignment: usize,
+        compression: MeshoptCompressionKind,
     ) -> json::Index<json::buffer::View> {
         let compressed_byte_offset = self.bytes.len();
         let compressed_byte_length = compressed_data.len();
         self.bytes.extend_from_slice(compressed_data);
 
-        let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback_alignment);
-        self.fallback_buffer_length = fallback_byte_offset + fallback_byte_length;
+        let fallback_byte_offset = align_length(self.fallback_buffer_length, fallback.alignment);
+        self.fallback_buffer_length = fallback_byte_offset + fallback.byte_length;
 
         let index = self.buffer_views.len();
         self.buffer_views.push(json::buffer::View {
             buffer: json::Index::new(1),
-            byte_length: json::validation::USize64(fallback_byte_length as u64),
+            byte_length: json::validation::USize64(fallback.byte_length as u64),
             byte_offset: Some(json::validation::USize64(fallback_byte_offset as u64)),
             byte_stride: byte_stride.map(json::buffer::Stride),
             target: Some(json::validation::Checked::Valid(target)),
@@ -2950,10 +2726,10 @@ impl BufferBuilder {
             buffer: 0,
             byte_offset: compressed_byte_offset as u64,
             byte_length: compressed_byte_length as u64,
-            byte_stride: byte_stride.unwrap_or(fallback_alignment) as u64,
+            byte_stride: byte_stride.unwrap_or(fallback.alignment) as u64,
             count: count as u64,
-            mode,
-            filter,
+            mode: compression.mode(),
+            filter: compression.filter(),
         }));
 
         json::Index::new(u32::try_from(index).expect("buffer view index exceeds u32 range"))

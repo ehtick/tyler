@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use log::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -25,9 +26,9 @@ pub struct Cli {
     /// Directory for the output.
     #[arg(short, long)]
     pub output: PathBuf,
-    // /// Output format.
-    // #[arg(long, value_enum)]
-    // pub format: crate::Formats,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t)]
+    pub format: crate::OutputFormatKind,
     /// The CityObject type to include
     /// (https://www.cityjson.org/specs/2.0.1/#city-objects).
     /// You can specify it multiple times.
@@ -110,6 +111,33 @@ pub struct Cli {
     /// Compute smooth vertex normals.
     #[arg(long)]
     pub smooth_normals: bool,
+    /// Include CityObjects without dynamic TSV attribute values when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_null_rows: bool,
+    /// Include parent and child CityObject identifiers when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_hierarchy: bool,
+    /// Include the source CityJSON CityObject ordinal when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_cityjson_ordinal: bool,
+    /// Include semantic primitive assignments in semantics.tsv when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_semantics: bool,
+    /// Include CityObject extra.address values in addresses.tsv when the output format is TSV.
+    #[arg(long)]
+    pub tsv_include_address: bool,
+    /// Split feature layers by LoD when the output format is GeoPackage.
+    #[arg(long = "gpkg-split-lod")]
+    pub gpkg_split_lod: bool,
+    /// Include semantic primitive assignments when the output format is GeoPackage.
+    #[arg(long = "gpkg-include-semantics")]
+    pub gpkg_include_semantics: bool,
+    /// Include parent and child relationships when the output format is GeoPackage.
+    #[arg(long = "gpkg-include-hierarchy")]
+    pub gpkg_include_hierarchy: bool,
+    /// Include CityObject addresses when the output format is GeoPackage.
+    #[arg(long = "gpkg-include-address")]
+    pub gpkg_include_address: bool,
     /// LoD to use in output for Building features
     #[arg(long)]
     pub lod_building: Option<String>,
@@ -244,12 +272,282 @@ pub struct Cli {
     // pub exe_python: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct NoEffectInfoRule {
+    flag: &'static str,
+    n_a_formats: &'static [crate::OutputFormatKind],
+    is_present: fn(&Cli) -> bool,
+}
+
+const NO_EFFECT_INFO_RULES: &[NoEffectInfoRule] = &[
+    NoEffectInfoRule {
+        flag: "--grid-minz",
+        n_a_formats: &[
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+            crate::OutputFormatKind::Gpkg,
+        ],
+        is_present: cli_has_grid_minz,
+    },
+    NoEffectInfoRule {
+        flag: "--grid-maxz",
+        n_a_formats: &[
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+            crate::OutputFormatKind::Gpkg,
+        ],
+        is_present: cli_has_grid_maxz,
+    },
+    NoEffectInfoRule {
+        flag: "--3dtiles-implicit",
+        n_a_formats: &[
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+            crate::OutputFormatKind::Gpkg,
+        ],
+        is_present: cli_has_3dtiles_implicit,
+    },
+    NoEffectInfoRule {
+        flag: "--3dtiles-content-clip-to-tile-bounds",
+        n_a_formats: &[
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+            crate::OutputFormatKind::Gpkg,
+        ],
+        is_present: cli_has_3dtiles_content_clip_to_tile_bounds,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-null-rows",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_null_rows,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-hierarchy",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_hierarchy,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-cityjson-ordinal",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_cityjson_ordinal,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-semantics",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_semantics,
+    },
+    NoEffectInfoRule {
+        flag: "--tsv-include-address",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+        ],
+        is_present: cli_has_tsv_include_address,
+    },
+    NoEffectInfoRule {
+        flag: "--gpkg-split-lod",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+        ],
+        is_present: cli_has_gpkg_split_lod,
+    },
+    NoEffectInfoRule {
+        flag: "--gpkg-include-semantics",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+        ],
+        is_present: cli_has_gpkg_include_semantics,
+    },
+    NoEffectInfoRule {
+        flag: "--gpkg-include-hierarchy",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+        ],
+        is_present: cli_has_gpkg_include_hierarchy,
+    },
+    NoEffectInfoRule {
+        flag: "--gpkg-include-address",
+        n_a_formats: &[
+            crate::OutputFormatKind::Cesium3dTiles,
+            crate::OutputFormatKind::Obj,
+            crate::OutputFormatKind::Cityjson,
+            crate::OutputFormatKind::Cityjsonseq,
+            crate::OutputFormatKind::Tsv,
+        ],
+        is_present: cli_has_gpkg_include_address,
+    },
+];
+
+impl Cli {
+    /// Central gate for rejecting CLI option combinations that are incompatible
+    /// with one or more selected output formats.
+    ///
+    /// This validation must run after clap parsing but before output directory
+    /// creation, input inspection, indexing, grid construction, or tile
+    /// processing. It intentionally accepts a format slice so future
+    /// multi-format CLI support can validate every selected format with the
+    /// same mechanism.
+    ///
+    /// The gate may start as a no-op until format-specific rules are added.
+    #[allow(clippy::unused_self)]
+    pub fn validate_parameter_combinations(
+        &self,
+        formats: &[crate::OutputFormatKind],
+    ) -> Result<(), String> {
+        for message in self.no_effect_info_messages(formats) {
+            info!("{message}");
+        }
+        Ok(())
+    }
+
+    fn no_effect_info_messages(&self, formats: &[crate::OutputFormatKind]) -> Vec<String> {
+        let selected_formats = unique_output_formats(formats);
+        let selected_format_names = selected_formats
+            .iter()
+            .map(|format| output_format_name(*format))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        NO_EFFECT_INFO_RULES
+            .iter()
+            .filter(|rule| {
+                (rule.is_present)(self)
+                    && selected_formats
+                        .iter()
+                        .all(|format| rule.n_a_formats.contains(format))
+            })
+            .map(|rule| {
+                format!(
+                    "{} has no effect for selected output formats: {}",
+                    rule.flag, selected_format_names
+                )
+            })
+            .collect()
+    }
+}
+
+fn cli_has_grid_minz(cli: &Cli) -> bool {
+    cli.grid_minz.is_some()
+}
+
+fn cli_has_grid_maxz(cli: &Cli) -> bool {
+    cli.grid_maxz.is_some()
+}
+
+fn cli_has_3dtiles_implicit(cli: &Cli) -> bool {
+    cli.cesium3dtiles_implicit
+}
+
+fn cli_has_3dtiles_content_clip_to_tile_bounds(cli: &Cli) -> bool {
+    cli.cesium3dtiles_content_clip_to_tile_bounds
+}
+
+fn cli_has_tsv_include_null_rows(cli: &Cli) -> bool {
+    cli.tsv_include_null_rows
+}
+
+fn cli_has_tsv_include_hierarchy(cli: &Cli) -> bool {
+    cli.tsv_include_hierarchy
+}
+
+fn cli_has_tsv_include_cityjson_ordinal(cli: &Cli) -> bool {
+    cli.tsv_include_cityjson_ordinal
+}
+
+fn cli_has_tsv_include_semantics(cli: &Cli) -> bool {
+    cli.tsv_include_semantics
+}
+
+fn cli_has_tsv_include_address(cli: &Cli) -> bool {
+    cli.tsv_include_address
+}
+
+fn cli_has_gpkg_split_lod(cli: &Cli) -> bool {
+    cli.gpkg_split_lod
+}
+
+fn cli_has_gpkg_include_semantics(cli: &Cli) -> bool {
+    cli.gpkg_include_semantics
+}
+
+fn cli_has_gpkg_include_hierarchy(cli: &Cli) -> bool {
+    cli.gpkg_include_hierarchy
+}
+
+fn cli_has_gpkg_include_address(cli: &Cli) -> bool {
+    cli.gpkg_include_address
+}
+
+fn unique_output_formats(formats: &[crate::OutputFormatKind]) -> Vec<crate::OutputFormatKind> {
+    let mut unique_formats = Vec::new();
+    for &format in formats {
+        if !unique_formats.contains(&format) {
+            unique_formats.push(format);
+        }
+    }
+    unique_formats.sort_unstable_by_key(|format| output_format_name(*format));
+    unique_formats
+}
+
+fn output_format_name(format: crate::OutputFormatKind) -> &'static str {
+    match format {
+        crate::OutputFormatKind::Cesium3dTiles => "3dtiles",
+        crate::OutputFormatKind::Obj => "obj",
+        crate::OutputFormatKind::Cityjson => "cityjson",
+        crate::OutputFormatKind::Cityjsonseq => "cityjsonseq",
+        crate::OutputFormatKind::Tsv => "tsv",
+        crate::OutputFormatKind::Gpkg => "gpkg",
+    }
+}
+
 fn existing_canonical_path(s: &str) -> Result<PathBuf, String> {
     if let Ok(c) = Path::new(s).canonicalize() {
         if c.exists() {
             Ok(c)
         } else {
-            Err(format!("path {:?} does not exist", &c))
+            Err(format!("path {:?} does not exist", c))
         }
     } else {
         Err(format!("could not resolve the path {:?}", s))
@@ -275,6 +573,7 @@ fn hex_color(s: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::Cli;
+    use crate::OutputFormatKind;
     use clap::{CommandFactory, Parser};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -416,6 +715,190 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_default_format() {
+        let cli = Cli::try_parse_from(dataset_args()).unwrap();
+
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_accepts_explicit_non_default_format() {
+        let mut args = dataset_args();
+        args.extend(["--format".to_string(), "cityjson".to_string()]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_accepts_cityjsonseq_format() {
+        let mut args = dataset_args();
+        args.extend(["--format".to_string(), "cityjsonseq".to_string()]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Cityjsonseq);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_accepts_obj_format() {
+        let mut args = dataset_args();
+        args.extend(["--format".to_string(), "obj".to_string()]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Obj);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_accepts_tsv_format_and_flags() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "tsv".to_string(),
+            "--tsv-include-null-rows".to_string(),
+            "--tsv-include-hierarchy".to_string(),
+            "--tsv-include-cityjson-ordinal".to_string(),
+            "--tsv-include-semantics".to_string(),
+            "--tsv-include-address".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Tsv);
+        assert!(cli.tsv_include_null_rows);
+        assert!(cli.tsv_include_hierarchy);
+        assert!(cli.tsv_include_cityjson_ordinal);
+        assert!(cli.tsv_include_semantics);
+        assert!(cli.tsv_include_address);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_tsv_include_metadata_flag() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "tsv".to_string(),
+            "--tsv-include-metadata".to_string(),
+        ]);
+
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn validation_accepts_multiple_formats_directly() {
+        let cli = Cli::try_parse_from(dataset_args()).unwrap();
+
+        assert!(cli
+            .validate_parameter_combinations(&[
+                OutputFormatKind::Cesium3dTiles,
+                OutputFormatKind::Cityjson,
+                OutputFormatKind::Cityjsonseq,
+                OutputFormatKind::Tsv,
+            ])
+            .is_ok());
+    }
+
+    #[test]
+    fn n_a_flag_emits_one_info_message_for_selected_formats() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.grid_minz = Some(-10);
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[
+                OutputFormatKind::Cityjson,
+                OutputFormatKind::Cityjsonseq,
+                OutputFormatKind::Tsv,
+            ]),
+            vec![
+                "--grid-minz has no effect for selected output formats: cityjson, cityjsonseq, tsv"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn supported_format_suppresses_no_op_info_message() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.grid_minz = Some(-10);
+
+        assert!(cli
+            .no_effect_info_messages(
+                &[OutputFormatKind::Cesium3dTiles, OutputFormatKind::Cityjson,]
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn default_single_format_path_still_behaves_correctly() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.grid_minz = Some(-10);
+
+        assert!(cli
+            .no_effect_info_messages(&[OutputFormatKind::Cesium3dTiles])
+            .is_empty());
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn obj_reports_3dtiles_only_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.cesium3dtiles_implicit = true;
+        cli.cesium3dtiles_content_clip_to_tile_bounds = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Obj]),
+            vec![
+                "--3dtiles-implicit has no effect for selected output formats: obj".to_string(),
+                "--3dtiles-content-clip-to-tile-bounds has no effect for selected output formats: obj"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tsv_reports_3dtiles_only_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.cesium3dtiles_implicit = true;
+        cli.cesium3dtiles_content_clip_to_tile_bounds = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Tsv]),
+            vec![
+                "--3dtiles-implicit has no effect for selected output formats: tsv".to_string(),
+                "--3dtiles-content-clip-to-tile-bounds has no effect for selected output formats: tsv"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_tsv_reports_tsv_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.tsv_include_null_rows = true;
+        cli.tsv_include_hierarchy = true;
+        cli.tsv_include_cityjson_ordinal = true;
+        cli.tsv_include_semantics = true;
+        cli.tsv_include_address = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Cityjson]),
+            vec![
+                "--tsv-include-null-rows has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-hierarchy has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-cityjson-ordinal has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-semantics has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--tsv-include-address has no effect for selected output formats: cityjson"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn reject_legacy_input_flags() {
         let dataset_dir = legacy_dataset_dir();
         let args = vec![
@@ -428,5 +911,59 @@ mod tests {
             env!("CARGO_MANIFEST_DIR").to_string(),
         ];
         assert!(Cli::try_parse_from(args).is_err());
+    }
+    #[test]
+    fn validation_accepts_gpkg_format_and_flags() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "gpkg".to_string(),
+            "--gpkg-split-lod".to_string(),
+            "--gpkg-include-semantics".to_string(),
+            "--gpkg-include-hierarchy".to_string(),
+            "--gpkg-include-address".to_string(),
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        assert_eq!(cli.format, OutputFormatKind::Gpkg);
+        assert!(cli.gpkg_split_lod);
+        assert!(cli.gpkg_include_semantics);
+        assert!(cli.gpkg_include_hierarchy);
+        assert!(cli.gpkg_include_address);
+        assert!(cli.validate_parameter_combinations(&[cli.format]).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_gpkg_include_metadata_flag() {
+        let mut args = dataset_args();
+        args.extend([
+            "--format".to_string(),
+            "gpkg".to_string(),
+            "--gpkg-include-metadata".to_string(),
+        ]);
+
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn non_gpkg_reports_gpkg_flags_as_no_effect() {
+        let mut cli = Cli::try_parse_from(dataset_args()).unwrap();
+        cli.gpkg_split_lod = true;
+        cli.gpkg_include_semantics = true;
+        cli.gpkg_include_hierarchy = true;
+        cli.gpkg_include_address = true;
+
+        assert_eq!(
+            cli.no_effect_info_messages(&[OutputFormatKind::Cityjson]),
+            vec![
+                "--gpkg-split-lod has no effect for selected output formats: cityjson".to_string(),
+                "--gpkg-include-semantics has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--gpkg-include-hierarchy has no effect for selected output formats: cityjson"
+                    .to_string(),
+                "--gpkg-include-address has no effect for selected output formats: cityjson"
+                    .to_string(),
+            ]
+        );
     }
 }

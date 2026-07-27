@@ -45,7 +45,7 @@ impl QuadTree {
         let mut merge_limit: usize = 0;
         let nr_cells = grid.length.pow(2) as f64;
         let max_level = (nr_cells.ln() / 4.0_f64.ln()).ceil() as u16;
-        debug!("Calculated maximum level for quadtree: {}", &max_level);
+        debug!("Calculated maximum level for quadtree: {}", max_level);
         // Somehow, the morton_encoding::morton_encode needs [y,x] for creating a Z-curve.
         //  If [x,y] is used, it creates an N-curve.
         //  crate::spatial_structs::interleave(x,y) creates a Z-curve.
@@ -133,7 +133,7 @@ impl QuadTree {
                     warn!(
                         "number of children is not dividable by 4: {}, in level {}",
                         tiles.len(),
-                        &level
+                        level
                     );
                 }
                 QuadTree {
@@ -850,7 +850,7 @@ impl SquareGrid {
         for (cellid, cell) in self {
             let wkt = self.cell_to_wkt(&cellid);
             file_grid
-                .write_all(format!("{}\t{}\t{}\n", &cellid, cell.nr_vertices, wkt).as_bytes())
+                .write_all(format!("{}\t{}\t{}\n", cellid, cell.nr_vertices, wkt).as_bytes())
                 .expect("cannot write grid line");
             let mut cellbuffer = String::new();
             if let Some(fset) = feature_set {
@@ -859,7 +859,7 @@ impl SquareGrid {
                     let centroid = f.centroid();
                     cellbuffer += format!(
                         "{}\t{}\tPOINT({} {})\n",
-                        fid, &cellid, centroid[0], centroid[1]
+                        fid, cellid, centroid[0], centroid[1]
                     )
                     .as_str();
                 }
@@ -1101,7 +1101,7 @@ pub struct CellId {
 
 impl Display for CellId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}", &self.column, &self.row)
+        write!(f, "{}-{}", self.column, self.row)
     }
 }
 
@@ -1249,7 +1249,7 @@ mod tests {
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                         needs_type_filter: false,
                     });
-                    let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
+                    let xc: f64 = format!("{}.{}", x, f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
                 }
             }
@@ -1270,7 +1270,7 @@ mod tests {
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                         needs_type_filter: false,
                     });
-                    let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
+                    let xc: f64 = format!("{}.{}", x, f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
                 }
             }
@@ -1295,7 +1295,7 @@ mod tests {
                         bbox: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                         needs_type_filter: false,
                     });
-                    let xc: f64 = format!("{}.{}", &x, &f).parse().unwrap();
+                    let xc: f64 = format!("{}.{}", x, f).parse().unwrap();
                     grid.insert(&[xc, y as f64], f as usize);
                 }
             }
@@ -1304,7 +1304,7 @@ mod tests {
         let _leaves: Vec<&QuadTree> = QuadTree::collect_leaves(&qtree);
         let n = qtree.node(&QuadTreeNodeId::new(0, 0, 2));
         if n.is_some() {
-            println!("{:?}", &n);
+            println!("{:?}", n);
         } else {
             println!("did not find node");
         }

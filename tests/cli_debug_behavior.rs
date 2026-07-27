@@ -42,11 +42,68 @@ fn run_tyler(dataset: &Path, output: &Path, args: &[&str]) -> Output {
     for arg in args {
         command.arg(arg);
     }
-    command.output().expect("run tyler")
+    let result = command.output().expect("run tyler");
+
+    // Re-emit subprocess stdout/stderr to test process
+    // This makes it controlled by cargo test's --show-output / --nocapture
+    if !result.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&result.stdout));
+    }
+    if !result.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    result
+}
+
+fn run_tyler_with_rust_log(dataset: &Path, output: &Path, rust_log: &str, args: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tyler"));
+    command.env("RUST_LOG", rust_log);
+    command.arg(dataset).arg("--output").arg(output);
+    for arg in args {
+        command.arg(arg);
+    }
+    let result = command.output().expect("run tyler");
+
+    // Re-emit subprocess stdout/stderr to test process
+    // This makes it controlled by cargo test's --show-output / --nocapture
+    if !result.stdout.is_empty() {
+        println!("{}", String::from_utf8_lossy(&result.stdout));
+    }
+    if !result.stderr.is_empty() {
+        eprintln!("{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    result
 }
 
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("read json file")).expect("parse json file")
+}
+
+fn parse_tsv(text: &str) -> Vec<Vec<String>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_reader(text.as_bytes());
+    reader
+        .records()
+        .map(|record| {
+            record
+                .expect("parse TSV record")
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+fn read_json_line_type(line: &str) -> String {
+    let value: Value = serde_json::from_str(line).expect("parse json line");
+    value["type"]
+        .as_str()
+        .expect("json line should have a string type")
+        .to_string()
 }
 
 fn read_glb_json(bytes: &[u8]) -> Value {
@@ -154,6 +211,300 @@ fn debug_dump_data_writes_bincode_and_intermediary_cityjson() {
 }
 
 #[test]
+fn format_tsv_writes_tile_tables_and_aggregate_metadata() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-tsv", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-tsv-output");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &[
+            "--format",
+            "tsv",
+            "--tsv-include-null-rows",
+            "--tsv-include-hierarchy",
+            "--tsv-include-cityjson-ordinal",
+            "--tsv-include-semantics",
+        ],
+    );
+    assert_success(&output, "TSV format run");
+
+    let mut cityobject_tables = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("t"),
+        "cityobjects.tsv",
+        &mut cityobject_tables,
+    );
+    assert!(
+        !cityobject_tables.is_empty(),
+        "expected CityObject TSV tables under {}",
+        output_dir.join("t").display()
+    );
+    let cityobjects = fs::read_to_string(&cityobject_tables[0]).expect("read cityobjects.tsv");
+    let cityobjects_header = cityobjects.lines().next().expect("cityobjects header");
+    assert!(cityobjects_header.contains("cityobject_id"));
+    assert!(cityobjects_header.contains("cityobject_ix"));
+    assert!(!cityobjects_header.contains("parents"));
+    assert!(!cityobjects_header.contains("children"));
+
+    let mut cityobject_hierarchy_tables = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("t"),
+        "cityobject_hierarchy.tsv",
+        &mut cityobject_hierarchy_tables,
+    );
+    assert!(
+        !cityobject_hierarchy_tables.is_empty(),
+        "expected CityObject hierarchy TSV tables under {}",
+        output_dir.join("t").display()
+    );
+    let cityobject_hierarchy =
+        fs::read_to_string(&cityobject_hierarchy_tables[0]).expect("read cityobject_hierarchy.tsv");
+    let hierarchy_rows = parse_tsv(&cityobject_hierarchy);
+    assert_eq!(hierarchy_rows[0].as_slice(), ["parent_id", "child_id"]);
+
+    let mut semantic_tables = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), "semantics.tsv", &mut semantic_tables);
+    assert!(
+        !semantic_tables.is_empty(),
+        "expected split semantic TSV tables under {}",
+        output_dir.join("t").display()
+    );
+
+    let aggregate_metadata =
+        fs::read_to_string(output_dir.join("metadata.tsv")).expect("read metadata.tsv");
+    let metadata_header = aggregate_metadata.lines().next().expect("metadata header");
+    assert!(metadata_header.starts_with("tile_id	content_path	geographical_extent	identifier"));
+    assert!(metadata_header.contains("geographical_extent"));
+    assert!(aggregate_metadata
+        .lines()
+        .skip(1)
+        .any(|line| line.contains("t/")));
+
+    let rows = parse_tsv(&aggregate_metadata);
+    assert!(
+        rows.len() >= 2,
+        "metadata.tsv should contain at least one data row"
+    );
+    let extent_wkt_ix = rows[0]
+        .iter()
+        .position(|column| column == "geographical_extent")
+        .expect("metadata.tsv should contain geographical_extent");
+    assert!(
+        rows[1][extent_wkt_ix].starts_with("POLYGON(("),
+        "geographical_extent should contain polygon WKT"
+    );
+    assert!(!output_dir.join(".tyler-tsv-metadata").exists());
+    assert!(!output_dir
+        .join("metadata/cjindex-metadata.city.json")
+        .exists());
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
+fn format_gpkg_writes_tile_databases_and_aggregate_metadata() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-gpkg", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-gpkg-output");
+    let legacy_metadata_dir = output_dir.join(".tyler-gpkg-metadata");
+    fs::create_dir_all(&legacy_metadata_dir).expect("create legacy metadata directory");
+    fs::write(legacy_metadata_dir.join("fragment.gpkg"), b"stale")
+        .expect("write stale metadata fragment");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &[
+            "--format",
+            "gpkg",
+            "--gpkg-split-lod",
+            "--gpkg-include-semantics",
+            "--gpkg-include-hierarchy",
+            "--gpkg-include-address",
+        ],
+    );
+    assert_success(&output, "GeoPackage format run");
+
+    let mut tile_databases = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".gpkg", &mut tile_databases);
+    assert!(
+        !tile_databases.is_empty(),
+        "expected GeoPackage tiles under {}",
+        output_dir.join("t").display()
+    );
+    let tile = rusqlite::Connection::open(&tile_databases[0]).expect("open tile GeoPackage");
+    let tables = tile
+        .prepare("SELECT table_name FROM gpkg_contents ORDER BY table_name")
+        .expect("prepare tile table query")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tile tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read tile tables");
+    assert!(tables.iter().any(|table| table == "semantics"));
+    assert!(tables.iter().any(|table| table == "addresses"));
+    assert!(tables.iter().any(|table| table == "cityobject_hierarchy"));
+    assert!(tables.iter().any(|table| table == "semantic_hierarchy"));
+
+    let aggregate_path = output_dir.join("metadata.gpkg");
+    let aggregate =
+        rusqlite::Connection::open(&aggregate_path).expect("open aggregate metadata GeoPackage");
+    let rows = aggregate
+        .prepare("SELECT tile_id, content_path, geographical_extent FROM metadata ORDER BY id")
+        .expect("prepare aggregate query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .expect("query aggregate metadata")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read aggregate metadata");
+    assert!(!rows.is_empty());
+    assert_eq!(
+        rows.len(),
+        tile_databases.len(),
+        "metadata.gpkg should contain exactly one row per tile GeoPackage"
+    );
+    for (tile_id, content_path, extent) in rows {
+        assert_eq!(content_path, format!("t/{tile_id}.gpkg"));
+        assert!(output_dir.join(&content_path).is_file());
+        assert!(extent.starts_with(b"GP"));
+    }
+    let geometry_registration: (String, i32) = aggregate
+        .query_row(
+            "SELECT column_name, srs_id FROM gpkg_geometry_columns WHERE table_name = 'metadata'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read aggregate geometry registration");
+    assert_eq!(geometry_registration.0, "geographical_extent");
+    assert!(!output_dir.join(".tyler-gpkg-metadata").exists());
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
+fn format_cityjson_writes_cityjson_tiles() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-cityjson", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-cityjson-output");
+
+    let output = run_tyler(&dataset, &output_dir, &["--format", "cityjson"]);
+    assert_success(&output, "CityJSON format run");
+
+    let mut cityjson_tiles = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".city.json", &mut cityjson_tiles);
+    assert!(
+        !cityjson_tiles.is_empty(),
+        "expected CityJSON tiles under {}",
+        output_dir.join("t").display()
+    );
+    let root = read_json(&cityjson_tiles[0]);
+    assert_eq!(root["type"], "CityJSON");
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+/// Issue <https://github.com/3DGI/tyler/issues/137>
+#[test]
+fn cityjsonfeature_buildingpart_filter_does_not_duplicate_cityobjects() {
+    let dataset = unique_test_dir("cityjsonfeature-buildingpart-filter");
+    fs::copy(
+        repo_path("tests/data/cjindex_cityjsonfeature_alias/source.city.jsonl"),
+        dataset.join("source.city.jsonl"),
+    )
+    .expect("copy CityJSONFeature alias fixture");
+    let output_dir = unique_test_dir("cityjsonfeature-buildingpart-filter-output");
+
+    let output = run_tyler_with_rust_log(
+        &dataset,
+        &output_dir,
+        "debug",
+        &[
+            "--format",
+            "cityjson",
+            "--color-building-part",
+            "#ff0000",
+            "--object-type",
+            "BuildingPart",
+        ],
+    );
+    assert_success(&output, "CityJSON BuildingPart fixture run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("duplicate CityObject id") && !stdout.contains("duplicate CityObject id"),
+        "Tyler should not duplicate CityObjects while filtering the fixture\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let mut cityjson_tiles = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".city.json", &mut cityjson_tiles);
+    assert!(
+        !cityjson_tiles.is_empty(),
+        "expected CityJSON tiles under {}\nstdout:\n{}\nstderr:\n{}",
+        output_dir.join("t").display(),
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn format_cityjsonseq_writes_feature_stream_tiles_matching_debug_shape() {
+    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
+    let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
+    let dataset = write_ndjson_dataset("format-cityjsonseq", &metadata, &[feature]);
+    let output_dir = unique_test_dir("format-cityjsonseq-output");
+
+    let output = run_tyler(
+        &dataset,
+        &output_dir,
+        &["--format", "cityjsonseq", "--debug-dump-data"],
+    );
+    assert_success(&output, "CityJSONSeq format run");
+
+    let mut output_streams = Vec::new();
+    collect_paths_with_suffix(&output_dir.join("t"), ".city.jsonl", &mut output_streams);
+    assert!(
+        !output_streams.is_empty(),
+        "expected CityJSONSeq tiles under {}",
+        output_dir.join("t").display()
+    );
+    let mut debug_streams = Vec::new();
+    collect_paths_with_suffix(
+        &output_dir.join("debug").join("inputs"),
+        ".city.jsonl",
+        &mut debug_streams,
+    );
+    assert!(
+        !debug_streams.is_empty(),
+        "expected debug CityJSONSeq streams under {}",
+        output_dir.join("debug").join("inputs").display()
+    );
+
+    let output_items = fs::read_to_string(&output_streams[0]).expect("read output stream");
+    let debug_items = fs::read_to_string(&debug_streams[0]).expect("read debug stream");
+    let output_types = output_items
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(read_json_line_type)
+        .collect::<Vec<_>>();
+    let debug_types = debug_items
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(read_json_line_type)
+        .collect::<Vec<_>>();
+    assert_eq!(output_types, debug_types);
+    assert_eq!(output_types.first().map(String::as_str), Some("CityJSON"));
+    assert!(output_types.iter().any(|kind| kind == "CityJSONFeature"));
+    assert!(!output_dir.join("tileset.json").exists());
+}
+
+#[test]
 fn debug_dump_grid_and_grid_features_write_tsv_exports() {
     let metadata = read_fixture("resources/data/3dbag_x00.city.json");
     let feature = read_fixture("resources/data/3dbag_feature_x71.city.jsonl");
@@ -253,9 +604,12 @@ fn debug_load_grid_uses_loaded_grid_for_quadtree_computation() {
 
 #[test]
 fn debug_3dtiles_tileset_only_skips_glb_conversion() {
-    let metadata = read_fixture("resources/data/3dbag_x00.city.json");
-    let features = read_fixture("cityjson-convert/tests/data/multi_feature_types.city.jsonl");
-    let dataset = write_ndjson_dataset("debug-tileset-only", &metadata, &[features]);
+    let dataset = unique_test_dir("debug-3dtiles-tileset");
+    fs::copy(
+        "cityjson-convert/tests/data/multi_feature_types.city.jsonl",
+        dataset.join("multi_feature_types.city.jsonl"),
+    )
+    .unwrap();
     let output_dir = unique_test_dir("debug-tileset-only-output");
 
     let output = run_tyler(

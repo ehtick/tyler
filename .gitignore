@@ -7,15 +7,19 @@
 .run
 .vs
 /resources/data/features_3dbag_5909/
+**/todo*
+**/TODO*
 
 # misc
 /tmp
 .env
+local.justfile
 
 # Test data
 /tests/output*
 /cityjson-convert/tests/output/
 .geodepot.bak
+**/*.sqlite
 
 # Debug data
 *.tsv

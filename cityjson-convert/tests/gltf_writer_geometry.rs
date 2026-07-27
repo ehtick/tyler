@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
-use cityjson_convert::{convert_to_glb, ExportOptions, GeographicClipRegion, GeometryPlacement};
+use cityjson_convert::{
+    convert_to_cityjson, convert_to_cityjsonseq, convert_to_glb, convert_to_obj,
+    CityJsonSeqExportOptions, ExportOptions, GeographicClipRegion, GeometryPlacement,
+    JsonExportOptions, ObjExportOptions,
+};
 use cityjson_lib::json;
 use serde_json::Value;
 
@@ -11,6 +16,41 @@ fn stable_output_path(name: &str) -> PathBuf {
         .join("tests")
         .join("output")
         .join(format!("{name}.glb"))
+}
+
+fn stable_output_path_with_suffix(name: &str, suffix: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("output")
+        .join(format!("{name}.{suffix}"))
+}
+
+fn legacy_feature_dataset_path(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("output")
+        .join(name);
+    if path.exists() {
+        fs::remove_dir_all(&path).expect("remove previous legacy feature dataset");
+    }
+    fs::create_dir_all(&path).expect("create legacy feature dataset");
+
+    let items = include_bytes!("data/multi_feature_types.city.jsonl")
+        .split(|byte| *byte == b'\n')
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 3);
+    let mut metadata: Value =
+        serde_json::from_slice(items[0]).expect("parse dataset metadata fixture");
+    metadata["transform"]["translate"] = serde_json::json!([100.0, 200.0, 0.0]);
+    fs::write(
+        path.join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize dataset metadata"),
+    )
+    .expect("write dataset metadata");
+    fs::write(path.join("building.city.jsonl"), items[1]).expect("write building feature");
+    fs::write(path.join("water.city.jsonl"), items[2]).expect("write water feature");
+    path
 }
 
 fn read_glb_json(bytes: &[u8]) -> Value {
@@ -28,6 +68,384 @@ fn read_glb_json(bytes: &[u8]) -> Value {
     assert_eq!(&bytes[16..20], b"JSON");
 
     serde_json::from_slice(&bytes[20..20 + json_length]).expect("GLB JSON chunk should parse")
+}
+
+fn read_json_lines(path: &PathBuf) -> Vec<Value> {
+    fs::read_to_string(path)
+        .expect("read json lines")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("json line should parse"))
+        .collect()
+}
+
+fn read_obj_lines(path: &PathBuf) -> Vec<String> {
+    fs::read_to_string(path)
+        .expect("read OBJ output")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn read_obj_vertices_and_faces(path: &PathBuf) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    for line in read_obj_lines(path) {
+        if let Some(rest) = line.strip_prefix("v ") {
+            let coordinates = rest
+                .split_whitespace()
+                .map(|value| value.parse::<f64>().expect("OBJ coordinate should parse"))
+                .collect::<Vec<_>>();
+            assert_eq!(coordinates.len(), 3);
+            vertices.push([coordinates[0], coordinates[1], coordinates[2]]);
+        } else if let Some(rest) = line.strip_prefix("f ") {
+            let indices = rest
+                .split_whitespace()
+                .map(|value| value.parse::<usize>().expect("OBJ face index should parse") - 1)
+                .collect::<Vec<_>>();
+            assert_eq!(indices.len(), 3);
+            faces.push([indices[0], indices[1], indices[2]]);
+        }
+    }
+    (vertices, faces)
+}
+
+fn inline_feature(id: &str, vertices: &str, boundaries: &str) -> Vec<u8> {
+    format!(
+        r#"{{"type":"CityJSONFeature","id":"{id}","transform":{{"scale":[1.0,1.0,1.0],"translate":[0.0,0.0,0.0]}},"CityObjects":{{"{id}":{{"type":"Building","geometry":[{{"type":"MultiSurface","lod":"1","boundaries":{boundaries}}}]}}}},"vertices":{vertices}}}"#
+    )
+    .into_bytes()
+}
+
+fn face_normal(vertices: &[[f64; 3]], face: [usize; 3]) -> [f64; 3] {
+    let p0 = vertices[face[0]];
+    let p1 = vertices[face[1]];
+    let p2 = vertices[face[2]];
+    let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+    let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+    [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ]
+}
+
+fn dot_f64(lhs: [f64; 3], rhs: [f64; 3]) -> f64 {
+    lhs[0] * rhs[0] + lhs[1] * rhs[1] + lhs[2] * rhs[2]
+}
+
+#[test]
+fn convert_to_obj_writes_single_triangle_in_source_coordinates() {
+    let input = inline_feature(
+        "source triangle",
+        "[[1000.5,2000.25,3.0],[1001.5,2000.25,3.0],[1000.5,2001.25,4.0]]",
+        "[[[0,1,2]]]",
+    );
+    let model = json::from_feature_slice(&input).expect("inline feature should parse");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_single_triangle", "obj");
+
+    convert_to_obj(&model, &output_path, &ObjExportOptions::default())
+        .expect("OBJ conversion should succeed");
+
+    let lines = read_obj_lines(&output_path);
+    assert_eq!(lines[0], "o source_triangle");
+    assert_eq!(lines[1], "v 1000.5 2000.25 3");
+    assert_eq!(lines[2], "v 1001.5 2000.25 3");
+    assert_eq!(lines[3], "v 1000.5 2001.25 4");
+    assert_eq!(lines[4], "f 1 2 3");
+}
+
+#[test]
+fn convert_to_obj_groups_cityobjects_and_uses_global_indices() {
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture should merge");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_multi_object", "obj");
+
+    convert_to_obj(&model, &output_path, &ObjExportOptions::default())
+        .expect("OBJ conversion should succeed");
+
+    let lines = read_obj_lines(&output_path);
+    let object_lines = lines
+        .iter()
+        .filter(|line| line.starts_with("o "))
+        .collect::<Vec<_>>();
+    assert!(object_lines
+        .iter()
+        .any(|line| *line == "o building-feature"));
+    assert!(object_lines.iter().any(|line| *line == "o water-feature"));
+    assert!(lines.iter().any(|line| line == "f 1 2 3"));
+    assert!(lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("f "))
+        .any(|face| face != "1 2 3"));
+}
+
+#[test]
+fn convert_to_obj_triangulates_polygons_and_preserves_unclipped_geometry_by_default() {
+    let input = inline_feature(
+        "quad",
+        "[[0.0,0.0,0.0],[2.0,0.0,0.0],[2.0,2.0,0.0],[0.0,2.0,0.0]]",
+        "[[[0,1,2,3]]]",
+    );
+    let model = json::from_feature_slice(&input).expect("inline feature should parse");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_quad", "obj");
+
+    convert_to_obj(&model, &output_path, &ObjExportOptions::default())
+        .expect("OBJ conversion should succeed");
+
+    let lines = read_obj_lines(&output_path);
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with("f ")).count(),
+        2
+    );
+    assert!(lines.iter().any(|line| line == "v 2 2 0"));
+}
+
+#[test]
+fn convert_to_obj_preserves_winding_for_y_dominant_polygons() {
+    let input = inline_feature(
+        "y-normal-quad",
+        "[[0.0,0.0,0.0],[0.0,0.0,2.0],[2.0,0.0,2.0],[2.0,0.0,0.0]]",
+        "[[[0,1,2,3]]]",
+    );
+    let model = json::from_feature_slice(&input).expect("inline feature should parse");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_y_winding", "obj");
+
+    convert_to_obj(&model, &output_path, &ObjExportOptions::default())
+        .expect("OBJ conversion should succeed");
+
+    let (vertices, faces) = read_obj_vertices_and_faces(&output_path);
+    assert_eq!(faces.len(), 2);
+    for face in faces {
+        assert!(
+            dot_f64(face_normal(&vertices, face), [0.0, 1.0, 0.0]) > 0.0,
+            "OBJ face {face:?} should preserve the source +Y winding"
+        );
+    }
+}
+
+#[test]
+fn convert_to_obj_preserves_reversed_winding_for_y_dominant_polygons() {
+    let input = inline_feature(
+        "negative-y-normal-quad",
+        "[[0.0,0.0,0.0],[2.0,0.0,0.0],[2.0,0.0,2.0],[0.0,0.0,2.0]]",
+        "[[[0,1,2,3]]]",
+    );
+    let model = json::from_feature_slice(&input).expect("inline feature should parse");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_negative_y_winding", "obj");
+
+    convert_to_obj(&model, &output_path, &ObjExportOptions::default())
+        .expect("OBJ conversion should succeed");
+
+    let (vertices, faces) = read_obj_vertices_and_faces(&output_path);
+    assert_eq!(faces.len(), 2);
+    for face in faces {
+        assert!(
+            dot_f64(face_normal(&vertices, face), [0.0, -1.0, 0.0]) > 0.0,
+            "OBJ face {face:?} should preserve the source -Y winding"
+        );
+    }
+}
+
+#[test]
+fn convert_to_obj_can_clip_to_bbox() {
+    let input = inline_feature(
+        "clip",
+        "[[-1.0,0.0,0.0],[2.0,0.0,0.0],[0.0,2.0,0.0]]",
+        "[[[0,1,2]]]",
+    );
+    let model = json::from_feature_slice(&input).expect("inline feature should parse");
+    let output_path = stable_output_path_with_suffix("convert_to_obj_clipped", "obj");
+    let options = ObjExportOptions {
+        clip_bbox: Some([0.0, 0.0, -1.0, 1.0, 1.0, 1.0]),
+    };
+
+    convert_to_obj(&model, &output_path, &options).expect("OBJ conversion should succeed");
+
+    let lines = read_obj_lines(&output_path);
+    let vertices = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("v "))
+        .map(|line| {
+            line.split_whitespace()
+                .map(|value| value.parse::<f64>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(!vertices.is_empty());
+    assert!(vertices.iter().all(|vertex| {
+        vertex[0] >= -1.0e-9
+            && vertex[0] <= 1.0 + 1.0e-9
+            && vertex[1] >= -1.0e-9
+            && vertex[1] <= 1.0 + 1.0e-9
+    }));
+}
+
+#[test]
+fn convert_to_cityjson_writes_parseable_cityjson() {
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture should merge");
+    let output_path = stable_output_path_with_suffix("convert_to_cityjson", "city.json");
+
+    convert_to_cityjson(&model, &output_path, &JsonExportOptions::default())
+        .expect("CityJSON conversion should succeed");
+
+    let root: Value =
+        serde_json::from_slice(&fs::read(&output_path).expect("read CityJSON output"))
+            .expect("CityJSON output should parse");
+    assert_eq!(root["type"], "CityJSON");
+}
+
+#[test]
+fn convert_to_cityjsonseq_writes_header_and_features() {
+    let base = json::from_slice(
+        include_bytes!("data/multi_feature_types.city.jsonl")
+            .split(|b| *b == b'\n')
+            .next()
+            .unwrap(),
+    )
+    .expect("cityjson base should parse");
+    let feature_a = json::from_feature_slice(
+        include_bytes!("data/multi_feature_types.city.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(1)
+            .unwrap(),
+    )
+    .expect("first feature should parse");
+    let feature_b = json::from_feature_slice(
+        include_bytes!("data/multi_feature_types.city.jsonl")
+            .split(|b| *b == b'\n')
+            .nth(2)
+            .unwrap(),
+    )
+    .expect("second feature should parse");
+    let features = vec![feature_a, feature_b];
+    let output_path = stable_output_path_with_suffix("convert_to_cityjsonseq", "city.jsonl");
+
+    convert_to_cityjsonseq(
+        &base,
+        &features,
+        &output_path,
+        &CityJsonSeqExportOptions::default(),
+    )
+    .expect("CityJSONSeq conversion should succeed");
+
+    let items = read_json_lines(&output_path);
+    assert_eq!(items[0]["type"], "CityJSON");
+    assert_eq!(items[1]["type"], "CityJSONFeature");
+    assert_eq!(items[2]["type"], "CityJSONFeature");
+}
+
+#[test]
+fn cjconvert_can_write_cityjson_cityjsonseq_and_obj() {
+    let cityjson_output = stable_output_path_with_suffix("cjconvert_cityjson", "city.json");
+    let cityjsonseq_output = stable_output_path_with_suffix("cjconvert_cityjsonseq", "city.jsonl");
+    let obj_output = stable_output_path_with_suffix("cjconvert_obj", "obj");
+    let cityjson_input = stable_output_path_with_suffix("cjconvert_input", "city.json");
+    let model =
+        json::merge_feature_stream_slice(include_bytes!("data/multi_feature_types.city.jsonl"))
+            .expect("fixture should merge");
+    convert_to_cityjson(&model, &cityjson_input, &JsonExportOptions::default())
+        .expect("write cjconvert input");
+
+    let cityjson_status = Command::new(env!("CARGO_BIN_EXE_cjconvert"))
+        .arg(&cityjson_input)
+        .arg("--output")
+        .arg(&cityjson_output)
+        .arg("--format")
+        .arg("cityjson")
+        .status()
+        .expect("run cjconvert cityjson");
+    assert!(cityjson_status.success());
+    let root: Value =
+        serde_json::from_slice(&fs::read(&cityjson_output).expect("read cjconvert CityJSON"))
+            .expect("parse cjconvert CityJSON");
+    assert_eq!(root["type"], "CityJSON");
+
+    let cityjsonseq_status = Command::new(env!("CARGO_BIN_EXE_cjconvert"))
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/multi_feature_types.city.jsonl"),
+        )
+        .arg("--output")
+        .arg(&cityjsonseq_output)
+        .arg("--format")
+        .arg("cityjsonseq")
+        .status()
+        .expect("run cjconvert cityjsonseq");
+    assert!(cityjsonseq_status.success());
+    let items = read_json_lines(&cityjsonseq_output);
+    assert_eq!(items[0]["type"], "CityJSON");
+    assert_eq!(items[1]["type"], "CityJSONFeature");
+
+    let obj_status = Command::new(env!("CARGO_BIN_EXE_cjconvert"))
+        .arg(&cityjson_input)
+        .arg("--output")
+        .arg(&obj_output)
+        .arg("--format")
+        .arg("obj")
+        .status()
+        .expect("run cjconvert obj");
+    assert!(obj_status.success());
+    let obj_lines = read_obj_lines(&obj_output);
+    assert!(obj_lines.iter().any(|line| line.starts_with("o ")));
+    assert!(obj_lines.iter().any(|line| line.starts_with("v ")));
+    assert!(obj_lines.iter().any(|line| line.starts_with("f ")));
+}
+
+#[test]
+fn cjconvert_supports_legacy_feature_file_datasets() {
+    let dataset = legacy_feature_dataset_path("cjconvert_legacy_feature_dataset");
+    let cityjson_output = stable_output_path_with_suffix("cjconvert_legacy", "city.json");
+    let cityjsonseq_output = stable_output_path_with_suffix("cjconvert_legacy", "city.jsonl");
+    let obj_output = stable_output_path_with_suffix("cjconvert_legacy", "obj");
+    let glb_output = stable_output_path("cjconvert_legacy");
+
+    for (format, output) in [
+        ("cityjson", &cityjson_output),
+        ("cityjsonseq", &cityjsonseq_output),
+        ("obj", &obj_output),
+        ("glb", &glb_output),
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_cjconvert"))
+            .arg(&dataset)
+            .arg("--output")
+            .arg(output)
+            .arg("--format")
+            .arg(format)
+            .status()
+            .unwrap_or_else(|error| panic!("run cjconvert {format}: {error}"));
+        assert!(status.success(), "cjconvert {format} should succeed");
+    }
+
+    assert!(dataset.join(".cityjson-index.sqlite").is_file());
+
+    let cityjson: Value = serde_json::from_slice(
+        &fs::read(&cityjson_output).expect("read legacy dataset CityJSON output"),
+    )
+    .expect("parse legacy dataset CityJSON output");
+    assert_eq!(cityjson["type"], "CityJSON");
+    assert!(cityjson["CityObjects"].get("building-feature").is_some());
+    assert!(cityjson["CityObjects"].get("water-feature").is_some());
+
+    let sequence = read_json_lines(&cityjsonseq_output);
+    assert_eq!(sequence.len(), 3);
+    assert_eq!(sequence[0]["type"], "CityJSON");
+    assert_eq!(sequence[1]["type"], "CityJSONFeature");
+    assert_eq!(sequence[2]["type"], "CityJSONFeature");
+
+    let obj = read_obj_lines(&obj_output);
+    assert!(obj.iter().any(|line| line == "o building-feature"));
+    assert!(obj.iter().any(|line| line == "o water-feature"));
+    assert!(obj.iter().any(|line| line == "v 100 200 0"));
+
+    let glb = fs::read(&glb_output).expect("read legacy dataset GLB output");
+    let glb_json = read_glb_json(&glb);
+    assert!(glb_json["meshes"]
+        .as_array()
+        .is_some_and(|meshes| !meshes.is_empty()));
 }
 
 #[allow(clippy::cast_possible_truncation)]

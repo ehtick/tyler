@@ -13,6 +13,8 @@ uses [cityjson-index](https://github.com/3DGI/cityjson/tree/main/crates/cityjson
 As output, *tyler* can create:
 
 - [3D Tiles v1.1](https://docs.ogc.org/cs/22-025r4/22-025r4.html)
+- tiled `CityJSON`
+- tiled `CityJSONSeq`
 
 Details of the 3D Tiles output:
 
@@ -40,6 +42,24 @@ After downloading the source code from GitHub, navigate into the tyler directory
 cargo install .
 ```
 
+Plain `cargo build` and `cargo install .` use Tyler's default `proj-system`
+feature. This enables PROJ-backed APIs and asks `proj-sys` to prefer a system
+PROJ installation with native network-grid capability enabled.
+
+`proj-sys 0.27.0` requires PROJ 9.6.2 or newer for system discovery. If no
+acceptable system PROJ is found, `proj-sys` may fall back to building PROJ from
+source. Build explicitly in bundled mode when you want the source build path:
+
+```shell
+cargo build --no-default-features --features proj-bundled
+```
+
+For Linux development, the recommended repeatable environment is the
+devcontainer in this repository. It installs the native PROJ, SQLite, TIFF,
+`pkg-config`, C/C++ build tooling and Rust tooling needed by both system and
+bundled PROJ modes. This is especially useful when your host package manager
+cannot provide the PROJ version required by `proj-sys`.
+
 #### On Windows
 
 Use [MSYS2](https://www.msys2.org/) with `UCRT64` environment.
@@ -53,7 +73,12 @@ Required libraries (prefix: `mingw-w64-ucrt-x86_64-`):
 * rust
 * sqlite3
 
-CI also installs `libtiff` on Linux because `proj-sys` falls back to building bundled PROJ with TIFF support when a suitable system `libproj` is not available.
+Local Linux validation assumes the devcontainer and uses separate PROJ modes:
+
+```shell
+just ci-check-system
+just ci-check-bundled
+```
 
 ## Usage
 
@@ -75,6 +100,17 @@ RUST_LOG=debug tyler ...
 
 Tyler uses the [proj](https://proj.org/) library for reprojecting the input to the required CRS.
 Set [PROJ_DATA](https://proj.org/usage/environmentvars.html#envvar-PROJ_DATA) if your environment requires a custom PROJ data directory.
+
+The packaged Nix build uses the reproducible/offline path: it vendors the Dutch
+`nl_nsgi_nlgeo2018.tif` and `nl_nsgi_rdtrans2018.tif` grids into `PROJ_DATA`, so
+required transforms do not depend on runtime downloads.
+
+Native PROJ networking is a separate, opt-in path for non-packaged builds. It
+requires both a system PROJ build with curl support and explicit runtime
+enablement in the caller. When enabled, PROJ fetches the needed remote grid
+chunks on demand and stores them in its user-writable cache database; it does
+not materialize full `.tif` files into `PROJ_DATA`. Reproducible or offline
+deployments should continue to provide required grids locally.
 
 ### Performance
 
@@ -109,6 +145,23 @@ For large `cjindex` datasets, Tyler processes the extent in chunks and reuses
 the dataset index while it works. The practical requirement is still the same:
 give Tyler a dataset root that `cjindex` can resolve.
 
+### Output formats
+
+Tyler writes 3D Tiles by default. Select another output format with `--format`:
+
+- `3dtiles`: writes a 3D Tiles tileset and `.glb` tile content.
+- `obj`: writes one geometry-only Wavefront OBJ file per non-empty tile.
+- `cityjson`: writes one merged `CityJSON` document per non-empty tile.
+- `cityjsonseq`: writes one `CityJSONSeq` stream per non-empty tile, with a
+  `CityJSON` header and one `CityJSONFeature` item per selected source feature.
+- `tsv`: writes tabular files per non-empty tile and one root `metadata.tsv`.
+- `gpkg`: writes one GeoPackage per non-empty tile and one root `metadata.gpkg`.
+
+The tiled `OBJ`, `CityJSON`, `CityJSONSeq`, `TSV` and `GeoPackage` outputs use the same grid, quadtree,
+feature filtering, LoD selection, attribute filtering and parent-attribute
+inheritance path as the 3D Tiles output. They do not write `tileset.json`,
+`subtrees/`, or 3D Tiles metadata.
+
 ### Exporting 3D Tiles
 
 An example command for generating 3D Tiles.
@@ -131,9 +184,94 @@ tyler \
     --grid-maxz=300
 ```
 
+### Exporting CityJSON
+
+Use `--format cityjson` to write tiled `CityJSON` documents.
+
+```shell
+tyler \
+    /data \
+    --output /cityjson-tiles \
+    --format cityjson \
+    --object-type Building \
+    --object-type BuildingPart
+```
+
+The output tiles are written under `t/<level>/<x>/<y>.city.json`.
+Each tile is a merged `CityJSON` document containing the selected features for
+that tile.
+
+### Exporting OBJ
+
+Use `--format obj` to write tiled Wavefront OBJ files.
+
+```shell
+tyler \
+    /data \
+    --output /obj-tiles \
+    --format obj \
+    --object-type Building \
+    --object-type BuildingPart
+```
+
+The output tiles are written under `t/<level>/<x>/<y>.obj`. Each tile contains
+geometry-only OBJ records grouped by CityObject ID. Coordinates stay in the
+source CityJSON coordinate space; Tyler does not apply the 3D Tiles ENU
+placement or tile-bound clipping to OBJ output.
+
+### Exporting CityJSONSeq
+
+Use `--format cityjsonseq` to write tiled `CityJSONSeq` streams.
+
+```shell
+tyler \
+    /data \
+    --output /cityjsonseq-tiles \
+    --format cityjsonseq \
+    --object-type Building \
+    --object-type BuildingPart
+```
+
+The output tiles are written under `t/<level>/<x>/<y>.city.jsonl`.
+Each tile stream starts with a `CityJSON` header, followed by one
+`CityJSONFeature` item per selected source feature. This is the same stream
+shape used by `--debug-dump-data`.
+
+### Exporting TSV
+
+Use `--format tsv` to write tabular files under
+`t/<level>/<x>/<y>/`. Tyler always writes `metadata.tsv` at the output root,
+with one row per written tile and shared `tile_id`, `content_path`, and `geographical_extent` columns.
+Use the `--tsv-*` options to include null rows, hierarchy, source ordinals,
+semantics, or addresses.
+
+### Exporting GeoPackage
+
+Use `--format gpkg` to write each non-empty tile to
+`t/<level>/<x>/<y>.gpkg`. Tyler always writes a separate `metadata.gpkg` at the
+output root. Its spatial `metadata` layer contains one row per written tile,
+including `tile_id`, the relative `content_path`, projected CityJSON metadata, and
+the quadtree leaf extent.
+
+```shell
+tyler \
+    /data \
+    --output /gpkg-tiles \
+    --format gpkg \
+    --gpkg-split-lod \
+    --gpkg-include-semantics \
+    --gpkg-include-hierarchy \
+    --gpkg-include-address
+```
+
+The GeoPackage-specific options split feature layers by LoD or add semantics,
+hierarchy, and address tables. Metadata aggregation is always enabled, so
+Tyler intentionally does not expose `--gpkg-include-metadata`.
+
+
 #### Input data
 
-`tyler` accepts a single `input` dataset directory with regulart CityJSON files, CityJSONSeq files, or the legacy `feature-files` layout.
+`tyler` accepts a single `input` dataset directory with regular CityJSON files, CityJSONSeq files, or the legacy `feature-files` layout.
 
 For example:
 
@@ -164,6 +302,11 @@ cjio combined.city.json upgrade save combined/combined_upg.city.json
 The output is written to the directory set in `--output`.
 For 3D Tiles output, it will contain a `tileset.json` file and `t/` directory with the glTF files.
 In case of implicit tiling, also a `subtrees/` directory is written with the subtrees.
+For `--format obj`, it will contain a `t/` directory with `.obj` tile files.
+For `--format cityjson`, it will contain a `t/` directory with `.city.json` tile files.
+For `--format cityjsonseq`, it will contain a `t/` directory with `.city.jsonl` tile files.
+For `--format tsv`, it will contain per-tile TSV directories and a root `metadata.tsv`.
+For `--format gpkg`, it will contain a `t/` directory with `.gpkg` tile files and a root `metadata.gpkg`.
 
 For `cjindex` datasets, Tyler writes a derived metadata file under `metadata/`. Per-tile CityJSONFeature streams are kept in memory by default. To inspect them, pass `--debug-dump-data`; Tyler then
 writes `debug/inputs/<tile>.city.jsonl`.
@@ -282,7 +425,7 @@ Run *tyler* in debug mode, by setting the logging level to `debug` in the `RUST_
 RUST_LOG=debug tyler ...
 ```
 
-In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and `tiles_failed` instances as [bincode](https://crates.io/crates/bincode) under `debug/`.
+In debug mode, or when `--debug-dump-data` is passed, *tyler* will write the `world`, `quadtree` and explicit `tiles_results` outcomes as [bincode](https://crates.io/crates/bincode) under `debug/`.
 In case of a large area and lots of features (eg. an entire country and multiple millions of features), the `world.bincode` file can become a couple GB in size.
 When `--debug-dump-data` is enabled, Tyler also writes intermediary per-tile CityJSONFeature streams under `debug/inputs/`.
 
@@ -295,7 +438,7 @@ The order in which *tyler* creates the instances:
 2. quadtree
 3. tileset
 4. (implicit tileset)
-5. tiles_failed
+5. tiles_results (written, skipped, or failed per export job)
 6. pruned tileset
 
 In addition to the instance data, *tyler* can export the grid (part of the `world`), quadtree and tileset data to Tab-separated values (`.tsv`), which you can load into a GIS.
@@ -360,9 +503,11 @@ Profiling Dependencies:
 - [x] Integrate the glTF converter
 - [x] Integrate cjlib
 - [x] Read regular CityJSON files, not only CityJSONFeatures
+- [x] Additional export formats:
+    - [x] CityJSON
+    - [x] CityJSONSeq
+    - [x] Wavefront OBJ
 - [ ] Additional export formats:
-    - [ ] CityJSON
-    - [ ] Wavefront OBJ
     - [ ] GeoPackage
 
 ## Funding
